@@ -1,0 +1,24 @@
+[package]
+name = "tisp-backend"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tisp-core.workspace = true
+tisp-middle.workspace = true
+tisp-runtime.workspace = true
+miette.workspace = true
+thiserror.workspace = true
+
+[features]
+default = []
+llvm = ["dep:inkwell"]
+z3 = ["dep:z3"]
+
+[dependencies.inkwell]
+workspace = true
+optional = true
+
+[dependencies.z3]
+workspace = true
+optional = true

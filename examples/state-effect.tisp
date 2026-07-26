@@ -1,0 +1,25 @@
+;; State effect example
+
+(defeffect State s
+  (get [] -> s)
+  (put [s] -> Unit))
+
+(defn run-state [init f]
+  (handle (f)
+    (State s)
+    (get [] [k s] (k s s))
+    (put [v] [k _s] (k Unit v))))
+
+(defn counter []
+  (let [x (get)]
+    (put (+ x 1))
+    (get)))
+
+(defn main []
+  (run-state 0
+    (fn []
+      (counter)
+      (counter)
+      (counter))))
+
+(println (main))

@@ -1,0 +1,11 @@
+[package]
+name = "tisp-middle"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tisp-core.workspace = true
+im.workspace = true
+petgraph.workspace = true
+miette.workspace = true
+thiserror.workspace = true

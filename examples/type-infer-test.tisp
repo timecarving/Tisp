@@ -1,0 +1,17 @@
+(defn id [x] x)
+
+(defn const [x y] x)
+
+(defn apply [f x] (f x))
+
+(defn add-one [x] (+ x 1))
+
+(defn factorial [n]
+  (if (<= n 1)
+    1
+    (* n (factorial (- n 1)))))
+
+(defn main []
+  (let [x 42
+        y (add-one x)]
+    (println y)))

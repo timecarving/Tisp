@@ -1,0 +1,31 @@
+;; Phase 4 test: Liquid Types and Refinement Types
+
+;; Test 1: Basic refinement type parsing (only parsing, not checking yet)
+;; This should type-check successfully
+
+;; Test 2: Simple function with contract
+(defn divide [n d]
+  :requires (!= d 0)
+  (+ n d))
+
+;; Test 3: Refinement-annotated function
+(defn sqrt [x]
+  (if (>= x 0) (* x x) 0))
+
+;; Test 4: Contract with ensures
+(defn add-positive [x y]
+  :ensures (> result 0)
+  (+ x y))
+
+;; Test 5: Multiple requires
+(defn safe-transfer [from-balance to-balance amount]
+  :requires (>= from-balance amount)
+  :requires (> amount 0)
+  :ensures (= result (+ from-balance to-balance))
+  (+ from-balance to-balance))
+
+;; Test 6: Using and/or in predicates
+(defn complex-check [x y]
+  :requires (and (>= x 0) (>= y 0))
+  :requires (< (+ x y) 1000)
+  (+ x y))

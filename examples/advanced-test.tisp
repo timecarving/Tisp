@@ -1,0 +1,44 @@
+;; Test basic type inference with various features
+
+;; Identity function
+(defn id [x] x)
+
+;; Constant function
+(defn const [x y] x)
+
+;; Function application
+(defn apply [f x] (f x))
+
+;; Arithmetic
+(defn add-one [x] (+ x 1))
+
+;; Recursive function
+(defn factorial [n]
+  (if (<= n 1)
+    1
+    (* n (factorial (- n 1)))))
+
+;; Let bindings
+(defn let-test []
+  (let [x 10
+        y 20
+        z (+ x y)]
+    z))
+
+;; Nested lambdas
+(defn compose [f g]
+  (fn [x] (f (g x))))
+
+;; Boolean operations
+(defn abs [x]
+  (if (< x 0)
+    (- 0 x)
+    x))
+
+;; Main with IO effect
+(defn main []
+  (let [x 42
+        y (add-one x)
+        z (factorial 5)]
+    (println y)
+    (println z)))

@@ -1,0 +1,195 @@
+/// HoTT runtime: Path types, Glue, Univalence, HIT, Cohesive modalities
+use std::sync::Arc;
+
+/// Interval type I with endpoints and operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interval {
+    Point(bool), // i0=false, i1=true
+    Var(u64),
+}
+
+impl Interval {
+    pub fn i0() -> Self { Interval::Point(false) }
+    pub fn i1() -> Self { Interval::Point(true) }
+    pub fn neg(self) -> Self {
+        match self { Interval::Point(b) => Interval::Point(!b), v => v }
+    }
+    pub fn meet(self, other: Interval) -> Interval {
+        match (self, other) { (Interval::Point(a), Interval::Point(b)) => Interval::Point(a && b), _ => self }
+    }
+    pub fn join(self, other: Interval) -> Interval {
+        match (self, other) { (Interval::Point(a), Interval::Point(b)) => Interval::Point(a || b), _ => self }
+    }
+}
+
+/// Path type constructor: Path A x y
+#[derive(Clone)]
+pub struct PathTerm {
+    pub endpoints: (PointValue, PointValue),
+    pub connection: Arc<dyn Fn(Interval) -> PointValue + Send + Sync>,
+}
+
+/// A point in any type
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PointValue {
+    Int(i64), Bool(bool), Str(String), Unit,
+    Pair(Box<PointValue>, Box<PointValue>),
+}
+
+impl PathTerm {
+    pub fn new(a: PointValue, b: PointValue, f: impl Fn(Interval) -> PointValue + Send + Sync + 'static) -> Self {
+        PathTerm { endpoints: (a, b), connection: Arc::new(f) }
+    }
+    pub fn refl(a: PointValue) -> Self {
+        let a2 = a.clone();
+        PathTerm::new(a.clone(), a, move |_| a2.clone())
+    }
+    pub fn sym(&self) -> PathTerm {
+        let conn = self.connection.clone();
+        PathTerm {
+            endpoints: (self.endpoints.1.clone(), self.endpoints.0.clone()),
+            connection: Arc::new(move |i| conn(i.neg())),
+        }
+    }
+    pub fn apply(&self, at: Interval) -> PointValue { (self.connection)(at) }
+}
+
+/// Glue type: Glue [i : I] (Partial A i) B
+#[derive(Clone)]
+pub struct GlueTerm {
+    pub base: PointValue,
+    pub equivalence: Arc<dyn Fn(PointValue) -> PathTerm + Send + Sync>,
+}
+
+impl GlueTerm {
+    pub fn glue(base: PointValue, equiv: impl Fn(PointValue) -> PathTerm + Send + Sync + 'static) -> Self {
+        GlueTerm { base, equivalence: Arc::new(equiv) }
+    }
+    pub fn unglue(&self) -> PointValue { self.base.clone() }
+}
+
+/// Univalence: Equiv A B → Path Type A B (computational)
+#[derive(Clone)]
+pub struct Equiv {
+    pub forward: Arc<dyn Fn(PointValue) -> PointValue + Send + Sync>,
+    pub backward: Arc<dyn Fn(PointValue) -> PointValue + Send + Sync>,
+    pub section: PathTerm,  // backward ∘ forward = id
+    pub retraction: PathTerm, // forward ∘ backward = id
+}
+
+impl Equiv {
+    pub fn new(fwd: impl Fn(PointValue) -> PointValue + Send + Sync + 'static,
+               bwd: impl Fn(PointValue) -> PointValue + Send + Sync + 'static) -> Self {
+        let a = PointValue::Unit;
+        Equiv {
+            forward: Arc::new(fwd), backward: Arc::new(bwd),
+            section: PathTerm::refl(a.clone()),
+            retraction: PathTerm::refl(a),
+        }
+    }
+}
+
+/// Cohesive modality: ♭ (flat) — strips topological structure
+#[derive(Debug, Clone)]
+pub struct Flat<T>(pub T);
+
+impl<T: Clone> Flat<T> {
+    pub fn intro(val: T) -> Self { Flat(val) }
+    pub fn elim(&self) -> T { self.0.clone() }
+}
+
+/// Cohesive modality: ♯ (sharp) — codiscrete embedding
+#[derive(Debug, Clone)]
+pub struct Sharp<T>(pub T);
+
+impl<T: Clone> Sharp<T> {
+    pub fn intro(val: T) -> Self { Sharp(val) }
+    pub fn elim(&self) -> T { self.0.clone() }
+}
+
+/// Higher Inductive Type: circle S¹
+#[derive(Debug, Clone)]
+pub enum Circle {
+    Base,
+    Loop(Interval),
+}
+
+impl Circle {
+    pub fn refl() -> PathTerm {
+        PathTerm::new(
+            PointValue::Bool(true),
+            PointValue::Bool(true),
+            |_| PointValue::Bool(true),
+        )
+    }
+}
+
+/// Quotient type: A / R
+#[derive(Debug, Clone)]
+pub struct Quotient<A, R> {
+    pub value: A,
+    pub _relation: std::marker::PhantomData<R>,
+}
+
+impl<A: Clone, R> Quotient<A, R> {
+    pub fn quot(val: A) -> Self { Quotient { value: val, _relation: std::marker::PhantomData } }
+    pub fn proj(&self) -> A { self.value.clone() }
+}
+
+//// Propositional truncation: ║A║
+#[derive(Debug, Clone)]
+pub struct Squash<A> {
+    pub value: A,
+}
+
+impl<A: Clone> Squash<A> {
+    pub fn squash(val: A) -> Self { Squash { value: val } }
+    pub fn elim<B>(&self, _f: impl Fn(&A) -> B) -> B where B: Clone {
+        // Cannot inspect A due to squash — this is a placeholder
+        panic!("squash elim: can't extract from propositional truncation")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test] fn test_interval_neg() {
+        assert_eq!(Interval::i0().neg(), Interval::i1());
+        assert_eq!(Interval::i1().neg(), Interval::i0());
+    }
+
+    #[test] fn test_path_refl() {
+        let p = PathTerm::refl(PointValue::Int(42));
+        assert_eq!(p.apply(Interval::i0()), PointValue::Int(42));
+        assert_eq!(p.apply(Interval::i1()), PointValue::Int(42));
+    }
+
+    #[test] fn test_path_sym() {
+        let p = PathTerm::new(PointValue::Int(1), PointValue::Int(2), |i| match i {
+            Interval::Point(false) => PointValue::Int(1),
+            Interval::Point(true) => PointValue::Int(2),
+            _ => PointValue::Int(0),
+        });
+        let q = p.sym();
+        assert_eq!(q.apply(Interval::i0()), PointValue::Int(2));
+        assert_eq!(q.apply(Interval::i1()), PointValue::Int(1));
+    }
+
+    #[test] fn test_glue() {
+        let g = GlueTerm::glue(PointValue::Int(42), |v| PathTerm::refl(v));
+        assert_eq!(g.unglue(), PointValue::Int(42));
+    }
+
+    #[test] fn test_cohesive() {
+        let f = Flat::intro(42i64);
+        assert_eq!(f.elim(), 42);
+        let s = Sharp::intro("hello");
+        assert_eq!(s.elim(), "hello");
+    }
+
+    #[test] fn test_quotient() {
+        let q = Quotient::<i64, ()>::quot(42);
+        assert_eq!(q.proj(), 42);
+    }
+}

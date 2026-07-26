@@ -1,0 +1,30 @@
+;; Phase 5 test: Holes, Determinism, and Contracts
+
+;; Test 1: Typed Holes
+(defn placeholder-fn [x y]
+  "this function is incomplete")
+
+(defn compute [a b c]
+  "stub for compute")
+
+;; Test 2: Hole in expression context
+(defn partial-fn [n]
+  (if (> n 0)
+    (* n (partial-fn (- n 1)))
+    ?base-case))
+
+;; Test 3: Determinism analysis on pure functions
+(defn pure-add [x y]
+  (+ x y))
+
+;; Test 4: Determinism on branching
+(defn safe-div [x y]
+  (if (= y 0)
+    false
+    true))
+
+;; Test 5: Determinism on match
+(defn first-elem [lst]
+  (match lst
+    (Nil) false
+    (Cons x _) true))

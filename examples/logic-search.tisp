@@ -1,0 +1,16 @@
+;; Logic programming with search effect
+
+(defpred append [List a :in, List a :in, List a :out] :det
+  ([[] Ys Ys])
+  ([([X . Xs] Ys [X . Zs])]
+   (append Xs Ys Zs)))
+
+(defpred member [a :free, List a :ground] :nondet
+  ([X [X . _]])
+  ([X [_ . Xs]] (member X Xs)))
+
+;; Find all members
+(handle (member x [1 2 3])
+  (Search)
+  (choose [xs] [k]
+    (fold (fn [acc v] (or (k v) acc)) false xs)))

@@ -1,0 +1,8 @@
+[package]
+name = "tisp-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tisp-core.workspace = true
+im.workspace = true

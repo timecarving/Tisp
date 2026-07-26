@@ -1,0 +1,15 @@
+;; FRP counter with temporal types
+
+(defdata (Stream a)
+  (::: [a, (⃝ (Stream a))]))
+
+(defn const-stream [{stable a : Type}, x : a] -> (Stream a)
+  (::: x (delay (const-stream x))))
+
+(defn running-sum [s : (Stream Int)] -> (Stream Int)
+  (let [go (fn [acc : Int, s : (Stream Int)] -> (Stream Int)
+             (match s
+               (::: x tail)
+               (let [new-acc (+ acc x)]
+                 (::: new-acc (delay (go new-acc (advance tail)))))))]
+    (go 0 s)))

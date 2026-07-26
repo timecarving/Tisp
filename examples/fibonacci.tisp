@@ -1,0 +1,9 @@
+;; Fibonacci with graded types
+;; f uses @2 (twice per call), n uses @1 (linear)
+
+(defn fib [{2 n : Int}] -> Int
+  (if (<= n 1)
+    n
+    (+ (fib (- n 1)) (fib (- n 2)))))
+
+(println (fib 10))

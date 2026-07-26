@@ -1,0 +1,50 @@
+;; Test ADT support
+
+(defdata (Maybe a)
+  (Nothing)
+  (Just a))
+
+(defdata (List a)
+  (Nil)
+  (Cons a (List a)))
+
+(defdata Color
+  (Red)
+  (Green)
+  (Blue))
+
+(defdata (Pair a b)
+  (MkPair a b))
+
+;; Test constructor usage
+(defn make-just [x]
+  (Just x))
+
+(defn make-nothing []
+  (Nothing))
+
+(defn make-list []
+  (Cons 1 (Cons 2 (Cons 3 (Nil)))))
+
+(defn make-pair [x y]
+  (MkPair x y))
+
+;; Test pattern matching
+(defn maybe-to-string [m]
+  (match m
+    (Nothing) "nothing"
+    (Just x) "just"))
+
+(defn list-length [lst]
+  (match lst
+    (Nil) 0
+    (Cons _ rest) (+ 1 (list-length rest))))
+
+(defn main []
+  (let [j (make-just 42)
+        n (make-nothing)
+        lst (make-list)
+        p (make-pair 1 "hello")]
+    (println (maybe-to-string j))
+    (println (maybe-to-string n))
+    (println (list-length lst))))

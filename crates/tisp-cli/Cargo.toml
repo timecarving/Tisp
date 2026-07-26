@@ -1,0 +1,26 @@
+[package]
+name = "tisp-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "tisp"
+path = "src/main.rs"
+
+[dependencies]
+tisp-core.workspace = true
+tisp-frontend.workspace = true
+tisp-middle.workspace = true
+tisp-backend.workspace = true
+tisp-runtime.workspace = true
+clap.workspace = true
+rustyline.workspace = true
+miette.workspace = true
+
+[features]
+default = []
+llvm = ["dep:inkwell", "tisp-backend/llvm"]
+
+[dependencies.inkwell]
+workspace = true
+optional = true

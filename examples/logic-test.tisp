@@ -1,0 +1,29 @@
+;; Phase 14a test: Mercury-style logic programming
+
+;; Simple predicate with backtracking
+(defpred member [x y]
+  (== x y)
+  (search))
+
+;; Relation definition
+(defpred append [xs ys zs]
+  (fresh [h t zt]
+    (== xs (cons h t))
+    (== zs (cons h zt))
+    (append t ys zt))
+  (== xs nil)
+  (== zs ys))
+
+;; Deterministic predicate
+(defpred length [xs n] :det
+  (fresh [h t m]
+    (== xs (cons h t))
+    (== n (+ m 1))
+    (length t m))
+  (== xs nil)
+  (== n 0))
+
+;; Main entry
+(defn main []
+  (search (member 42 [1 2 42 3]))
+  (println "OK"))
