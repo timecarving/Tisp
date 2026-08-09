@@ -142,7 +142,7 @@ tisp [OPTIONS] [FILE]
       --typecheck        运行类型推断
       --run              运行程序(解释执行)
       --verify           运行模型检查
-      --ir               生成 LLVM IR 文本
+      --ir               生成 LLVM IR(启用 llvm feature 时为 inkwell 真实 IR,否则文本 IR)
       --compile          JIT 编译运行(需 llvm 特性)
 ```
 

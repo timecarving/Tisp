@@ -9,7 +9,7 @@
 
 | 章 | 特性 | 状态 | 摘要 |
 |----|------|------|------|
-| 1 | Introduction | ⚠️ | Lisp-1/无 GC 区域栈已落地;LLVM 仅文本 IR 骨架 |
+| 1 | Introduction | ✅ | Lisp-1/无 GC 区域栈已落地;LLVM 经 inkwell 生成真实 IR(llvm feature,llc 验证) |
 | 2 | Design Philosophy | ⚠️ | 统一 def+六维注解、语法糖脱糖最实;统一约束求解、演算统一未达成 |
 | 3 | Lexical Structure | ⚠️ | 标识符/字面量/行注释/块注释 `#| |#`/字符串转义齐; |
 | 4 | Data Structures | ⚠️ | List/Unit/构造器(list/vector/hash-map/hash-set)可用;Vec/Map/Set 无持久化语义;quote 不产生数据 |
@@ -38,7 +38,7 @@
 | 27 | Process Calculi | ✅ | π 通道(FIFO)/Async/加密/spi commit-check/SKI 组合子/ambient/ρ/κ 全部接线 |
 | 28 | Verification | ⚠️ | defprop 属性声明+verify 内置+ModelChecker 可达性;find-attack/dolev-yao 缺 |
 | 29 | Built-in Functions | ⚠️ | 90+ 注册、集合/字符串/IO/构造器齐;反射函数硬编码 |
-| 30 | Compiler Pragmas | ⚠️ | inline!/specialize!/opt-level/suppress-warning 语法接受;--ir 文本生成 |
+| 30 | Compiler Pragmas | ⚠️ | inline!/specialize!/opt-level/suppress-warning 语法接受;--ir 经 inkwell 生成真实 IR(llvm feature),非 llvm 回退文本 |
 
 ---
 
@@ -59,7 +59,7 @@
 | 9 | 模块系统 | §25 | ns 的 requires/refers 被丢弃;NSDef 空操作;stdlib Namespace 未接入 |
 | 10 | FFI 真实语义 | §26 | 无链接/调用;PtrRead/Write 透传;Unsafe 门控未强制 |
 | 11 | 验证(属性/等价/攻击) | §28 | defprop/verify/check-equivalence/find-attack/dolev-yao 全缺 |
-| 12 | 编译指示 | §30 | inline!/specialize!/opt-level/suppress-warning 无处理 |
+| 12 | 编译指示 | §30 | inline!/specialize!/opt-level/suppress-warning 无处理;--ir 在 llvm feature 下经 inkwell 生成真实 IR(递归/多参调用/if-phi,llc 验证),非 llvm 回退文本生成器 |
 
 ### ⚠️ 部分实现(有骨架、语义残缺)
 

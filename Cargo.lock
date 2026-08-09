@@ -926,6 +926,7 @@ name = "tisp-backend"
 version = "0.1.0"
 dependencies = [
  "inkwell",
+ "llvm-sys",
  "miette",
  "thiserror 2.0.19",
  "tisp-core",

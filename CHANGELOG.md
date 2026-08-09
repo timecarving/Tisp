@@ -9,6 +9,13 @@
 
 ### 新增
 
+**LLVM 工具链与真实 IR 生成(§30)**
+- LLVM 工具链接线:`LLVM_SYS_170_PREFIX=/usr/lib/llvm-17`(零安装,Debian llvm-17 共享库);workspace 直接依赖 `llvm-sys 170` + `force-dynamic` feature 修复静态库缺失
+- `IrGenerator` 重构:启用 `llvm` feature 时用 inkwell 生成真实 LLVM IR(函数参数绑定、多参调用收集、比较结果 zext i64、if/else phi 汇合),非 llvm 回退文本生成器
+- 修复文本生成器三个缺陷:函数参数被忽略、调用最后参数丢失、icmp 操作数类型不匹配
+- `--ir` 输出经 `llc-17` 编译验证合法(fibonacci/advanced-test)
+- z3 feature 需安装 `libclang-17-dev`(bindgen 依赖 libclang C API)
+
 **效果系统(§12)**
 - `handle`/`perform` 运行时:handler 作用域栈、按操作名分发、续延闭包 `k`(`(k result new_state)` 状态回写;`(k v)` 搜索续延)
 - 内置效果操作注册:`get`/`put`/`ask`/`tell`/`throw`/`choose`,无 handler 时明确报错

@@ -12,10 +12,14 @@ thiserror.workspace = true
 
 [features]
 default = []
-llvm = ["dep:inkwell"]
+llvm = ["dep:inkwell", "dep:llvm-sys"]
 z3 = ["dep:z3"]
 
 [dependencies.inkwell]
+workspace = true
+optional = true
+
+[dependencies.llvm-sys]
 workspace = true
 optional = true
 
