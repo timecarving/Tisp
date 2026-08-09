@@ -5,6 +5,17 @@ use tisp_core::core_ast::*;
 use tisp_core::types::Type;
 use std::collections::HashMap;
 
+/// 把 IR 中最后一条 "ret i64 %X" 转成 "target = add i64 %X, 0"(支持多行)
+fn ret_to_assign(ir: &str, target: &str) -> String {
+    if let Some(idx) = ir.rfind("  ret i64 ") {
+        let (head, tail) = ir.split_at(idx);
+        let val = tail.trim_start().trim_start_matches("ret i64 ").trim();
+        format!("{}{} = add i64 {}, 0", head, target, val)
+    } else {
+        ir.to_string()
+    }
+}
+
 /// Map Tisp type to LLVM IR type string
 pub fn tisp_type_to_llvm(ty: &Type) -> String {
     match ty {
@@ -65,7 +76,7 @@ impl IrGenerator {
 
             let body_ir = self.compile_expr(&def.body);
             let fn_ir = format!(
-                "define i64 @{}({{\nentry:\n{}{}}}\n",
+                "define i64 @{}() {{\nentry:\n{}{}\n}}\n",
                 def.name.as_str(), self.ir_buf, body_ir
             );
             ir.push_str(&fn_ir);
@@ -141,7 +152,7 @@ impl IrGenerator {
         let body_ir = self.compile_expr(body);
         self.locals.remove(name.as_str());
 
-        format!("{}\n{}", value_ir.replace("ret i64", &format!("%{} = add i64", val_reg)), body_ir)
+        format!("{}\n{}", ret_to_assign(&value_ir, &format!("%{}", val_reg)), body_ir)
     }
 
     fn compile_if(&mut self, cond: &CoreExpr, then: &CoreExpr, else_: &CoreExpr) -> String {
@@ -153,6 +164,7 @@ impl IrGenerator {
 
         let then_body = self.compile_expr(then);
         let else_body = self.compile_expr(else_);
+        let phi_target = self.fresh_reg();
 
         format!(
             "  %{} = icmp ne i64 {}, 0\n  br i1 %{}, label %{}, label %{}\n\
@@ -160,9 +172,9 @@ impl IrGenerator {
              {}:\n{}\n  br label %{}\n\
              {}:\n  %{} = phi i64 [%tmp_then, {}], [%tmp_else, {}]\n  ret i64 %{}",
             result, cond_val, result, then_label, else_label,
-            then_label, then_body.replace("ret i64", "%tmp_then = add i64"), merge_label,
-            else_label, else_body.replace("ret i64", "%tmp_else = add i64"), merge_label,
-            merge_label, self.fresh_reg(), then_label, else_label, self.fresh_reg()
+            then_label, ret_to_assign(&then_body, "%tmp_then"), merge_label,
+            else_label, ret_to_assign(&else_body, "%tmp_else"), merge_label,
+            merge_label, phi_target, then_label, else_label, phi_target
         )
     }
 
@@ -200,5 +212,78 @@ impl IrGenerator {
 
     fn fresh_label(&mut self) -> String {
         let l = format!("L{}", self.next_label); self.next_label += 1; l
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tisp_core::span::Span;
+    use tisp_core::symbol::Symbol;
+
+    fn expr(node: CoreExprNode) -> CoreExpr {
+        CoreExpr::new(node, Span::dummy())
+    }
+
+    fn def(name: &str, body: CoreExpr) -> CoreDef {
+        CoreDef {
+            name: Symbol::new(name),
+            ty: None,
+            effects: tisp_core::types::EffectRow::Pure,
+            grade: tisp_core::types::Grade::Omega,
+            mode: tisp_core::types::Mode::In,
+            determinism: tisp_core::types::Determinism::Det,
+            body,
+            requires: None,
+            ensures: None,
+            span: Span::dummy(),
+        }
+    }
+
+    #[test]
+    fn test_ir_function_header() {
+        // §30:define i64 @main() { 语法正确
+        let body = expr(CoreExprNode::Lit(Literal::I64(42)));
+        let program = CoreProgram { data_decls: vec![], effect_decls: vec![], defs: vec![def("main", body)] };
+        let ir = IrGenerator::new().generate(&program);
+        assert!(ir.starts_with("define i64 @main() {\nentry:\n"), "header malformed: {}", ir);
+        assert!(ir.ends_with("}\n"), "missing closing brace");
+        assert!(ir.contains("ret i64"));
+    }
+
+    #[test]
+    fn test_ir_arithmetic() {
+        // (+ 21 21) → add 指令
+        let add = expr(CoreExprNode::App(
+            Box::new(expr(CoreExprNode::App(Box::new(expr(CoreExprNode::Var(Symbol::new("+")))), Box::new(expr(CoreExprNode::Lit(Literal::I64(21))))))),
+            Box::new(expr(CoreExprNode::Lit(Literal::I64(21)))),
+        ));
+        let program = CoreProgram { data_decls: vec![], effect_decls: vec![], defs: vec![def("main", add)] };
+        let ir = IrGenerator::new().generate(&program);
+        assert!(ir.contains("= add i64 "), "expected add instruction: {}", ir);
+    }
+
+    #[test]
+    fn test_ir_phi_register_consistency() {
+        // if 编译:phi 目标与 ret 引用同一寄存器
+        let cond = expr(CoreExprNode::App(
+            Box::new(expr(CoreExprNode::App(Box::new(expr(CoreExprNode::Var(Symbol::new(">")))), Box::new(expr(CoreExprNode::Lit(Literal::I64(1))))))),
+            Box::new(expr(CoreExprNode::Lit(Literal::I64(0)))),
+        ));
+        let ife = expr(CoreExprNode::If(
+            Box::new(cond),
+            Box::new(expr(CoreExprNode::Lit(Literal::I64(1)))),
+            Box::new(expr(CoreExprNode::Lit(Literal::I64(0)))),
+        ));
+        let program = CoreProgram { data_decls: vec![], effect_decls: vec![], defs: vec![def("main", ife)] };
+        let ir = IrGenerator::new().generate(&program);
+        assert!(ir.contains("phi i64"), "expected phi: {}", ir);
+        // 每处 ret i64 %N 引用的寄存器都有定义
+        for line in ir.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("ret i64 %") {
+                assert!(ir.contains(&format!("%{} = ", rest)), "ret references undefined %{}", rest);
+            }
+        }
     }
 }

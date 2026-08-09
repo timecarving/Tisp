@@ -123,9 +123,48 @@ impl ConstraintStore {
         }
     }
 
+    /// 把另一个 store 中已绑定的变量并入本 store(用于 and_parallel 结果合并)。
+    /// 共享变量(本 store 已存在的 id)直接 unify 回原变量(约束生效且冲突可检测);
+    /// 仅线程新建的变量(id 在本 store 不存在)分配新编号避免冲突。
+    pub fn merge_from(&mut self, other: &ConstraintStore) -> bool {
+        let mut id_map: HashMap<u64, u64> = HashMap::new();
+        let mut next = self.next_id;
+        for id in other.vars.keys() {
+            if !self.vars.contains_key(id) {
+                id_map.entry(*id).or_insert_with(|| {
+                    let n = next;
+                    next += 1;
+                    n
+                });
+            }
+        }
+        for (id, var) in &other.vars {
+            if let LVar::Bound(v) = var {
+                let mapped_id = if self.vars.contains_key(id) { *id } else { id_map[id] };
+                let new_var = LogicValue::Var(mapped_id);
+                let new_val = remap_value(&other.deref(v), &id_map);
+                if !self.unify(&new_var, &new_val) {
+                    return false;
+                }
+            }
+        }
+        self.next_id = next;
+        true
+    }
+
     /// Mark a choice point (before trying alternatives)
     pub fn mark_choice_point(&mut self) {
         self.choice_points.push((self.trail.len(), 0));
+    }
+
+    /// 当前 choice point 数量(Search 失败回滚时用于截断)
+    pub fn choice_points_len(&self) -> usize {
+        self.choice_points.len()
+    }
+
+    /// 截断 choice points 到指定数量(失败回溯后清理)
+    pub fn truncate_choice_points(&mut self, len: usize) {
+        self.choice_points.truncate(len);
     }
 
     /// Cut — commit to current choice, discard alternatives
@@ -188,6 +227,18 @@ impl ConstraintStore {
 
 /// A goal is a function that takes a state and produces a stream of results
 pub type Goal = Rc<dyn Fn(&mut ConstraintStore) -> bool>;
+
+/// 把逻辑值中的变量 id 按映射重编号(未在映射中的 id 保持原值)
+fn remap_value(v: &LogicValue, id_map: &HashMap<u64, u64>) -> LogicValue {
+    match v {
+        LogicValue::Var(id) => LogicValue::Var(*id_map.get(id).unwrap_or(id)),
+        LogicValue::Cons(h, t) => LogicValue::Cons(
+            Box::new(remap_value(h, id_map)),
+            Box::new(remap_value(t, id_map)),
+        ),
+        _ => v.clone(),
+    }
+}
 
 /// Create a goal that always succeeds
 pub fn succeed() -> Goal {

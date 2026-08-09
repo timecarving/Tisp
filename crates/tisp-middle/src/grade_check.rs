@@ -251,7 +251,7 @@ impl GradeChecker {
                 self.usage_env.bind(name.clone(), Grade::Omega);
             }
             Pattern::Lit(_) => {}
-            Pattern::Con(con_name, subpats) => {
+            Pattern::Con(_, subpats) => {
                 // Zero-multiplicity check: constructor patterns break parametricity
                 // when matching on a 0-multiplicity type variable
                 for subpat in subpats {

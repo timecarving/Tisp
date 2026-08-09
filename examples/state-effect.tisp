@@ -5,7 +5,9 @@
   (put [s] -> Unit))
 
 (defn run-state [init f]
-  (handle (f)
+  ;; §12.2:handle 的 state 槽初始为空;先 (put init) 初始化状态再执行 body
+  (handle (let [_ (put init)]
+            (f))
     (State s)
     (get [] [k s] (k s s))
     (put [v] [k _s] (k Unit v))))

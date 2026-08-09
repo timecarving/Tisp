@@ -18,9 +18,12 @@ pub enum Token {
     #[token("#")] Hash,
     #[token("@")] At,
     #[token(".")] Dot,
+    #[token(",")] Comma,
     #[token(":")] Colon,
     #[token("->")] Arrow,
     #[token("|")] Pipe,
+    // ⃝ (U+20DD) 时态算子:⃝ A = 下一时刻可用的值(§18.1)
+    #[token("⃝")] Next,
 
     #[regex(r"-?[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?", priority = 3, callback = |lex| lex.slice().parse::<f64>().ok())]
     Float(f64),
@@ -37,13 +40,15 @@ pub enum Token {
     #[regex(r"\\(newline|space|tab|.)", parse_char_literal)]
     Char(char),
 
-    #[regex(r":[a-zA-Z_!\-?+*/<>=&%#][a-zA-Z0-9_!\-?+*/<>=&%#.:]*", |lex| {
+    #[regex(r":[a-zA-Z_!\-?+*/<>=&%#][a-zA-Z0-9_!\-?+*/<>=&%#.:]*", priority = 2, callback = |lex| {
         let s = lex.slice();
         Some(s[1..].to_string())
     })]
     Keyword(String),
 
-    #[regex(r"[a-zA-Z_!\-?+*/<>=&%][a-zA-Z0-9_!\-?+*/<>=&%.:]*", |lex| lex.slice().to_string())]
+    // 第一字符类含 ':' 以支持 :: / ::: 等构造器名(§18.2 Stream 的 (::: ...));
+    // Keyword 的 priority 更高,`:foo` 仍归 Keyword
+    #[regex(r"[a-zA-Z_!\-?+*/<>=&%:][a-zA-Z0-9_!\-?+*/<>=&%.:]*", priority = 1, callback = |lex| lex.slice().to_string())]
     Ident(String),
 
     #[token("true", |_| true)] #[token("false", |_| false)]

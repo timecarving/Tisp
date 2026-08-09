@@ -1,394 +1,231 @@
 # 01 — Tisp 核心语言参考
 
-> 覆盖：词法结构 · 数据类型 · 表达式 · 定义 · ADT · 模式匹配 · 类型系统基础
+> 覆盖：词法结构 · 数据类型 · 表达式 · 定义 · ADT/GADT · 模式匹配 · 类型系统基础
+> 本文档对齐当前实现(0.1.0)，所有语法均可由 `cargo run -- --run <file>` 实际运行验证。
 
 ---
 
 ## 1. 词法结构
 
-### 1.1 字符集与编码
+### 1.1 字符集与注释
 
 源文件使用 **UTF-8** 编码。
 
-### 1.2 注释
-
 ```clojure
 ;; 行注释 — 到行尾为止
-#| 块注释
-   可以跨多行 |#
 ```
 
-### 1.3 空白符
+### 1.2 标识符与关键字
 
-空格、制表符、换行符、换页符用作 token 分隔符，无其他语义。
-
-### 1.4 标识符
+标识符由字母、数字与符号字符组成：
 
 ```
 标识符 ::= (字母 | 符号-char)+
-
-符号-char ::= 字母 | 数字 | - | _ | ? | ! | = | < | > | * | / | + | .
+符号-char ::= 字母 | 数字 | - | _ | ? | ! | = | < | > | * | / | + | . | :
 ```
 
-✅ 合法标识符示例：`x`, `add-one`, `list-length`, `+`, `->`, `foo?`, `set!`
+- 普通标识符：`x`、`add-one`、`list-length`、`foo?`、`set!`、`+`、`->`
+- **以 `:` 开头的标识符**（如 `:else`、`:free`）是关键字/标签（keyword），用作命名参数、模式注解与特殊标记
+- **以 `:` 开头的构造器名**（如 `::`、`:::`）合法——`:::` 用于 FRP 流的构造（§8）
 
-### 1.5 关键字
+### 1.3 特殊字符与分隔符
 
-以 `:` 开头的标识符用作命名参数/标签：
+| 字符 | 含义 |
+|------|------|
+| `,` | 分隔符（元组/向量/参数列表中的分隔，可忽略） |
+| `[` `]` | 向量字面量与模式列表 |
+| `(` `)` | 列表（调用/分组）与模式列表 |
+| `.` | cons 模式尾标记（`[X . Xs]`） |
+| `⃝` | 时态算子：`⃝ A` 表示「下一时刻的 A」，等价于 `(delay A)` |
+| `nil` | 空值（`Unit` 字面量） |
+
+### 1.4 字面量
 
 ```clojure
-:requires  :ensures  :in  :out  :det  :around
+42            ; 整数 (i64)
+3.14          ; 浮点数 (f64)
+true false    ; 布尔
+"hello"       ; 字符串
+\a            ; 字符
+nil           ; Unit(也写作 `Unit`)
+:tag          ; 关键字
 ```
-
-### 1.6 字面量
-
-| 类型 | 语法 | 示例 | ✅ 实现 |
-|------|------|------|---------|
-| 整数 (i64) | `-?[0-9]+` | `42`, `-7`, `0` | ✅ |
-| 浮点数 (f64) | `-?[0-9]+\.[0-9]+` | `3.14`, `-0.5` | ✅ |
-| 布尔 | `true` / `false` | `true` | ✅ |
-| 字符串 | `"[^"]*"` | `"hello"` | ✅ |
-| 字符 | `\c` | `\a`, `\n` | ⚠️ (部分) |
-| Nil / 空列表 | `nil` | `nil` | ✅ |
-
-### 1.7 特殊字符
-
-| 字符 | 作用 |
-|------|------|
-| `(` `)` | 列表/表达式定界符 |
-| `[` `]` | 向量定界符 |
-| `{` `}` | Map/Set 定界符 |
-| `'`  | 引号 (quote) |
-| `#`  | 指令前缀 |
 
 ---
 
 ## 2. 数据类型
 
-### 2.1 原始类型
+| 类型 | 语法 | 说明 |
+|------|------|------|
+| List | `(cons 1 (cons 2 (Nil)))` | 不可变链表；`Nil`/`Cons` 为 ADT 构造器 |
+| Vector | `[1 2 3]` | 向量字面量，desugar 为 `Vec` 构造 |
+| Map | 设计阶段 | 见 docs/spec.md §4.3 |
+| Set | `#{1 2 3}` | 设计阶段 |
+| Unit | `nil` / `Unit` | 空值 |
 
-| Tisp 类型 | Rust 对应 | 字面量示例 |
-|-----------|----------|-----------|
-| `i8` `i16` `i32` `i64` | `i8`..`i64` | `42` (i64), `-7` |
-| `u8` `u16` `u32` `u64` | `u8`..`u64` | `255u8` ⚠️ (语法未实现) |
-| `f32` `f64` | `f32` `f64` | `3.14` (f64) |
-| `bool` | `bool` | `true`, `false` |
-| `String` | `String` | `"hello"` |
-| `Unit` | `()` | 函数无返回时 |
-
-### 2.2 复合类型 ✅
-
-| 类型 | 构造语法 | 示例 |
-|------|---------|------|
-| 列表 | `(1 2 3)` | `(Cons 1 (Cons 2 (Nil)))` |
-| 向量 | `[1 2 3]` | `[x y z]` |
-| Map | `{:a 1 :b 2}` | ⚠️ (语法已解析，未完全脱糖) |
-| Set | `#{1 2 3}` | ⚠️ (语法已解析，未完全脱糖) |
-| 元组 | `(1 "a" true)` | ⚠️ (语法设计阶段) |
-
-### 2.3 函数类型 ✅
-
-```
-(param-type ->[effects, region, @grade, mode, det] return-type)
-```
-
-简化形式（省略标注 = 使用默认值）：
-
-```clojure
-i64 -> i64            ; 纯函数，ω 使用，det 确定性
-i64 ->[IO] Unit       ; 带 IO 效果的函数
-```
+向量字面量在**模式匹配**中与 Cons 链兼容：模式 `[X . _]` 可以匹配向量 `[1 2 3]`（§21 逻辑编程中常用）。
 
 ---
 
 ## 3. 表达式
 
-### 3.1 字面量 ✅
+### 3.1 函数应用(多参数)
 
 ```clojure
-42        ; i64
-3.14      ; f64
-true      ; bool
-"hello"   ; String
-nil       ; nil/空列表
+(+ 1 2)        ; => 3
+(+ 1 2 3)      ; => 6(多参数折叠)
+(println "hi") ; 输出 hi
 ```
 
-### 3.2 变量引用 ✅
+应用为左结合，解释器把应用链的参数合并后一次性分发；内置函数按 arity 支持部分应用：
 
 ```clojure
-x         ; 在当前作用域查找 x
+((+ 1) 2)      ; => 3(部分应用/柯里化)
 ```
 
-### 3.3 函数调用 ✅
+### 3.2 Lambda
 
 ```clojure
-(f arg1 arg2 ...)
+(fn [x] (* x 2))           ; 单表达式
+(fn [x]
+  (println x)
+  (* x 2))                 ; 多表达式(依次求值,返回最后一个)
 ```
 
-Tisp 采用 **左结合函数调用**：`(+ 1 2)` 等价于把 `+` 作用于 `1` 和 `2`。
+### 3.3 Let 绑定
 
 ```clojure
-(+ 1 2 3)       ; → 6
-(* (+ 3 4) 2)   ; → 14
-(println "hi")  ; 输出 "hi"，返回 ()
+(let [x 1
+      y 2]
+  (+ x y))                 ; => 3(多 body 依次求值)
 ```
 
-### 3.4 Lambda 表达式 ✅
+### 3.4 条件
 
 ```clojure
-(fn [x] (+ x 1))
-(fn [x y] (* x y))
+(if (> x 0) "pos" "neg")
+(cond (< x 0) "neg"
+      (= x 0) "zero"
+      :else   "pos")       ; :else 分支;无 :else 时最后一项为默认值
 ```
 
-### 3.5 Let 绑定 ✅
+### 3.5 Do
 
 ```clojure
-(let [x 42
-      y (+ x 8)]
-  (println y))          ; 输出 50
+(do expr1 expr2 expr3)     ; 依次求值,返回最后一个
 ```
 
-Let 绑定按顺序求值，后续绑定可引用前面的变量。
-
-### 3.6 If 表达式 ✅
+### 3.6 模式匹配
 
 ```clojure
-(if condition then-expr else-expr)
+(match lst
+  (Nil) 0
+  (Cons x _) x)
 ```
 
-```clojure
-(if (<= n 1)
-  1
-  (* n (factorial (- n 1))))
-```
-
-### 3.7 Cond 表达式 ⬜
-
-多分支条件（设计阶段）：
+### 3.7 宏展开(§24)
 
 ```clojure
-(cond
-  (< x 0)  "negative"
-  (= x 0)  "zero"
-  :else    "positive")
-```
+(defmacro unless [cond then]
+  (if cond nil then))
 
-### 3.8 Do 表达式 ✅
-
-顺序执行多个表达式，返回最后一个的值：
-
-```clojure
-(do
-  (println "processing...")
-  (compute-result)
-  (return-value))
-```
-
-### 3.9 类型标注 ✅
-
-```clojure
-x : i64
-name : String
-f : (i64 -> i64)
+(unless false 42)          ; => 42
 ```
 
 ---
 
 ## 4. 定义
 
-### 4.1 值定义 `(def name body)` ✅
+### 4.1 函数
 
 ```clojure
-(def answer 42)
-(def greeting (str "Hello, " name))
+(defn add [a b] (+ a b))
+(defn counter []           ; 零参函数:(counter) 调用
+  (println "tick")
+  1)
 ```
 
-### 4.2 函数定义 `(defn name [params] body)` ✅
+### 4.2 顶层表达式
+
+顶层非定义表达式会被收集为隐式入口 `__top__` 并执行：
 
 ```clojure
-(defn add [x y]
-  (+ x y))
-
-(defn factorial [n]
-  (if (<= n 1)
-    1
-    (* n (factorial (- n 1)))))
+(defn main [] 42)
+(println (main))           ; 顶层表达式,输出 42
 ```
 
-### 4.3 带类型标注的函数定义 ✅
+### 4.3 代数数据类型(§7)
 
 ```clojure
-(defn add-one [x : i64] -> i64
-  (+ x 1))
+(defdata (List a)
+  (Nil)
+  (Cons a (List a)))
 
-(defn greet [name : String] ->[IO] Unit
-  (println (str "Hello, " name)))
+(defdata (Maybe a)
+  (Nothing)
+  (Just a))
 ```
 
-### 4.4 带合约的函数定义 ⚠️
+构造器自动注册：零参构造经 `(Nil)` 调用，带参构造直接调用 `(Just 42)`。
+
+### 4.4 GADT 字段列表(§7.3)
 
 ```clojure
-(defn divide [n : i64, d : {x : i64 | (!= x 0)}] -> i64
-  :requires true
-  :ensures (= result (quot n d))
-  (quot n d))
+(defdata (Expr a)
+  (IntLit  [Int]        -> (Expr Int))
+  (BoolLit [Bool]       -> (Expr Bool))
+  (Add     [(Expr Int), (Expr Int)] -> (Expr Int)))
 ```
 
-> ⚠️ `:requires` / `:ensures` 语法已解析但液态类型验证未完成。
-
-### 4.5 递归函数 ✅
+### 4.5 谓词(§21,逻辑编程)
 
 ```clojure
-(defn list-length [lst]
-  (match lst
-    (Nil) 0
-    (Cons _ rest) (+ 1 (list-length rest))))
+(defpred member [X Xs]
+  ([X [X . _]])
+  ([X [_ . T]] (member X T)))
+
+(member 3 [1 2 3])       ; 成功
+(member 9 [1 2 3])       ; => false(失败不报错)
 ```
 
-### 4.6 统一 `def` 形式
-
-所有定义都是 `def` 的特化形式，带有六维标注（缺省使用默认值）：
+### 4.6 效果声明与处理器(§12)
 
 ```clojure
-(def name                   ; 名称
-  [p1 : T1, ...]            ; 参数
-  ->[ε, ρ, @r, m, d] Ret    ; 六维标注（可选）
-  body)                     ; 主体
-```
+(defeffect State s
+  (get [] -> s)
+  (put [s] -> Unit))
 
-| 维度 | 缩写 | 默认值 | 含义 |
-|------|------|--------|------|
-| 效果 | ε | `Pure` | 副作用集合 |
-| 区域 | ρ | (推断) | 内存分配区域 |
-| 等级 | @r | `ω` | QTT 使用次数 |
-| 模式 | m | `In` | Mercury 模式 |
-| 确定性 | d | `Det` | 解数+失败可能 |
+(handle (let [_ (put 0)] (f))
+  (State s)
+  (get [] [k s] (k s s))
+  (put [v] [k _s] (k Unit v)))
+```
 
 ---
 
-## 5. 代数数据类型 (ADT)
+## 5. 代数数据类型与模式匹配
 
-### 5.1 定义数据类型 `(defdata ...)` ✅
-
-```clojure
-(defdata (Maybe a)          ; 单类型参数
-  (Nothing)                 ; 无字段构造器
-  (Just a))                 ; 带字段构造器
-
-(defdata Color              ; 无参数
-  (Red) (Green) (Blue))
-
-(defdata (Pair a b)         ; 多类型参数
-  (MkPair a b))
-```
-
-### 5.2 构造器应用 ✅
+构造器字段可匿名或命名(§7.2)：
 
 ```clojure
-(Just 42)                   ; → (Just 42) : Maybe i64
-(Nothing)                   ; → Nothing : Maybe ?a
-(MkPair 1 "hello")          ; → MkPair 1 "hello" : Pair i64 String
+(defdata Person
+  (MkPerson {name : String, age : Int}))
+
+(match p
+  (MkPerson n a) (println n a))
 ```
 
-构造器自动拥有正确的多态类型方案，在应用时进行即时化（instantiation）。
-
-### 5.3 模式匹配 `(match ...)` ✅
-
-```clojure
-(defn maybe-to-string [m]
-  (match m
-    (Nothing) "nothing"
-    (Just x) (str "just: " x)))
-```
-
-支持的 match arm 形式：
-
-| 形式 | 语义 |
-|------|------|
-| `(Pattern body)` | 无 guard 的分支 |
-| `(Pattern :when guard body)` | 带 guard 的分支 ⬜ |
-
-支持的 Pattern 形式：
-
-| Pattern | 示例 | 语义 |
-|---------|------|------|
-| 变量 | `x` | 绑定任意值 |
-| 通配符 | `_` | 匹配任意，不绑定 |
-| 构造器 | `(Just x)` | 匹配指定构造器 |
-| 构造器嵌套 | `(Cons x (Cons y (Nil)))` | 深层匹配 |
-| 字面量 | `42`, `true` | 精确匹配 ⚠️ |
+模式种类：变量、通配符 `_`、字面量、构造器、cons 模式 `[X . Xs]`、向量模式 `[a b c]`(编译为 Cons 链)。
 
 ---
 
-## 6. 类型系统
+## 6. 类型系统基础
 
-### 6.1 HM 类型推断 (Algorithm W) ✅
+内置类型：`i8/i16/i32/i64/u8/u16/u32/u64/f32/f64/bool/String/Unit`。
 
-Tisp 使用 **Hindley-Milner 类型推断**，支持：
+- 函数类型：`(a -> b)`、效果行 `(a ->[{IO}] b)`(§12.4)
+- 多态：类型参数经 defdata 声明，如 `(List a)`
+- 类型推断：`cargo run -- --typecheck <file>` 运行；对 ADT/函数/模式匹配推断
+- 等级(§QTT)：`Grade::Zero/One/Omega`，`grade_check` 校验线性资源
 
-- **类型变量**：`?1`, `?2`, ... 自动生成
-- **合一 (Unification)**：通过 occurs check 解决 `t1 = t2`
-- **即时化 (Instantiation)**：每次使用多态类型时用新鲜变量替换
-- **泛化 (Generalization)**：let 绑定中泛化不在环境中的自由类型变量
-
-```clojure
-(defn id [x] x)
-;; 推断类型: id : ∀a. a → a
-;; 实际输出: id : ?1 -> ?1
-
-; 每次调用 id 使用不同的即时化:
-(defn main []
-  (let [a (id 42)      ; id : i64 → i64
-        b (id "hello")] ; id : String → String
-    a))
-```
-
-### 6.2 函数类型构造
-
-```clojure
-i64 -> i64                      ; defn add [x : i64] -> i64 (+ x 1)
-i64 -> i64 -> i64               ; defn add [x y] (+ x y)
-i64 ->[IO] Unit                 ; defn print-val [x] (println x)
-```
-
-### 6.3 多态与泛化
-
-`let` 绑定的值如果其类型中的变量不在当前环境中，则泛化为 `Forall` 类型方案：
-
-```clojure
-(defn const [x y] x)
-;; const : ?3 -> ?4 -> ?3   (类型保留为变量，因为 y 自由)
-
-; 但一旦实例化到 let 中：
-(let [f (fn [x] x)]
-  ;; f : ∀a. a → a (泛化后)
-  ...)
-```
-
-### 6.4 类型环境 (TypeEnv)
-
-内置类型环境注册了所有原始运算的类型方案：
-
-```clojure
-+ : i64 -> i64 -> i64
-= : ∀a. a -> a -> bool
-println : ∀a. a ->[IO] Unit
-```
-
-### 6.5 Kind 系统 ⚠️
-
-```
-Kind ::= Star | Arrow(Kind, Kind) | Effect | Grade | Region | Mode | Determinism | Session
-```
-
-Kind 类型已在 Core 中完整定义，但 kind checking 在类型推断中只有 basic 支持。
-
-### 6.6 液态/Refinement 类型 ⚠️
-
-```clojure
-{x : T | predicate}
-```
-
-> ⚠️ 类型变体 `Type::Refined` 已定义，`requires`/`ensures` 语法已解析，但 Z3 验证仅部分集成。
-
----
+> 注：类型推断(`type_infer`)覆盖核心语言；部分高级节点(如 effect perform)的类型规则仍在完善中。

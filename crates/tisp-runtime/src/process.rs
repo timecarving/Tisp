@@ -12,7 +12,6 @@ impl<T: Clone + Send> AsyncChannel<T> {
     pub fn new() -> Self { Self { buffer: Arc::new(Mutex::new(VecDeque::new())) } }
     pub fn send(&self, val: T) { self.buffer.lock().unwrap().push_back(val); }
     pub fn recv(&self) -> Option<T> { self.buffer.lock().unwrap().pop_front() }
-    pub fn try_recv(&self) -> Option<T> { self.buffer.lock().unwrap().pop_front() }
 }
 
 /// Applied π-calculus: cryptographic primitives

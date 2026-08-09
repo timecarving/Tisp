@@ -1,13 +1,13 @@
 /// Constraint Logic Programming (CLP) runtime
 /// Supports CLP(FD) — Constraint Logic Programming over Finite Domains
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
-/// A finite domain for constraint variables
+/// A finite domain for constraint variables(有序集合,label 按升序枚举解)
 #[derive(Debug, Clone, PartialEq)]
 pub struct Domain {
-    values: HashSet<i64>,
+    values: BTreeSet<i64>,
 }
 
 impl Domain {
@@ -20,15 +20,15 @@ impl Domain {
     }
 
     pub fn singleton(v: i64) -> Self {
-        let mut s = HashSet::new(); s.insert(v); Self { values: s }
+        let mut s = BTreeSet::new(); s.insert(v); Self { values: s }
     }
 
     pub fn size(&self) -> usize { self.values.len() }
 
     pub fn is_empty(&self) -> bool { self.values.is_empty() }
 
-    pub fn min(&self) -> Option<i64> { self.values.iter().min().copied() }
-    pub fn max(&self) -> Option<i64> { self.values.iter().max().copied() }
+    pub fn min(&self) -> Option<i64> { self.values.iter().next().copied() }
+    pub fn max(&self) -> Option<i64> { self.values.iter().next_back().copied() }
 
     pub fn remove(&mut self, v: i64) -> bool { self.values.remove(&v) }
     pub fn retain(&mut self, pred: impl Fn(&i64) -> bool) { self.values.retain(pred); }
@@ -126,7 +126,7 @@ impl ConstraintStore {
             let x_dom = store.domain_of(x).cloned().unwrap_or(Domain::range(0, 0));
             let y_dom = store.domain_of(y).cloned().unwrap_or(Domain::range(0, 0));
             let intersection = {
-                let mut set = HashSet::new();
+                let mut set = BTreeSet::new();
                 for v in x_dom.iter() {
                     if y_dom.contains(*v) { set.insert(*v); }
                 }

@@ -1,0 +1,6 @@
+# Rust build artifacts
+/target
+
+# Reasonix 工具本地配置(不提交)
+.reasonix/
+reasonix.toml

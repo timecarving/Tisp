@@ -17,13 +17,12 @@ pub struct Explanation {
 
 /// Abduction engine: generate explanations for a goal given abducible variables
 pub struct AbductionEngine {
-    hypotheses: Vec<Hypothesis>,
     max_hypotheses: usize,
 }
 
 impl AbductionEngine {
     pub fn new() -> Self {
-        Self { hypotheses: Vec::new(), max_hypotheses: 10 }
+        Self { max_hypotheses: 10 }
     }
 
     /// Generate candidate hypotheses for abducible variables

@@ -56,10 +56,6 @@ impl TypeInfer {
 
         // Register data declarations
         for decl in &program.data_decls {
-            for ctor in &decl.constructors {
-                for (_i, _field) in ctor.fields.iter().enumerate() {
-                }
-            }
             self.data_env.register(decl.clone());
             // Register constructors in the type environment
             for ctor in &decl.constructors {

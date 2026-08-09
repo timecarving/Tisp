@@ -60,6 +60,24 @@ impl Parser {
             Token::Colon => { let span = self.advance().span; Ok(Spanned::new(Expr::Keyword(Symbol::new(":")), span)) }
             Token::Arrow => { let span = self.advance().span; Ok(Spanned::new(Expr::Keyword(Symbol::new("->")), span)) }
             Token::Pipe => { let span = self.advance().span; Ok(Spanned::new(Expr::Keyword(Symbol::new("|")), span)) }
+            Token::Comma => {
+                // 逗号仅作分隔符(§4.5 元组/向量语法),顶层出现时跳过
+                self.advance();
+                self.parse_expr()
+            }
+            Token::Next => {
+                // ⃝ A(§18.1 时态算子):语法糖为 (delay A)
+                let start = self.advance().span;
+                let inner = self.parse_expr()?;
+                let span = start.merge(inner.span);
+                Ok(Spanned::new(
+                    Expr::List(vec![
+                        Spanned::new(Expr::Sym(Symbol::new("delay")), start),
+                        inner,
+                    ]),
+                    span,
+                ))
+            }
             Token::Keyword(k) => { let k = Symbol::new(k); let span = self.advance().span; Ok(Spanned::new(Expr::Keyword(k), span)) }
             Token::Ident(name) => { let name = Symbol::new(name); let span = self.advance().span; Ok(Spanned::new(Expr::Sym(name), span)) }
             _ => Err(ParseError {
@@ -74,6 +92,7 @@ impl Parser {
         let mut items = Vec::new();
         let mut tail = None;
         while !self.check(&Token::RParen) && !self.is_eof() {
+            if self.check(&Token::Comma) { self.advance(); continue; }
             if self.check(&Token::Dot) {
                 self.advance(); // consume dot
                 tail = Some(Box::new(self.parse_expr()?));
@@ -93,6 +112,7 @@ impl Parser {
         let mut items = Vec::new();
         let mut tail = None;
         while !self.check(&Token::RBracket) && !self.is_eof() {
+            if self.check(&Token::Comma) { self.advance(); continue; }
             if self.check(&Token::Dot) {
                 self.advance(); // consume dot
                 tail = Some(Box::new(self.parse_expr()?));

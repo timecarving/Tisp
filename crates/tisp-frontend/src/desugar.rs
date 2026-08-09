@@ -1,8 +1,8 @@
 use tisp_core::ast::{Expr, SExpr};
 use tisp_core::core_ast::*;
-use tisp_core::span::Span;
+use tisp_core::span::{Span, Spanned};
 use tisp_core::symbol::Symbol;
-use tisp_core::types::{Grade, Mode, EffectRow, EffectLabel, Determinism, Predicate, CmpOp, BinOp, Lit};
+use tisp_core::types::{Grade, Mode, EffectRow, EffectLabel, Determinism, Predicate, CmpOp, BinOp, Lit, Type};
 use tisp_core::data::{DataDecl, Constructor, Field};
 
 #[derive(Debug, Clone)]
@@ -26,19 +26,51 @@ enum TopLevel {
     EffectDecl(tisp_core::effects::EffectDecl),
     Namespace(Symbol, Vec<(Symbol, Symbol)>, Vec<Symbol>),
     FFIDecl(Symbol, String, Vec<tisp_core::types::Type>, Option<tisp_core::types::Type>, Vec<tisp_core::types::EffectLabel>),
+    /// 声明类形式(defmacro 等):已处理,不产生 def 也不作为顶层表达式
+    Ignored,
 }
 
-pub struct Desugarer;
+/// 宏模板替换:把模板中的参数符号替换为实参 SExpr(§24.1)
+fn substitute_macro(template: &SExpr, bindings: &std::collections::HashMap<Symbol, SExpr>) -> SExpr {
+    match &template.node {
+        Expr::Sym(s) => {
+            if let Some(repl) = bindings.get(s) {
+                repl.clone()
+            } else {
+                template.clone()
+            }
+        }
+        Expr::List(items) => {
+            let new_items: Vec<SExpr> = items.iter().map(|i| substitute_macro(i, bindings)).collect();
+            Spanned::new(Expr::List(new_items), template.span)
+        }
+        Expr::Vec(items) => {
+            let new_items: Vec<SExpr> = items.iter().map(|i| substitute_macro(i, bindings)).collect();
+            Spanned::new(Expr::Vec(new_items), template.span)
+        }
+        Expr::ConsPattern(items, tail) => {
+            let new_items: Vec<SExpr> = items.iter().map(|i| substitute_macro(i, bindings)).collect();
+            Spanned::new(Expr::ConsPattern(new_items, Box::new(substitute_macro(tail, bindings))), template.span)
+        }
+        _ => template.clone(),
+    }
+}
+
+pub struct Desugarer {
+    /// §24.1 宏表:宏名 → (参数列表, 模板表达式)
+    macros: std::cell::RefCell<std::collections::HashMap<Symbol, (Vec<Symbol>, Vec<SExpr>)>>,
+}
 
 impl Desugarer {
     pub fn new() -> Self {
-        Self
+        Self { macros: std::cell::RefCell::new(std::collections::HashMap::new()) }
     }
 
     pub fn desugar_program(&self, forms: Vec<SExpr>) -> Result<CoreProgram, DesugarError> {
         let mut data_decls = Vec::new();
         let mut effect_decls = Vec::new();
         let mut defs = Vec::new();
+        let mut top_exprs = Vec::new();
         for form in forms {
             match self.desugar_top_level(&form)? {
                 Some(TopLevel::DataDecl(decl)) => data_decls.push(decl),
@@ -56,8 +88,35 @@ impl Desugarer {
                         body: CoreExpr::new(CoreExprNode::ExternDef(name, c_name, params, ret, vec![]), Span::dummy()),
                         requires: None, ensures: None, span: Span::dummy() });
                 }
-                None => {}
+                Some(TopLevel::Ignored) => {}
+                None => {
+                    // 顶层表达式:收集为隐式入口 __top__(§6.3 顶层求值)
+                    top_exprs.push(self.desugar_expr(&form)?);
+                }
             }
+        }
+        // 有顶层表达式时生成隐式入口 def(由解释器优先执行)
+        if !top_exprs.is_empty() {
+            let body = if top_exprs.len() == 1 {
+                top_exprs.pop().unwrap()
+            } else {
+                CoreExpr::new(CoreExprNode::Do(top_exprs), Span::dummy())
+            };
+            defs.push(CoreDef {
+                name: Symbol::new("__top__"),
+                ty: None,
+                effects: EffectRow::Open(vec![EffectLabel::IO, EffectLabel::Search, EffectLabel::State(Box::new(tisp_core::types::Type::unit()))], Box::new(EffectRow::Pure)),
+                grade: Grade::Omega,
+                mode: Mode::In,
+                determinism: Determinism::NonDet,
+                body: CoreExpr::new(
+                    CoreExprNode::Lam(Lambda { params: vec![], body: Box::new(body), ret_type: None }),
+                    Span::dummy(),
+                ),
+                requires: None,
+                ensures: None,
+                span: Span::dummy(),
+            });
         }
         Ok(CoreProgram { data_decls, effect_decls, defs })
     }
@@ -77,11 +136,11 @@ impl Desugarer {
                             return Ok(Some(TopLevel::EffectDecl(self.desugar_defeffect_form(items, expr.span)?)));
                         }
                         "defpred" => return Ok(Some(TopLevel::Def(self.desugar_defpred_form(items, expr.span)?))),
-                        "defclass" => return self.desugar_stub_defn(items, "defclass", expr.span),
-                        "definstance" => return self.desugar_stub_defn(items, "definstance", expr.span),
-                        "defgeneric" => return self.desugar_stub_defn(items, "defgeneric", expr.span),
-                        "defmethod" => return self.desugar_stub_defn(items, "defmethod", expr.span),
-                        "defmacro" => return self.desugar_stub_defn(items, "defmacro", expr.span),
+                        "defclass" => return self.desugar_defclass_form(items, expr.span),
+                        "definstance" => return self.desugar_definstance_form(items, expr.span),
+                        "defgeneric" => return self.desugar_defgeneric_form(items, expr.span),
+                        "defmethod" => return self.desugar_defmethod_form(items, expr.span),
+                        "defmacro" => return self.desugar_defmacro_form(items, expr.span),
                         "defextern" => return self.desugar_defextern_form(items, expr.span),
                         "defresource-algebra" => return self.desugar_stub_defn(items, "defresource-algebra", expr.span),
                         "defsession" => return self.desugar_defsession_form(items, expr.span),
@@ -103,6 +162,127 @@ impl Desugarer {
         let body = CoreExpr::new(CoreExprNode::Lit(Literal::Unit), _span);
         let def = CoreDef { name, ty: None, effects: EffectRow::Pure, grade: Grade::Omega,
             mode: Mode::In, determinism: Determinism::Det, body, requires: None, ensures: None, span: _span };
+        Ok(Some(TopLevel::Def(def)))
+    }
+
+    /// §22.1:(defgeneric name [params] -> Ret)
+    fn desugar_defgeneric_form(&self, items: &[SExpr], span: Span) -> Result<Option<TopLevel>, DesugarError> {
+        let name = match items.get(1).and_then(|i| match &i.node { Expr::Sym(s) => Some(s.clone()), _ => None }) {
+            Some(s) => s,
+            None => return Err(DesugarError { message: "defgeneric requires a name".into(), span }),
+        };
+        let params = match items.get(2) {
+            Some(p) => self.desugar_params(p)?,
+            None => Vec::new(),
+        };
+        let def = CoreDef {
+            name: name.clone(), ty: None, effects: EffectRow::Pure, grade: Grade::Omega,
+            mode: Mode::In, determinism: Determinism::Det,
+            body: CoreExpr::new(CoreExprNode::GenericDef(name, params, None), span),
+            requires: None, ensures: None, span,
+        };
+        Ok(Some(TopLevel::Def(def)))
+    }
+
+    /// §22.2:(defmethod generic [(c Circle) ...] body...)
+    fn desugar_defmethod_form(&self, items: &[SExpr], span: Span) -> Result<Option<TopLevel>, DesugarError> {
+        let gen = match items.get(1).and_then(|i| match &i.node { Expr::Sym(s) => Some(s.clone()), _ => None }) {
+            Some(s) => s,
+            None => return Err(DesugarError { message: "defmethod requires a generic name".into(), span }),
+        };
+        let patterns = match items.get(2).map(|i| &i.node) {
+            Some(Expr::Vec(pats)) => pats.iter().map(|p| self.desugar_method_pattern(p)).collect::<Result<Vec<_>, _>>()?,
+            _ => return Err(DesugarError { message: "defmethod requires pattern vector".into(), span: items.get(2).map(|i| i.span).unwrap_or(span) }),
+        };
+        let mut goals = Vec::new();
+        for g in &items[3..] {
+            goals.push(self.desugar_expr(g)?);
+        }
+        let body = if goals.len() == 1 { goals.pop().unwrap() } else { CoreExpr::new(CoreExprNode::Do(goals), span) };
+        let def = CoreDef {
+            name: Symbol::new(&format!("__method_{}", gen.as_str())), ty: None,
+            effects: EffectRow::Pure, grade: Grade::Omega, mode: Mode::In, determinism: Determinism::Det,
+            body: CoreExpr::new(CoreExprNode::MethodDef(gen, patterns, Box::new(body)), span),
+            requires: None, ensures: None, span,
+        };
+        Ok(Some(TopLevel::Def(def)))
+    }
+
+    /// §22.2 方法模式:(name Type) → 绑定 name 匹配 Type;(Type) → 无绑定;x → 变量
+    fn desugar_method_pattern(&self, expr: &SExpr) -> Result<Pattern, DesugarError> {
+        match &expr.node {
+            Expr::Sym(_) => self.desugar_pattern(expr),
+            Expr::List(items) if items.len() == 2 => {
+                if let (Expr::Sym(name), Expr::Sym(ty)) = (&items[0].node, &items[1].node) {
+                    return Ok(Pattern::Con(ty.clone(), vec![Pattern::Var(name.clone())]));
+                }
+                self.desugar_pattern(expr)
+            }
+            Expr::List(items) if items.len() == 1 => {
+                if let Expr::Sym(ty) = &items[0].node {
+                    return Ok(Pattern::Con(ty.clone(), vec![]));
+                }
+                self.desugar_pattern(expr)
+            }
+            _ => self.desugar_pattern(expr),
+        }
+    }
+
+    /// §23.1:(defclass Name typevar (method [params] -> Ret) ...)
+    fn desugar_defclass_form(&self, items: &[SExpr], span: Span) -> Result<Option<TopLevel>, DesugarError> {
+        let name = match items.get(1).and_then(|i| match &i.node { Expr::Sym(s) => Some(s.clone()), _ => None }) {
+            Some(s) => s,
+            None => return Err(DesugarError { message: "defclass requires a name".into(), span }),
+        };
+        let tvars: Vec<Symbol> = items.get(2).and_then(|i| match &i.node { Expr::Sym(s) => Some(vec![s.clone()]), _ => None }).unwrap_or_default();
+        let mut methods = Vec::new();
+        for m in &items[3..] {
+            if let Expr::List(parts) = &m.node {
+                if let Some(Expr::Sym(mname)) = parts.first().map(|p| &p.node) {
+                    // 方法签名 (method [params] -> Ret):解析返回类型,缺省 Unit
+                    let ret = if parts.len() >= 4 {
+                        if let Some(Expr::Keyword(kw)) = parts.get(2).map(|p| &p.node) {
+                            if kw.as_str() == "->" {
+                                self.desugar_type_with_params(&parts[3], &[])?
+                            } else { Type::unit() }
+                        } else { Type::unit() }
+                    } else { Type::unit() };
+                    methods.push((mname.clone(), ret));
+                }
+            }
+        }
+        let def = CoreDef {
+            name: name.clone(), ty: None, effects: EffectRow::Pure, grade: Grade::Omega,
+            mode: Mode::In, determinism: Determinism::Det,
+            body: CoreExpr::new(CoreExprNode::ClassDef(name, tvars, methods), span),
+            requires: None, ensures: None, span,
+        };
+        Ok(Some(TopLevel::Def(def)))
+    }
+
+    /// §23.2:(definstance Class Type (method [params] body) ...)
+    fn desugar_definstance_form(&self, items: &[SExpr], span: Span) -> Result<Option<TopLevel>, DesugarError> {
+        let class = match items.get(1).and_then(|i| match &i.node { Expr::Sym(s) => Some(s.clone()), _ => None }) {
+            Some(s) => s,
+            None => return Err(DesugarError { message: "definstance requires a class name".into(), span }),
+        };
+        let types: Vec<Type> = items.get(2).map(|t| self.desugar_type_with_params(t, &[])).transpose()?.into_iter().collect();
+        let mut methods = Vec::new();
+        for m in &items[3..] {
+            if let Expr::List(parts) = &m.node {
+                if let Some(Expr::Sym(mname)) = parts.first().map(|p| &p.node) {
+                    let mbody = if parts.len() >= 3 { self.desugar_expr(&parts[parts.len() - 1])? }
+                        else { CoreExpr::new(CoreExprNode::Lit(Literal::Unit), span) };
+                    methods.push((mname.clone(), Box::new(mbody)));
+                }
+            }
+        }
+        let def = CoreDef {
+            name: Symbol::new(&format!("__instance_{}", class.as_str())), ty: None,
+            effects: EffectRow::Pure, grade: Grade::Omega, mode: Mode::In, determinism: Determinism::Det,
+            body: CoreExpr::new(CoreExprNode::InstanceDef(class, types, methods), span),
+            requires: None, ensures: None, span,
+        };
         Ok(Some(TopLevel::Def(def)))
     }
 
@@ -258,6 +438,15 @@ impl Desugarer {
                                 i += 2;
                                 continue;
                             }
+                        }
+                        // §7.3 GADT 字段列表语法:[T1, T2, ...] → 多个匿名字段
+                        if let Expr::Vec(vs) = &items[i].node {
+                            for v in vs {
+                                let ty = self.desugar_type_with_params(v, type_params)?;
+                                fields.push(Field { name: None, ty });
+                            }
+                            i += 1;
+                            continue;
                         }
                         fields.push(self.desugar_field(&items[i], type_params)?);
                         i += 1;
@@ -829,15 +1018,92 @@ impl Desugarer {
             _ => return Err(DesugarError { message: "defpred name must be a symbol".into(), span: items[1].span }),
         };
         let params = self.desugar_params(&items[2])?;
-        // Collect all body expressions (clauses) — defpred has multiple clauses
-        let mut clauses = Vec::new();
-        for idx in 3..items.len() {
-            clauses.push(self.desugar_expr(&items[idx])?);
-        }
-        let body = if clauses.len() == 1 {
-            clauses.into_iter().next().unwrap()
+        // 子句形式检测(§21.2 Mercury 风格):([P1 P2 ...] body...) 首项为 Vec
+        let is_clause_form = items[3..].iter().any(|c| {
+            matches!(&c.node, Expr::List(parts) if !parts.is_empty() && matches!(&parts[0].node, Expr::Vec(_)))
+        });
+        let body = if is_clause_form {
+            // 每个子句编译为 Match 的一个 arm:参数打包成 __tuple,子句模式与之匹配;
+            // 无 arm 匹配返回 Err → Search 节点据此回溯(§21.4)
+            let mut arms = Vec::new();
+            for clause in &items[3..] {
+                // 跳过 :det/:nondet 等模式注解(§21.2)
+                if matches!(&clause.node, Expr::Keyword(_)) {
+                    continue;
+                }
+                match &clause.node {
+                    Expr::List(parts) if !parts.is_empty() => {
+                        // 模式列表来源(§21.2):
+                        // 1. [模式...] 向量(元素即模式)
+                        // 2. [([p1 p2 ...])] 向量包圆括号模式列表
+                        // 3. (模式...) 圆括号模式列表
+                        let pattern_exprs: Vec<&SExpr> = match &parts[0].node {
+                            Expr::Vec(vs) if vs.len() == 1 => {
+                                if let Expr::List(inner) = &vs[0].node {
+                                    inner.iter().collect()
+                                } else {
+                                    vs.iter().collect()
+                                }
+                            }
+                            Expr::Vec(vs) => vs.iter().collect(),
+                            Expr::List(inner) => inner.iter().collect(),
+                            _ => return Err(DesugarError {
+                                message: "defpred 子句要求模式列表".into(),
+                                span: clause.span,
+                            }),
+                        };
+                        let sub_patterns: Vec<Pattern> = pattern_exprs.iter()
+                            .map(|p| self.desugar_pattern(p))
+                            .collect::<Result<_, _>>()?;
+                        let pattern = Pattern::Con(Symbol::new("__tuple"), sub_patterns);
+                        let clause_body = if parts.len() > 1 {
+                            let mut goals = Vec::new();
+                            for g in &parts[1..] {
+                                goals.push(self.desugar_expr(g)?);
+                            }
+                            if goals.len() == 1 {
+                                goals.pop().unwrap()
+                            } else {
+                                CoreExpr::new(CoreExprNode::Do(goals), span)
+                            }
+                        } else {
+                            CoreExpr::new(CoreExprNode::Lit(Literal::Unit), span)
+                        };
+                        arms.push(MatchArm { pattern, guard: None, body: Box::new(clause_body) });
+                        continue;
+                    }
+                    _ => {}
+                }
+                return Err(DesugarError {
+                    message: "defpred 子句形式要求 ([pattern...] body...)".into(),
+                    span: clause.span,
+                });
+            }
+            let scrutinee = CoreExpr::new(
+                CoreExprNode::Data(
+                    Symbol::new("__tuple"),
+                    params.iter().map(|p| {
+                        CoreExpr::new(CoreExprNode::Var(p.name.clone()), span)
+                    }).collect(),
+                ),
+                span,
+            );
+            // Search 包装:子句全部失败 → 返回 false 而非传播 match failure(§21.4 回溯)
+            CoreExpr::new(
+                CoreExprNode::Search(Box::new(CoreExpr::new(CoreExprNode::Match(Box::new(scrutinee), arms), span))),
+                span,
+            )
         } else {
-            CoreExpr::new(CoreExprNode::Do(clauses), span)
+            // 普通目标表达式形式(现有语义)
+            let mut clauses = Vec::new();
+            for idx in 3..items.len() {
+                clauses.push(self.desugar_expr(&items[idx])?);
+            }
+            if clauses.len() == 1 {
+                clauses.into_iter().next().unwrap()
+            } else {
+                CoreExpr::new(CoreExprNode::Do(clauses), span)
+            }
         };
         let lambda = CoreExprNode::Lam(Lambda { params, body: Box::new(body), ret_type: None });
         Ok(CoreDef {
@@ -860,15 +1126,23 @@ impl Desugarer {
                             let mut ty = None;
                             let name = name.clone();
                             // Check if next items are : type
+                            let mut mode = Mode::In;
                             if i + 2 < items.len() {
                                 if let Expr::Keyword(kw) = &items[i + 1].node {
                                     if kw.as_str() == ":" {
                                         ty = Some(self.desugar_type_with_params(&items[i + 2], &[])?);
                                         i += 2; // skip : and type
+                                    } else if kw.as_str() == "free" {
+                                        // §21.2 模式注解:name :free(输出逻辑变量)
+                                        mode = Mode::Free;
+                                        i += 1;
+                                    } else if kw.as_str() == "ground" {
+                                        mode = Mode::In;
+                                        i += 1;
                                     }
                                 }
                             }
-                            params.push(Param { name, ty, grade, mode: Mode::In });
+                            params.push(Param { name, ty, grade, mode });
                             i += 1;
                         }
                         // Graded parameter: (grade name : type) or (grade name)
@@ -976,6 +1250,47 @@ impl Desugarer {
         Ok(())
     }
 
+    /// §24.1:注册宏(不生成 def;调用点在 desugar_expr 展开)
+    fn desugar_defmacro_form(&self, items: &[SExpr], _span: Span) -> Result<Option<TopLevel>, DesugarError> {
+        if items.len() < 3 {
+            return Err(DesugarError { message: "defmacro requires name and params".into(), span: _span });
+        }
+        let name = match &items[1].node {
+            Expr::Sym(s) => s.clone(),
+            _ => return Err(DesugarError { message: "defmacro name must be a symbol".into(), span: items[1].span }),
+        };
+        let params = match &items[2].node {
+            Expr::Vec(vs) => vs.iter().filter_map(|p| match &p.node {
+                Expr::Sym(s) => Some(s.clone()),
+                _ => None,
+            }).collect(),
+            _ => Vec::new(),
+        };
+        let template: Vec<SExpr> = items[3..].to_vec();
+        self.macros.borrow_mut().insert(name, (params, template));
+        Ok(Some(TopLevel::Ignored))
+    }
+
+    /// 展开宏调用:参数绑定到模板,递归替换后 desugar
+    fn expand_macro(&self, template: &[SExpr], params: &[Symbol], args: &[SExpr], span: Span) -> Result<CoreExpr, DesugarError> {
+        let mut bindings = std::collections::HashMap::new();
+        for (p, a) in params.iter().zip(args) {
+            bindings.insert(p.clone(), a.clone());
+        }
+        let mut expanded = Vec::new();
+        for t in template {
+            expanded.push(substitute_macro(t, &bindings));
+        }
+        let wrapped = if expanded.len() == 1 {
+            expanded.pop().unwrap()
+        } else {
+            let mut items = vec![Spanned::new(Expr::Sym(Symbol::new("do")), span)];
+            items.extend(expanded);
+            Spanned::new(Expr::List(items), span)
+        };
+        self.desugar_expr(&wrapped)
+    }
+
     pub fn desugar_expr(&self, expr: &SExpr) -> Result<CoreExpr, DesugarError> {
         match &expr.node {
             Expr::Nil => Ok(CoreExpr::new(
@@ -1003,7 +1318,10 @@ impl Desugarer {
                 expr.span,
             )),
             Expr::Sym(name) => {
-                if name.as_str() == "i0" {
+                if name.as_str() == "Unit" {
+                    // 值上下文的 unit 字面量(如 handler 里的 (k Unit v))
+                    Ok(CoreExpr::new(CoreExprNode::Lit(Literal::Unit), expr.span))
+                } else if name.as_str() == "i0" {
                     Ok(CoreExpr::new(CoreExprNode::IntervalEndpoint(false), expr.span))
                 } else if name.as_str() == "i1" {
                     Ok(CoreExpr::new(CoreExprNode::IntervalEndpoint(true), expr.span))
@@ -1110,6 +1428,10 @@ impl Desugarer {
                 }
             }
             Expr::Sym(name) => {
+                // §24.1 宏展开优先于关键字与函数调用
+                if let Some((params, template)) = self.macros.borrow().get(name).cloned() {
+                    return self.expand_macro(&template, &params, &items[1..], span);
+                }
                 match name.as_str() {
                     "fn" => self.desugar_lambda(items, span),
                     "let" => self.desugar_let(items, span),
@@ -1130,7 +1452,7 @@ impl Desugarer {
                     "fresh"     => self.desugar_new_fresh(items, span),
                     "=="        => self.desugar_binary_wrap(|a, b| CoreExprNode::Unify(a, b), items, span),
                     "unify"     => self.desugar_binary_wrap(|a, b| CoreExprNode::Unify(a, b), items, span),
-                    "search"    => self.desugar_unary_wrap(|e| CoreExprNode::Search(e), items, span),
+                    "search"    => self.desugar_search(items, span),
                     "commit"    => self.desugar_unary_wrap(|e| CoreExprNode::Commit(e), items, span),
                     "abduce"    => self.desugar_abduce(items, span),
                     // Constraint
@@ -1194,9 +1516,7 @@ impl Desugarer {
                     "region-free" => self.desugar_unary_wrap(|e| CoreExprNode::RegionFree(e), items, span),
                     "ptr-read"  => self.desugar_unary_wrap(|e| CoreExprNode::PtrRead(e), items, span),
                     "ptr-write" => self.desugar_binary_wrap(|a, b| CoreExprNode::PtrWrite(a, b), items, span),
-                    // Session
-                    "send"      => self.desugar_session(SessionOp::Send, items, span),
-                    "recv"      => self.desugar_session(SessionOp::Recv, items, span),
+                    // Session(send/recv 走 §27 通道内置;session 协议操作用 send!/recv!)
                     "close"     => self.desugar_session(SessionOp::Close, items, span),
                     _ => self.desugar_app(items, span),
                 }
@@ -1214,7 +1534,16 @@ impl Desugarer {
         }
 
         let params = self.desugar_params(&items[1])?;
-        let body = self.desugar_expr(&items[2])?;
+        // 收集全部 body 表达式(多表达式用 Do 包装;原实现只保留第一个)
+        let mut body_exprs = Vec::new();
+        for item in &items[2..] {
+            body_exprs.push(self.desugar_expr(item)?);
+        }
+        let body = if body_exprs.len() == 1 {
+            body_exprs.pop().unwrap()
+        } else {
+            CoreExpr::new(CoreExprNode::Do(body_exprs), span)
+        };
 
         Ok(CoreExpr::new(
             CoreExprNode::Lam(Lambda {
@@ -1249,7 +1578,16 @@ impl Desugarer {
             });
         }
 
-        let body = self.desugar_expr(&items[2])?;
+        // 收集全部 body 表达式(多表达式用 Do 包装;原实现只保留第一个)
+        let mut body_exprs = Vec::new();
+        for item in &items[2..] {
+            body_exprs.push(self.desugar_expr(item)?);
+        }
+        let body = if body_exprs.len() == 1 {
+            body_exprs.pop().unwrap()
+        } else {
+            CoreExpr::new(CoreExprNode::Do(body_exprs), span)
+        };
 
         // Build nested lets from right to left
         let mut result = body;
@@ -1295,11 +1633,21 @@ impl Desugarer {
             return Err(DesugarError { message: "cond requires at least one clause".into(), span });
         }
         let clauses = &items[1..];
-        let mut result = self.desugar_expr(&items[items.len() - 1])?;
-        let mut i = clauses.len();
+        // 奇数个 clause 时最后一项是默认分支;偶数个时 [test body] 成对,默认 Unit
+        let (pairs, default) = if clauses.len() % 2 == 1 {
+            (&clauses[..clauses.len() - 1], Some(&clauses[clauses.len() - 1]))
+        } else {
+            (clauses, None)
+        };
+        let mut result = match default {
+            Some(d) => self.desugar_expr(d)?,
+            None => CoreExpr::new(CoreExprNode::Lit(Literal::Unit), span),
+        };
+        // 从后往前构建嵌套 If(原实现会把最后一项重复求值)
+        let mut i = pairs.len();
         while i >= 2 {
-            let body = &clauses[i - 1];
-            let test = &clauses[i - 2];
+            let body = &pairs[i - 1];
+            let test = &pairs[i - 2];
             i -= 2;
             if let Expr::Keyword(kw) = &test.node {
                 if kw.as_str() == "else" {
@@ -1513,28 +1861,18 @@ impl Desugarer {
 
     fn desugar_some_thread(&self, items: &[SExpr], span: Span) -> Result<CoreExpr, DesugarError> {
         if items.len() < 2 { return Err(DesugarError { message: "some-> requires at least a value".into(), span }); }
+        // §5.8 some->:任一中间结果为 nil(Unit)时短路,返回 nil
         let nil_check = CoreExpr::new(CoreExprNode::Lit(Literal::Unit), span);
         let mut result = self.desugar_expr(&items[1])?;
         for item in &items[2..] {
-            result = match &item.node {
+            // 构建本步调用:符号 (f) → (f result);列表 (f a b) → (f result a b)
+            let step = match &item.node {
                 Expr::Sym(f) => CoreExpr::new(
-                    CoreExprNode::If(
-                        Box::new(CoreExpr::new(
-                            CoreExprNode::App(
-                                Box::new(CoreExpr::new(CoreExprNode::Var(Symbol::new("=")), item.span)),
-                                Box::new(result.clone()),
-                            ), span,
-                        )),
-                        Box::new(nil_check.clone()),
-                        Box::new(CoreExpr::new(
-                            CoreExprNode::App(Box::new(CoreExpr::new(CoreExprNode::Var(f.clone()), item.span)), Box::new(result)),
-                            span,
-                        )),
-                    ),
+                    CoreExprNode::App(Box::new(CoreExpr::new(CoreExprNode::Var(f.clone()), item.span)), Box::new(result.clone())),
                     span,
                 ),
                 Expr::List(parts) if !parts.is_empty() => {
-                    let mut args = vec![result];
+                    let mut args = vec![result.clone()];
                     for p in &parts[1..] { args.push(self.desugar_expr(p)?); }
                     let func = self.desugar_expr(&parts[0])?;
                     let mut app = func;
@@ -1545,6 +1883,24 @@ impl Desugarer {
                 }
                 _ => continue,
             };
+            // nil 短路:result 为 nil 时直接返回 nil,否则执行本步(原实现 List 分支缺此检查)
+            result = CoreExpr::new(
+                CoreExprNode::If(
+                    Box::new(CoreExpr::new(
+                        CoreExprNode::App(
+                            Box::new(CoreExpr::new(
+                                CoreExprNode::App(Box::new(CoreExpr::new(CoreExprNode::Var(Symbol::new("=")), item.span)), Box::new(result)),
+                                span,
+                            )),
+                            Box::new(nil_check.clone()),
+                        ),
+                        span,
+                    )),
+                    Box::new(nil_check.clone()),
+                    Box::new(step),
+                ),
+                span,
+            );
         }
         Ok(result)
     }
@@ -1637,6 +1993,15 @@ impl Desugarer {
                 }
                 Ok(result)
             }
+            Expr::Vec(items) => {
+                // 列表模式(§21.2):[a b c] → Cons 链;[] → Nil
+                let mut result = Pattern::Con(Symbol::new("Nil"), vec![]);
+                for item in items.iter().rev() {
+                    let head = self.desugar_pattern(item)?;
+                    result = Pattern::Con(Symbol::new("Cons"), vec![head, result]);
+                }
+                Ok(result)
+            }
             _ => Err(DesugarError { message: "invalid pattern".into(), span: expr.span }),
         }
     }
@@ -1688,10 +2053,62 @@ impl Desugarer {
         Ok(CoreExpr::new(wrap, span))
     }
 
+    /// §21.3:(search) 零参提交搜索 或 (search expr...) 搜索子目标
+    fn desugar_search(&self, items: &[SExpr], span: Span) -> Result<CoreExpr, DesugarError> {
+        let inner = if items.len() >= 2 {
+            let mut exprs = Vec::new();
+            for item in &items[1..] {
+                exprs.push(self.desugar_expr(item)?);
+            }
+            if exprs.len() == 1 {
+                exprs.pop().unwrap()
+            } else {
+                CoreExpr::new(CoreExprNode::Do(exprs), span)
+            }
+        } else {
+            CoreExpr::new(CoreExprNode::Lit(Literal::Unit), span)
+        };
+        Ok(CoreExpr::new(CoreExprNode::Search(Box::new(inner)), span))
+    }
+
     fn desugar_new_fresh(&self, items: &[SExpr], span: Span) -> Result<CoreExpr, DesugarError> {
-        if items.len() != 2 { return Err(DesugarError { message: "fresh requires a variable name".into(), span }); }
-        let name = match &items[1].node { Expr::Sym(s) => s.clone(), _ => return Err(DesugarError { message: "expected symbol".into(), span: items[1].span }) };
-        Ok(CoreExpr::new(CoreExprNode::Fresh(name), span))
+        if items.len() < 2 {
+            return Err(DesugarError { message: "fresh requires variable name(s)".into(), span });
+        }
+        // §21.1:(fresh x) 单变量 或 (fresh [x y z] body...) 多变量
+        let mut vars = Vec::new();
+        match &items[1].node {
+            Expr::Sym(s) => vars.push(s.clone()),
+            Expr::Vec(vs) => {
+                for v in vs {
+                    match &v.node {
+                        Expr::Sym(s) => vars.push(s.clone()),
+                        _ => return Err(DesugarError { message: "fresh variables must be symbols".into(), span: v.span }),
+                    }
+                }
+            }
+            _ => return Err(DesugarError { message: "fresh requires a variable name".into(), span: items[1].span }),
+        }
+        // 仅单变量且无 body:保持原语义 (fresh x) → Fresh(x)
+        if vars.len() == 1 && items.len() == 2 {
+            return Ok(CoreExpr::new(CoreExprNode::Fresh(vars.pop().unwrap()), span));
+        }
+        // 多变量或带 body:Fresh(v1); Fresh(v2); ...; body
+        let body = if items.len() > 2 {
+            let mut exprs = Vec::new();
+            for item in &items[2..] {
+                exprs.push(self.desugar_expr(item)?);
+            }
+            if exprs.len() == 1 { exprs.pop().unwrap() }
+            else { CoreExpr::new(CoreExprNode::Do(exprs), span) }
+        } else {
+            CoreExpr::new(CoreExprNode::Lit(Literal::Unit), span)
+        };
+        let mut exprs: Vec<CoreExpr> = vars.into_iter()
+            .map(|v| CoreExpr::new(CoreExprNode::Fresh(v), span))
+            .collect();
+        exprs.push(body);
+        Ok(CoreExpr::new(CoreExprNode::Do(exprs), span))
     }
 
     fn desugar_abduce(&self, items: &[SExpr], span: Span) -> Result<CoreExpr, DesugarError> {
@@ -1838,7 +2255,15 @@ impl Desugarer {
         let func = self.desugar_expr(&items[0])?;
 
         if items.len() == 1 {
-            return Ok(func);
+            // (f) 零参调用:生成 App(f, Unit) 以触发调用;
+            // 解释器对 0 参函数/构造函数在收到 Unit 参数时返回结果
+            return Ok(CoreExpr::new(
+                CoreExprNode::App(
+                    Box::new(func),
+                    Box::new(CoreExpr::new(CoreExprNode::Lit(Literal::Unit), span)),
+                ),
+                span,
+            ));
         }
 
         // Build left-associative application: (f x y z) = ((f x) y) z
