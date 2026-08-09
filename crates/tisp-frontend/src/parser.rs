@@ -132,8 +132,30 @@ impl Parser {
         let mut pairs = Vec::new();
         while !self.check(&Token::RBrace) && !self.is_eof() {
             let key = self.parse_expr()?;
-            let val = self.parse_expr()?;
-            pairs.push((key, val));
+            // §8.2 refined 类型/模式 {x : T | pred}:值语法为 (T | pred)
+            if self.check(&Token::Colon) {
+                self.advance(); // ':'
+                let ty = self.parse_expr()?;
+                let pred = if self.check(&Token::Pipe) {
+                    self.advance(); // '|'
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                let items = match pred {
+                    Some(p) => {
+                        let pipe = Spanned::new(Expr::Keyword(Symbol::new("|")), p.span);
+                        vec![ty, pipe, p]
+                    }
+                    None => vec![ty],
+                };
+                let end = items.last().unwrap().span;
+                let val = Spanned::new(Expr::List(items), start.merge(end));
+                pairs.push((key, val));
+            } else {
+                let val = self.parse_expr()?;
+                pairs.push((key, val));
+            }
         }
         let end = self.expect(Token::RBrace, "expected '}'")?;
         Ok(Spanned::new(Expr::Map(pairs), start.merge(end)))

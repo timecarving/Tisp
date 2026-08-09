@@ -27,6 +27,8 @@
 
 ## 2. 效果系统 ✅
 
+> **设计定位(演算 > 代数效应)**:演算是抽象核心(§9 逻辑编程、§10 进程演算、§8 FRP 都是演算);效果系统是它们的**编码载体**——每个演算都可用 effect 家族表达(Search effect = 逻辑搜索,Communication effect = 进程演算,Signal effect = FRP),handler 编码演算之间的转换关系。本章实现这套载体。
+
 ### 2.1 效果声明
 
 ```clojure
@@ -247,15 +249,16 @@ h : (Int ->[{IO, State Int}] Bool)
 ## 11. 宏系统(§24)✅
 
 ```clojure
-(defmacro unless [cond then]
-  (if cond nil then))
+(defmacro double [x]
+  (* 2 x))
 
-(unless false 42)             ; => 42
+(double 21)                   ; => 42
 ```
 
 - `defmacro` 注册宏表(desugar 阶段)
 - 调用点展开:参数替换模板,递归 desugar(支持嵌套宏)
 - 多表达式模板自动包 `do`
+- **注意**:宏展开在类型检查之前,模板本身须通过静态类型检查(如 `if` 分支类型一致)
 - **未实现**:syntax-quote、卫生宏(hygiene)
 
 ---

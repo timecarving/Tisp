@@ -47,6 +47,17 @@
 | `println` | 打印(可多参数) |
 | `print` | 打印不换行(flush) |
 | `read-line` | 读一行 |
+| `slurp` | 读取整个文件为字符串 |
+| `spit` | 写文件(覆盖) |
+
+### 1.5 集合构造器
+
+| 函数 | 说明 | 示例 |
+|------|------|------|
+| `list` | 变参构造链表 | `(list 1 2 3)` |
+| `vector` | 变参构造向量 | `(vector 1 2 3)` |
+| `hash-map` | 变参构造映射(键值对) | `(hash-map "a" 1 "b" 2)` |
+| `hash-set` | 变参构造集合 | `(hash-set 1 2 3)` |
 
 ### 1.5 列表
 
@@ -59,6 +70,7 @@
 | `reverse` | 反转 | `(reverse (range 1 5))` => 4 3 2 1 |
 | `sort` | 升序排序(Int) | |
 | `count` `length` | 元素个数 | `(count (range 1 5))` => 4 |
+| `append` | 多列表拼接(同 concat) | `(append (range 1 3) (range 3 5))` |
 | `range` | `[s, e)` 升序列表 | `(range 1 5)` => 1 2 3 4 |
 | `zip` | 成对合并 | `(zip (range 1 3) (range 10 12))` |
 | `concat` | 列表拼接 | `(concat (range 1 3) (range 3 5))` |
@@ -102,7 +114,8 @@
 |------|------|
 | `fresh` | 创建逻辑变量(`(fresh x)` 或 `(fresh [x y] goal...)`) |
 | `==` | 逻辑 unify |
-| `search` | 回溯边界(失败返回 false 并恢复) |
+| `search` | 回溯边界(执行零参 thunk,失败返回 false 并恢复 trail) |
+| `solve-all` | 枚举 CLP 变量域中的全部解(升序去重) |
 | `commit!` | cut |
 
 ### 1.11 部分应用(柯里化)

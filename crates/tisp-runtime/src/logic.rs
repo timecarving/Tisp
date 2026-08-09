@@ -198,6 +198,18 @@ impl ConstraintStore {
         self.trail.len()
     }
 
+    /// 当前所有已绑定变量的快照:(var_id, 值)(§21 多解收集)
+    pub fn bound_snapshot(&self) -> Vec<(u64, LogicValue)> {
+        let mut out = Vec::new();
+        for (id, lv) in &self.vars {
+            if let LVar::Bound(val) = lv {
+                out.push((*id, (**val).clone()));
+            }
+        }
+        out.sort_by_key(|(id, _)| *id);
+        out
+    }
+
     /// Restore to a specific trail depth
     pub fn restore_to(&mut self, depth: usize) {
         while self.trail.len() > depth {
@@ -207,8 +219,7 @@ impl ConstraintStore {
             } else {
                 self.vars.remove(&entry.var_id);
             }
-        }
-    }
+        }    }
 
     /// Extract a concrete value from a logic value
     pub fn extract(&self, val: &LogicValue) -> Option<LogicValue> {

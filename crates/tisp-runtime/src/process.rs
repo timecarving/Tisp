@@ -36,6 +36,8 @@ pub struct CryptoEngine {
 impl CryptoEngine {
     pub fn new() -> Self { Self { keys: HashMap::new() } }
     pub fn add_key(&mut self, name: &str, key: Vec<u8>) { self.keys.insert(name.into(), key); }
+    /// 所有已声明密钥名(§27.5 spi 验证用)
+    pub fn keys(&self) -> Vec<String> { self.keys.keys().cloned().collect() }
 
     pub fn encrypt(&self, data: &[u8], key_name: &str) -> Option<CryptoValue> {
         let key = self.keys.get(key_name)?;

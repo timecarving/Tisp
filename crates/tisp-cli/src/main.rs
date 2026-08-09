@@ -86,8 +86,11 @@ fn compile_file(path: &str, cli: &Cli) -> miette::Result<()> {
         return Ok(());
     }
 
-    // Desugar to Core AST
+    // Desugar to Core AST(带模块加载基准目录)
     let desugarer = tisp_frontend::desugar::Desugarer::new();
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        desugarer.set_base_dir(&dir.to_string_lossy());
+    }
     let core_program = desugarer.desugar_program(forms)
         .map_err(|e| miette::miette!("{}", e))?;
 
@@ -115,6 +118,20 @@ fn compile_file(path: &str, cli: &Cli) -> miette::Result<()> {
 
         for (name, eff) in effects {
             println!("{} effects: {:?}", name, eff);
+        }
+
+        // §12.6 Monad 优化路径:检测单处理器效果(可降级为 monadic 编码)
+        let compiler = tisp_middle::effect_compile::EffectCompiler::new();
+        let mut monad_candidates = 0;
+        for def in &core_program.defs {
+            if let tisp_core::core_ast::CoreExprNode::Handle(_, handler) = &def.body.node {
+                if compiler.detect_single_handler(handler) {
+                    monad_candidates += 1;
+                }
+            }
+        }
+        if monad_candidates > 0 {
+            println!("; {} handle(s) eligible for monadic optimization (§12.6)", monad_candidates);
         }
 
         // Grade checking
@@ -207,10 +224,31 @@ fn compile_file(path: &str, cli: &Cli) -> miette::Result<()> {
     Ok(())
 }
 
+/// 判断顶层 form 是否为定义形式(defn/defdata/defpred/defmacro/...)
+fn is_definition_form(form: &tisp_core::ast::SExpr) -> bool {
+    if let tisp_core::ast::Expr::List(parts) = &form.node {
+        if let Some(first) = parts.first() {
+            if let tisp_core::ast::Expr::Sym(name) = &first.node {
+                return matches!(name.as_str(),
+                    "defn" | "defn-" | "def" | "def-" | "defdata" | "defdata-hit" | "defpred"
+                    | "defmacro" | "defeffect" | "defgeneric" | "defmethod" | "defclass"
+                    | "definstance" | "defsession" | "defextern" | "ns");
+            }
+        }
+    }
+    false
+}
+
 fn repl(cli: &Cli) -> miette::Result<()> {
-    println!("Tisp v0.1.0 — type (exit) to quit, or an expression to evaluate");
+    println!("Tisp v0.1.0 — (exit) to quit; expressions show inferred type; :type EXPR queries type only");
     let mut rl = DefaultEditor::new()
         .map_err(|e| miette::miette!("{}", e))?;
+
+    // 跨行状态:同一 Desugarer(宏表跨行保留)+ 累积的程序定义
+    let desugarer = tisp_frontend::desugar::Desugarer::new();
+    let mut data_decls: Vec<tisp_core::data::DataDecl> = Vec::new();
+    let mut effect_decls: Vec<tisp_core::effects::EffectDecl> = Vec::new();
+    let mut defs: Vec<tisp_core::core_ast::CoreDef> = Vec::new();
 
     loop {
         let line = match rl.readline("tisp> ") {
@@ -226,21 +264,93 @@ fn repl(cli: &Cli) -> miette::Result<()> {
 
         rl.add_history_entry(&line).ok();
 
-        // Try to evaluate as an expression
-        let wrapped = format!("(defn main [] {})", trimmed);
-        match tisp_frontend::reader::read(&wrapped) {
-            Ok(forms) => {
-                let desugarer = tisp_frontend::desugar::Desugarer::new();
+        // :type EXPR — 只查类型不求值
+        if let Some(expr_str) = trimmed.strip_prefix(":type ").or_else(|| trimmed.strip_prefix(":t ")) {
+            let wrapped = format!("(defn main [] {})", expr_str);
+            if let Ok(forms) = tisp_frontend::reader::read(&wrapped) {
                 if let Ok(program) = desugarer.desugar_program(forms) {
-                    let mut interpreter = tisp_backend::interpreter::Interpreter::new();
-                    match interpreter.run_program(&program) {
-                        Ok(Some(result)) => println!("=> {:?}", result),
-                        Ok(None) => eprintln!("; evaluation returned nothing"),
-                        Err(e) => eprintln!("error: {}", e),
+                    let mut all_defs = defs.clone();
+                    all_defs.extend(program.defs);
+                    let program_all = tisp_core::core_ast::CoreProgram {
+                        data_decls: data_decls.clone(),
+                        effect_decls: effect_decls.clone(),
+                        defs: all_defs,
+                    };
+                    let mut type_infer = tisp_middle::type_infer::TypeInfer::new();
+                    match type_infer.infer_program(&program_all) {
+                        Ok(typed) => {
+                            if let Some((_, ty)) = typed.iter().find(|(n, _)| n.as_str() == "main") {
+                                println!("; main : {}", ty);
+                            } else {
+                                eprintln!("; no type inferred");
+                            }
+                        }
+                        Err(e) => eprintln!("; type error: {}", e),
                     }
                 } else if cli.print_ast {
                     let forms = tisp_frontend::reader::read(trimmed).unwrap_or_else(|_| vec![]);
                     for form in &forms { println!("{:#?}", form); }
+                }
+            }
+            continue;
+        }
+
+        // 定义行(defn/defdata/defpred/defmacro/...)并入累积;否则作为表达式求值
+        let is_def = tisp_frontend::reader::read(trimmed)
+            .ok()
+            .and_then(|forms| forms.into_iter().next())
+            .map(|f| is_definition_form(&f))
+            .unwrap_or(false);
+
+        let wrapped = if is_def {
+            trimmed.to_string()
+        } else {
+            format!("(defn main [] {})", trimmed)
+        };
+
+        match tisp_frontend::reader::read(&wrapped) {
+            Ok(forms) => {
+                match desugarer.desugar_program(forms) {
+                    Ok(program) => {
+                        if is_def {
+                            // 定义行:并入累积,不求值
+                            data_decls.extend(program.data_decls);
+                            effect_decls.extend(program.effect_decls);
+                            let names: Vec<String> = program.defs.iter()
+                                .map(|d| d.name.as_str().to_string()).collect();
+                            defs.extend(program.defs);
+                            println!("; defined{}", if names.is_empty() {
+                                String::new()
+                            } else {
+                                format!(": {}", names.join(", "))
+                            });
+                        } else {
+                            // 表达式行:先类型检查(强静态类型:类型错误不求值),再求值
+                            let mut all_defs = defs.clone();
+                            all_defs.extend(program.defs);
+                            let program_all = tisp_core::core_ast::CoreProgram {
+                                data_decls: data_decls.clone(),
+                                effect_decls: effect_decls.clone(),
+                                defs: all_defs,
+                            };
+                            let mut type_infer = tisp_middle::type_infer::TypeInfer::new();
+                            match type_infer.infer_program(&program_all) {
+                                Ok(typed) => {
+                                    if let Some((_, ty)) = typed.iter().find(|(n, _)| n.as_str() == "main") {
+                                        println!("; main : {}", ty);
+                                    }
+                                }
+                                Err(e) => { eprintln!("; type error: {}", e); continue; }
+                            }
+                            let mut interpreter = tisp_backend::interpreter::Interpreter::new();
+                            match interpreter.run_program(&program_all) {
+                                Ok(Some(result)) => println!("=> {:?}", result),
+                                Ok(None) => eprintln!("; evaluation returned nothing"),
+                                Err(e) => eprintln!("error: {}", e),
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("; desugar error: {}", e),
                 }
             }
             Err(e) => eprintln!("parse error: {}", e),

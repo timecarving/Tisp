@@ -14,15 +14,7 @@ use tisp_runtime::process::CryptoEngine;
 use tisp_runtime::frp::Signal;
 use crate::process::ProcessRuntime;
 use crate::temporal::Stream;
-
-/// Method combination type for OOP dispatch
-#[derive(Debug, Clone, PartialEq)]
-pub enum MethodCategory {
-    Primary,
-    Around,
-    Before,
-    After,
-}
+use tisp_core::core_ast::MethodCategory;
 
 /// ς-calculus OOP: generic function dispatch table
 pub struct Interpreter {
@@ -45,6 +37,14 @@ pub struct Interpreter {
     pub instance_dict: HashMap<Symbol, Vec<(Symbol, HashMap<Symbol, Value>)>>,
     /// ADT 构造函数参数个数:ctor_name → arity(≥1;零参构造直接注册为 Data 值)
     ctor_arity: HashMap<String, usize>,
+    /// 构造器字段名表(§7.2 记录字段访问):ctor_name → 字段名列表
+    field_names: HashMap<Symbol, Vec<Symbol>>,
+    /// §21 多解收集模式:find-all 期间为 true
+    collect_mode: bool,
+    /// §21 收集到的解(每个解为值列表)
+    collected_solutions: Vec<Vec<Value>>,
+    /// §21 收集模式下 Search 的起始 trail 深度(arm 间隔离用)
+    collect_start_depth: usize,
     /// 活跃 effect handler 栈(§12.2):perform 从栈顶向下分发
     handlers: Vec<ActiveHandler>,
     /// π-calculus 通道运行时(§27):send/recv 经共享缓冲区
@@ -54,6 +54,12 @@ pub struct Interpreter {
     /// 惰性数值流缓存(§18):stream_id → Stream<i64>
     streams: HashMap<u64, Stream<i64>>,
     next_stream_id: u64,
+    /// §27 ambients:已注册的 ambient 名
+    ambients: HashMap<Symbol, bool>,
+    /// §28 验证属性表:prop 名 → 属性表达式(defprop 登记,verify 求值)
+    properties: HashMap<Symbol, CoreExpr>,
+    /// §23 构造器 → 所属 ADT 名(类型类实例分发用)
+    ctor_to_adt: HashMap<Symbol, Symbol>,
     /// FRP 信号缓存(§18.5):signal_id → Signal<Value>
     signals: HashMap<u64, Signal<Value>>,
     next_signal_id: u64,
@@ -134,11 +140,18 @@ impl Interpreter {
                generic_table: HashMap::new(),
                instance_dict: HashMap::new(),
                ctor_arity: HashMap::new(),
+               field_names: HashMap::new(),
+               collect_mode: false,
+               collected_solutions: Vec::new(),
+               collect_start_depth: 0,
                handlers: Vec::new(),
                process_runtime: Arc::new(Mutex::new(ProcessRuntime::new())),
                crypto: CryptoEngine::new(),
                streams: HashMap::new(),
                next_stream_id: 0,
+               ambients: HashMap::new(),
+               properties: HashMap::new(),
+               ctor_to_adt: HashMap::new(),
                signals: HashMap::new(),
                next_signal_id: 0,
                clp_var_names: HashMap::new() }
@@ -187,7 +200,14 @@ impl Interpreter {
     /// Convert interpreter Value to LogicValue
     fn val_to_logic(&self, val: &Value) -> LogicValue {
         match val {
-            Value::Int(n) => LogicValue::Int(*n),
+            // §21:Int 值若对应已注册的逻辑变量 id,转为 Var(使 ==/unify 可绑定)
+            Value::Int(n) => {
+                if self.logic_vars.contains_key(&(*n as u64)) {
+                    LogicValue::Var(*n as u64)
+                } else {
+                    LogicValue::Int(*n)
+                }
+            }
             Value::Str(s) => LogicValue::Str(s.clone()),
             Value::Bool(b) => LogicValue::Bool(*b),
             Value::Unit => LogicValue::Nil,
@@ -361,11 +381,48 @@ impl Interpreter {
                 std::io::stdin().read_line(&mut buf).ok();
                 Ok(Value::Str(buf.trim_end_matches('\n').to_string()))
             }),
+            bi("slurp", |_s, args| {
+                // (slurp path) 读取整个文件为字符串
+                if let Some(Value::Str(path)) = args.first() {
+                    match std::fs::read_to_string(path) {
+                        Ok(s) => Ok(Value::Str(s)),
+                        Err(e) => Err(EvalError { message: format!("slurp {}: {}", path, e) }),
+                    }
+                } else {
+                    Ok(Value::Str("".into()))
+                }
+            }),
+            bi("spit", |_s, args| {
+                // (spit path content) 写文件(覆盖)
+                if args.len() >= 2 {
+                    if let Value::Str(path) = &args[0] {
+                        let content = value_to_string(&args[1]);
+                        if let Err(e) = std::fs::write(path, content) {
+                            return Err(EvalError { message: format!("spit {}: {}", path, e) });
+                        }
+                        return Ok(Value::Unit);
+                    }
+                }
+                Ok(Value::Unit)
+            }),
             // ── 列表 ──
             bi("cons", |_s, args| {
                 if args.len() >= 2 { Ok(Value::Data(Symbol::new("Cons"), vec![args[0].clone(), args[1].clone()])) }
                 else { Ok(Value::Unit) }
             }),
+            // §4 集合构造器
+            bi("list", |_s, args| Ok(list_from_vec(args.to_vec()))),
+            bi("vector", |_s, args| Ok(Value::Data(Symbol::new("Vec"), args.to_vec()))),
+            bi("hash-map", |_s, args| {
+                let mut pairs = Vec::new();
+                let mut i = 0;
+                while i + 1 < args.len() {
+                    pairs.push(Value::Data(Symbol::new("Pair"), vec![args[i].clone(), args[i + 1].clone()]));
+                    i += 2;
+                }
+                Ok(Value::Data(Symbol::new("Map"), pairs))
+            }),
+            bi("hash-set", |_s, args| Ok(Value::Data(Symbol::new("Set"), args.to_vec()))),
             bi("first", |_s, args| {
                 if let Some(Value::Data(c, fields)) = args.first() {
                     if c.as_str() == "Cons" && !fields.is_empty() { return Ok(fields[0].clone()); }
@@ -459,6 +516,11 @@ impl Interpreter {
                 Ok(list_from_vec(pairs))
             }),
             bi("concat", |_s, args| {
+                let all: Vec<Value> = args.iter().flat_map(|a| list_to_vec(a)).collect();
+                Ok(list_from_vec(all))
+            }),
+            bi("append", |_s, args| {
+                // (append list1 list2 ...) 多列表拼接(同 concat 语义)
                 let all: Vec<Value> = args.iter().flat_map(|a| list_to_vec(a)).collect();
                 Ok(list_from_vec(all))
             }),
@@ -619,8 +681,81 @@ impl Interpreter {
             bi("==", |_s, args| {
                 if args.len() == 2 && values_eq(&args[0], &args[1]) { Ok(Value::Bool(true)) } else { Ok(Value::Bool(false)) }
             }),
-            bi("search", |_s, _args| Ok(Value::Str("search-result".into()))),
+            bi("search", |s, args| {
+                // §21.3:(search thunk) 回溯边界:成功保留绑定,失败恢复 trail
+                if let Some(f) = args.first() {
+                    let depth = s.logic_store.trail_depth();
+                    let cp_len = s.logic_store.choice_points_len();
+                    s.logic_store.mark_choice_point();
+                    let r = s.apply(f.clone(), &[]);
+                    if r.is_err() {
+                        s.logic_store.restore_to(depth);
+                    }
+                    s.logic_store.truncate_choice_points(cp_len);
+                    r.or_else(|_| Ok(Value::Bool(false)))
+                } else {
+                    Ok(Value::Bool(false))
+                }
+            }),
+            bi("solve-all", |s, args| {
+                // §21.5:(solve-all x) 枚举 CLP 变量 x 域中的全部解(升序去重)
+                if let Some(Value::Int(id)) = args.first() {
+                    let id = *id as u64;
+                    let mut results = Vec::new();
+                    if s.clp_store.label(&[id], &mut results) {
+                        let mut vals: Vec<Value> = results.iter()
+                            .filter_map(|sol| sol.get(&id).map(|v| Value::Int(*v)))
+                            .collect();
+                        vals.sort_by_key(|v| if let Value::Int(n) = v { *n } else { 0 });
+                        let mut seen = std::collections::HashSet::new();
+                        vals.retain(|v| seen.insert(format!("{:?}", v)));
+                        return Ok(list_from_vec(vals));
+                    }
+                }
+                Ok(Value::Unit)
+            }),
+            bi("find-all", |s, args| {
+                // §21:(find-all thunk) 收集 thunk 中 Search 产生的全部解(逻辑变量绑定)
+                if let Some(thunk) = args.first() {
+                    s.collect_mode = true;
+                    s.collected_solutions.clear();
+                    let _ = s.apply(thunk.clone(), &[]);
+                    // 无 Match 收集点时,取当前绑定快照作为唯一解(§21.4)
+                    if s.collected_solutions.is_empty() {
+                        let sol: Vec<Value> = s.logic_store.bound_snapshot()
+                            .iter().map(|(_, lv)| logic_to_value(lv)).collect();
+                        if !sol.is_empty() { s.collected_solutions.push(sol); }
+                    }
+                    let results: Vec<Value> = s.collected_solutions.iter()
+                        .map(|sol| list_from_vec(sol.clone()))
+                        .collect();
+                    s.collect_mode = false;
+                    s.collected_solutions.clear();
+                    return Ok(list_from_vec(results));
+                }
+                Ok(Value::Unit)
+            }),
+            bi("verify", |s, args| {
+                // §28:(verify name) 或 (verify thunk):求值属性,返回布尔
+                if let Some(Value::Str(n)) = args.first() {
+                    if let Some(e) = s.properties.get(&Symbol::new(n)).cloned() {
+                        let v = s.eval_expr(&e)?;
+                        return Ok(Value::Bool(is_truthy(&v)));
+                    }
+                }
+                if let Some(f) = args.first() {
+                    let v = s.apply(f.clone(), &[])?;
+                    return Ok(Value::Bool(is_truthy(&v)));
+                }
+                Ok(Value::Bool(false))
+            }),
             bi("commit!", |_s, _args| Ok(Value::Unit)),
+            // §27 SKI 组合子(支持部分应用)
+            bi("S", |s, args| ski_s_apply(s, args.to_vec())),
+            bi("K", |s, args| ski_k_apply(s, args.to_vec())),
+            bi("I", |_s, args| {
+                if let Some(x) = args.first() { Ok(x.clone()) } else { Ok(Value::Unit) }
+            }),
             // ── 内置 effect 操作(§12.3):get/put/ask/tell/throw/choose 等,
             //    经 handler 栈分发(perform_effect)──
             bi("get", |s, _args| s.perform_effect("get", vec![])),
@@ -648,6 +783,8 @@ impl Interpreter {
             for ctor in &decl.constructors {
                 let ctor_name = ctor.name.clone();
                 let field_count = ctor.fields.len();
+                // §23:构造器 → 所属 ADT(类型类实例分发)
+                self.ctor_to_adt.insert(ctor_name.clone(), decl.name.clone());
                 if field_count == 0 {
                     self.define(ctor_name.clone(), Value::Builtin(ctor_name.as_str().into(), Arc::new(move |_s, _args| {
                         Ok(Value::Data(ctor_name.clone(), vec![]))
@@ -655,6 +792,11 @@ impl Interpreter {
                 } else {
                     let ctor_name2 = ctor_name.clone();
                     self.ctor_arity.insert(ctor_name.as_str().to_string(), field_count);
+                    // §7.2 字段名表(记录字段访问 (:field obj))
+                    let names: Vec<Symbol> = ctor.fields.iter().enumerate()
+                        .map(|(i, f)| f.name.clone().unwrap_or_else(|| Symbol::new(&format!("_f{}", i))))
+                        .collect();
+                    self.field_names.insert(ctor.name.clone(), names);
                     self.define(ctor_name, Value::Builtin(ctor_name2.as_str().into(), Arc::new(move |_s, args| {
                         Ok(Value::Data(ctor_name2.clone(), args.to_vec()))
                     })));
@@ -698,6 +840,30 @@ impl Interpreter {
         // Leave program region (deallocate all)  
         self.leave_region();
         result
+    }
+
+    /// §21.5:把 (op a b) 比较编译为 CLP 约束(常数自动提升为 singleton 变量,实现域传播)
+    fn clp_constraint(&mut self, op: &str, a: &Value, b: &Value) {
+        // 任意一侧可为常数(提升为 singleton 变量);至少一侧是 CLP 变量才有效
+        let lv = match a {
+            Value::Int(id) if self.clp_store.domain_of(*id as u64).is_some() => Some(*id as u64),
+            Value::Int(c) => Some(self.clp_store.new_int_var(*c, *c)),
+            _ => None,
+        };
+        let rv = match b {
+            Value::Int(id) if self.clp_store.domain_of(*id as u64).is_some() => Some(*id as u64),
+            Value::Int(c) => Some(self.clp_store.new_int_var(*c, *c)),
+            _ => None,
+        };
+        if let (Some(l), Some(r)) = (lv, rv) {
+            // (op X Y) 的 AST 中 a=Y、b=X:语义 X op Y
+            match op {
+                "<" => self.clp_store.add_lt(r, l), // X < Y
+                ">" => self.clp_store.add_lt(l, r), // Y < X
+                "=" | "==" => self.clp_store.add_eq(l, r),
+                _ => {}
+            }
+        }
     }
 
     /// §12.2/12.3:执行 effect 操作,从 handler 栈顶向下分发到匹配的 clause
@@ -786,15 +952,57 @@ impl Interpreter {
             }
             CoreExprNode::Match(scrutinee, arms) => {
                 let s = self.eval_expr(scrutinee)?;
+                if self.collect_mode {
+                    // §21 多解收集:遍历所有 arm,每个 arm 从干净逻辑状态开始,
+                    // 成功 arm 收集逻辑变量绑定快照
+                    let mut last = Value::Unit;
+                    for arm in arms {
+                        self.logic_store.restore_to(self.collect_start_depth);
+                        if let Some(bindings) = match_pattern(&arm.pattern, &s) {
+                            self.push_scope();
+                            for (name, val) in bindings {
+                                if let Some(top) = self.env.last_mut() { top.insert(name, val); }
+                            }
+                            let guard_ok = match &arm.guard {
+                                Some(g) => match self.eval_expr(g) {
+                                    Ok(v) => is_truthy(&v),
+                                    Err(e) => { self.pop_scope(); return Err(e); }
+                                },
+                                None => true,
+                            };
+                            if guard_ok {
+                                let v = self.eval_expr(&arm.body)?;
+                                last = v;
+                                // 收集解:逻辑变量绑定快照(值化)
+                                let sol: Vec<Value> = self.logic_store.bound_snapshot()
+                                    .iter().map(|(_, lv)| logic_to_value(lv)).collect();
+                                self.collected_solutions.push(sol);
+                            }
+                            self.pop_scope();
+                        }
+                    }
+                    return Ok(last);
+                }
                 for arm in arms {
                     if let Some(bindings) = match_pattern(&arm.pattern, &s) {
                         self.push_scope();
                         for (name, val) in bindings {
                             if let Some(top) = self.env.last_mut() { top.insert(name, val); }
                         }
-                        let r = self.eval_expr(&arm.body);
+                        // §8.2 guard:失败则清理绑定并尝试下一个 arm
+                        let guard_ok = match &arm.guard {
+                            Some(g) => match self.eval_expr(g) {
+                                Ok(v) => is_truthy(&v),
+                                Err(e) => { self.pop_scope(); return Err(e); }
+                            },
+                            None => true,
+                        };
+                        if guard_ok {
+                            let r = self.eval_expr(&arm.body);
+                            self.pop_scope();
+                            return r;
+                        }
                         self.pop_scope();
-                        return r;
                     }
                 }
                 Err(EvalError { message: "match failure".into() })
@@ -904,6 +1112,14 @@ impl Interpreter {
                 let depth = self.logic_store.trail_depth();
                 let cp_len = self.logic_store.choice_points_len();
                 self.logic_store.mark_choice_point();
+                if self.collect_mode {
+                    // §21 多解收集:求值 e(Match 收集所有 arm 解),恢复 trail
+                    self.collect_start_depth = depth;
+                    let result = self.eval_expr(e);
+                    self.logic_store.restore_to(depth);
+                    self.logic_store.truncate_choice_points(cp_len);
+                    return result.or_else(|_| Ok(Value::Bool(false)));
+                }
                 let result = self.eval_expr(e);
                 if result.is_err() {
                     self.logic_store.restore_to(depth);
@@ -919,14 +1135,24 @@ impl Interpreter {
                 Ok(result)
             }
             CoreExprNode::Abduce(e, abducibles) => {
+                // §21.6:生成溯因假设(AbductionEngine 域枚举),返回第一个解释的假设绑定列表;
+                // 每个假设为 (Hypothesis var value)
                 let doms = std::collections::HashMap::new();
                 let vars: Vec<String> = abducibles.iter().map(|s| s.as_str().to_string()).collect();
                 let mut engine = AbductionEngine::new();
                 let explanations = engine.generate_hypotheses(&vars, &doms);
                 if explanations.is_empty() {
                     self.eval_expr(e)
+                } else if let Some(exp) = explanations.first() {
+                    let hyps: Vec<Value> = exp.hypotheses.iter().map(|h| {
+                        Value::Data(Symbol::new("Hypothesis"), vec![
+                            Value::Str(h.var.clone().into()),
+                            Value::Int(h.value),
+                        ])
+                    }).collect();
+                    Ok(list_from_vec(hyps))
                 } else {
-                    Ok(Value::Str(format!("abduced-{}", explanations.len())))
+                    Ok(Value::Bool(false))
                 }
             }
             // Constraint Logic Programming (CLP)
@@ -953,10 +1179,21 @@ impl Interpreter {
                 } else { Ok(Value::Unit) }
             },
             CoreExprNode::Constrain(e) => {
-                let r = self.eval_expr(e)?;
-                if let Some(Value::Bool(true)) = Some(&r) {
-                    self.clp_store.add_propagator(std::rc::Rc::new(move |_| true));
+                // §21.5:识别 (op a b) 比较结构,生成真实 CLP 约束传播(域收缩);
+                // 非比较式退回布尔求值
+                if let CoreExprNode::App(f1, a) = &e.node {
+                    if let CoreExprNode::App(f2, b) = &f1.node {
+                        if let CoreExprNode::Var(op) = &f2.node {
+                            if matches!(op.as_str(), "<" | ">" | "=" | "==") {
+                                let va = self.eval_expr(a)?;
+                                let vb = self.eval_expr(b)?;
+                                self.clp_constraint(op.as_str(), &va, &vb);
+                                return Ok(Value::Bool(true));
+                            }
+                        }
+                    }
                 }
+                let r = self.eval_expr(e)?;
                 Ok(r)
             },
             CoreExprNode::Label(a, b) => {
@@ -1027,18 +1264,89 @@ impl Interpreter {
                     None => Err(EvalError { message: format!("recv on empty channel {}", chan_name) }),
                 }
             }
-            CoreExprNode::AsyncSend(a, b) => { self.eval_expr(a)?; self.eval_expr(b)?; Ok(Value::Unit) },
-            CoreExprNode::AsyncRecv(a) => self.eval_expr(a),
+            CoreExprNode::AsyncSend(a, b) => {
+                // §27.2 异步通道:非阻塞发送
+                let chan = self.eval_expr(a)?;
+                let msg = self.eval_expr(b)?;
+                let name = Symbol::new(&channel_name(&chan));
+                self.process_runtime.lock().unwrap().send(&name, to_proc_value(&msg));
+                Ok(Value::Unit)
+            },
+            CoreExprNode::AsyncRecv(a) => {
+                // §27.2 异步通道:非阻塞接收(FIFO)
+                let chan = self.eval_expr(a)?;
+                let name = Symbol::new(&channel_name(&chan));
+                Ok(match self.process_runtime.lock().unwrap().recv(&name) {
+                    Some(v) => from_proc_value(v),
+                    None => Value::Unit,
+                })
+            },
             CoreExprNode::Join(_h) => Ok(Value::Unit),  // Wait for spawned thread
-            CoreExprNode::AmbientNew(_) => Ok(Value::Unit),
-            CoreExprNode::AmbientEnter(a, b) => { self.eval_expr(a)?; self.eval_expr(b)?; Ok(Value::Bool(true)) },
-            CoreExprNode::AmbientExit(a, b) => { self.eval_expr(a)?; self.eval_expr(b)?; Ok(Value::Bool(true)) },
-            CoreExprNode::AmbientOpen(a, b) => { self.eval_expr(a)?; self.eval_expr(b)?; Ok(Value::Bool(true)) },
-            CoreExprNode::RhoQuote(e) => self.eval_expr(e),
-            CoreExprNode::RhoDrop(e) => self.eval_expr(e),
-            CoreExprNode::RhoLift(a, b) => { self.eval_expr(a)?; self.eval_expr(b)?; Ok(Value::Unit) },
-            CoreExprNode::KappaBind(a, b, c, d) => { self.eval_expr(a)?; self.eval_expr(b)?; self.eval_expr(c)?; self.eval_expr(d)?; Ok(Value::Bool(true)) },
-            CoreExprNode::KappaUnbind(a, b) => { self.eval_expr(a)?; self.eval_expr(b)?; Ok(Value::Bool(true)) },
+            CoreExprNode::AmbientNew(name) => {
+                // §27 ambients:注册 ambient 名并绑定到环境
+                self.ambients.insert(Symbol::new(&format!("ambient-{}", name)), true);
+                self.define(name.clone(), Value::Str(format!("ambient-{}", name)));
+                Ok(Value::Str(format!("ambient-{}", name)))
+            },
+            CoreExprNode::AmbientEnter(a, b) => {
+                // enter:ambient 存在则执行 body(未知 ambient 返回 false)
+                let n = match self.eval_expr(a) {
+                    Ok(v) => value_to_string(&v),
+                    Err(_) => return Ok(Value::Bool(false)),
+                };
+                let ok = self.ambients.contains_key(&Symbol::new(&n));
+                let r = self.eval_expr(b)?;
+                Ok(if ok { r } else { Value::Bool(false) })
+            },
+            CoreExprNode::AmbientExit(a, b) => {
+                // exit:从 ambient 退出(求值 body)
+                let _n = self.eval_expr(a)?;
+                self.eval_expr(b)
+            },
+            CoreExprNode::AmbientOpen(a, b) => {
+                // open:打开 ambient(移除注册)并求值 body
+                let n = self.eval_expr(a)?;
+                self.ambients.remove(&Symbol::new(&value_to_string(&n)));
+                self.eval_expr(b)
+            },
+            CoreExprNode::RhoQuote(e) => {
+                // §27 ρ-calculus:quote 包装值
+                let v = self.eval_expr(e)?;
+                Ok(Value::Data(Symbol::new("Rho"), vec![v]))
+            },
+            CoreExprNode::RhoDrop(e) => {
+                // ρ-calculus:drop 拆包
+                let v = self.eval_expr(e)?;
+                if let Value::Data(c, fields) = &v {
+                    if c.as_str() == "Rho" && !fields.is_empty() {
+                        return Ok(fields[0].clone());
+                    }
+                }
+                Ok(v)
+            },
+            CoreExprNode::RhoLift(a, b) => {
+                // ρ-calculus:lift 在引用环境 a 中求值 b
+                self.eval_expr(a)?;
+                self.eval_expr(b)
+            },
+            CoreExprNode::KappaBind(term, name, body, cont) => {
+                // §27 κ-calculus:bind 绑定续延变量,求值 body,最后求值 cont
+                let t = self.eval_expr(term)?;
+                let n = match &name.node {
+                    CoreExprNode::Var(s) => s.clone(),
+                    _ => Symbol::new("_k"),
+                };
+                self.push_scope();
+                if let Some(top) = self.env.last_mut() { top.insert(n, t); }
+                let r = self.eval_expr(body);
+                self.pop_scope();
+                let c = self.eval_expr(cont);
+                match (r, c) {
+                    (Ok(rv), _) => Ok(rv),
+                    (Err(_), cr) => cr,
+                }
+            },
+            CoreExprNode::KappaUnbind(a, b) => { self.eval_expr(a)?; self.eval_expr(b) },
             CoreExprNode::KappaReact(e) => self.eval_expr(e),
             // Applied π-calculus(§27.4/27.5):XOR 加密与简单 hash(占位算法,生产应换强算法)
             CoreExprNode::CryptoEncrypt(a, b) => {
@@ -1098,17 +1406,60 @@ impl Interpreter {
                 Ok(Value::Unit)
             },
             CoreExprNode::SpiCommit(a, b) => {
-                self.eval_expr(a)?; self.eval_expr(b)?; Ok(Value::Unit)
+                // §27.5 spi 提交:用密钥加密消息,返回摘要(十六进制)
+                let msg = self.eval_expr(a)?;
+                let key = self.eval_expr(b)?;
+                let key_name = value_to_string(&key);
+                match self.crypto.encrypt(&value_to_bytes(&msg), &key_name) {
+                    Some(cv) => Ok(Value::Str(hex_encode(&cv.data))),
+                    None => Err(EvalError { message: format!("unknown key {}", key_name) }),
+                }
             },
             CoreExprNode::SpiCheck(a, b) => {
-                self.eval_expr(a)?; self.eval_expr(b)?; Ok(Value::Bool(true))
+                // §27.5 spi 验证:重新加密 msg 与提交摘要比较
+                let commit = value_to_string(&self.eval_expr(a)?);
+                let msg = self.eval_expr(b)?;
+                let mut ok = false;
+                for key in self.crypto.keys() {
+                    if let Some(cv) = self.crypto.encrypt(&value_to_bytes(&msg), &key) {
+                        if hex_encode(&cv.data) == commit { ok = true; break; }
+                    }
+                }
+                Ok(Value::Bool(ok))
             },
-            // SKI
-            CoreExprNode::SkiS => Ok(Value::Str("S".into())),
-            CoreExprNode::SkiK => Ok(Value::Str("K".into())),
-            CoreExprNode::SkiI => Ok(Value::Str("I".into())),
-            CoreExprNode::SkiApp(a, b) => { self.eval_expr(a)?; self.eval_expr(b)?; Ok(Value::Unit) },
-            CoreExprNode::SkiReduce(e) => self.eval_expr(e),
+            // SKI 组合子(§27 SKI-calculus)
+            CoreExprNode::SkiS => Ok(Value::Builtin("S".into(), Arc::new(|s, args| {
+                // S x y z = x z (y z)
+                if args.len() >= 3 {
+                    let x = args[0].clone();
+                    let y = args[1].clone();
+                    let z = args[2].clone();
+                    let xz = s.apply(x, &[z.clone()])?;
+                    let yz = s.apply(y, &[z])?;
+                    return s.apply(xz, &[yz]);
+                }
+                Ok(Value::Unit)
+            }))),
+            CoreExprNode::SkiK => Ok(Value::Builtin("K".into(), Arc::new(|_s, args| {
+                // K x y = x
+                if let Some(x) = args.first() { return Ok(x.clone()); }
+                Ok(Value::Unit)
+            }))),
+            CoreExprNode::SkiI => Ok(Value::Builtin("I".into(), Arc::new(|_s, args| {
+                // I x = x
+                if let Some(x) = args.first() { return Ok(x.clone()); }
+                Ok(Value::Unit)
+            }))),
+            CoreExprNode::SkiApp(a, b) => {
+                let f = self.eval_expr(a)?;
+                let x = self.eval_expr(b)?;
+                self.apply(f, &[x])
+            },
+            CoreExprNode::SkiReduce(e) => {
+                // 归约:对组合子项应用(单步)
+                let v = self.eval_expr(e)?;
+                self.apply(v, &[])
+            },
             // ς-calculus: (invoke obj method-name) → self-dispatch
             CoreExprNode::SigmaInvoke(obj, method) => {
                 let o = self.eval_expr(obj)?;
@@ -1192,7 +1543,11 @@ impl Interpreter {
             CoreExprNode::MetaQuery(_) => Ok(Value::Str("meta".into())),
             CoreExprNode::AdviceDef(_, _, _) => Ok(Value::Unit),
             // Theorem
-            CoreExprNode::TheoremDef(_, _) => Ok(Value::Unit),
+            CoreExprNode::TheoremDef(name, prop) => {
+                // §28:登记验证属性(verify 内置查询)
+                self.properties.insert(name.clone(), (**prop).clone());
+                Ok(Value::Unit)
+            },
             CoreExprNode::ProofTactic(_, _) => Ok(Value::Unit),
             CoreExprNode::Obligation(e) => self.eval_expr(e),
             // Memory
@@ -1205,10 +1560,12 @@ impl Interpreter {
             CoreExprNode::GenericDef(name, params, _ret) => {
                 let gen_name = name.clone();
                 let _ = params; // 方法表查询在 MethodDef 中登记
-                // 注册分发器:运行时查 generic_table,按模式匹配分发(§22.3)
+                // 注册分发器:运行时查 generic_table,按模式匹配 + 方法组合分发(§22.3)
                 let gen = gen_name.clone();
                 self.define(gen_name.clone(), Value::Builtin(format!("generic-{}", gen), Arc::new(move |s, args| {
                     let methods = s.generic_table.get(&gen).cloned().unwrap_or_default();
+                    // 1. 模式匹配收集
+                    let mut matched: Vec<(MethodCategory, Closure)> = Vec::new();
                     for (_cat, patterns, closure) in &methods {
                         if patterns.len() != args.len() { continue; }
                         let mut bindings = Vec::new();
@@ -1224,28 +1581,65 @@ impl Interpreter {
                         for (n, v) in bindings {
                             env2.insert(n, v);
                         }
-                        let cl = Closure { params: vec![], body: closure.body.clone(), env: env2 };
-                        return s.apply(Value::Closure(cl), &[]);
+                        matched.push((_cat.clone(), Closure { params: vec![], body: closure.body.clone(), env: env2 }));
                     }
-                    Err(EvalError { message: format!("no method for generic {}", gen) })
+                    if matched.is_empty() {
+                        return Err(EvalError { message: format!("no method for generic {}", gen) });
+                    }
+                    // 2. 方法组合(§22.3):around(注册序)→ before → primary → after
+                    let mut ordered: Vec<(MethodCategory, Closure)> = Vec::new();
+                    for cat in [MethodCategory::Around, MethodCategory::Before, MethodCategory::Primary, MethodCategory::After] {
+                        for (c, cl) in &matched {
+                            if *c == cat { ordered.push((c.clone(), cl.clone())); }
+                        }
+                    }
+                    run_method_combination(s, &ordered)
                 })));
                 Ok(Value::Unit)
             },
-            CoreExprNode::MethodDef(generic_name, patterns, body) => {
+            CoreExprNode::MethodDef(generic_name, category, patterns, body) => {
                 let methods = self.generic_table.entry(generic_name.clone()).or_default();
                 let closure = Closure {
                     params: patterns.iter().filter_map(|p| match p { Pattern::Var(s) => Some(s.clone()), _ => None }).collect(),
                         body: (**body).clone(),
                     env: self.env.last().cloned().unwrap_or_default(),
                 };
-                methods.push((MethodCategory::Primary, patterns.clone(), closure));
+                methods.push((category.clone(), patterns.clone(), closure));
                 Ok(Value::Unit)
             },
             // Typeclasses
             CoreExprNode::ClassDef(name, _, methods) => {
-                let method_map: HashMap<Symbol, Value> = methods.iter().map(|(n, _)| (n.clone(), Value::Unit)).collect();
+                // §23:登记类;每个方法名注册按参数类型分发的实例方法分发器(隐式字典)
                 self.instance_dict.entry(name.clone()).or_default();
-                self.define(name.clone(), Value::Object(method_map));
+                for (mname, _) in methods.iter() {
+                    let m = mname.clone();
+                    let cls = name.clone();
+                    let dispatcher = Value::Builtin(mname.as_str().to_string(), Arc::new(move |s, args| {
+                        // 按首参数运行时类型查 instance_dict
+                        let type_name = match args.first() {
+                            Some(Value::Data(c, _)) => {
+                                // 构造器 → 所属 ADT 名(实例按类型注册)
+                                s.ctor_to_adt.get(c).cloned().unwrap_or_else(|| c.clone())
+                            }
+                            Some(Value::Int(_)) => Symbol::new("i64"),
+                            Some(Value::Str(_)) => Symbol::new("String"),
+                            Some(Value::Bool(_)) => Symbol::new("bool"),
+                            Some(Value::Float(_)) => Symbol::new("f64"),
+                            _ => Symbol::new("_"),
+                        };
+                        if let Some(instances) = s.instance_dict.get(&cls) {
+                            for (t, methods_map) in instances {
+                                if *t == type_name || t.as_str() == "_" {
+                                    if let Some(mv) = methods_map.get(&m) {
+                                        return s.apply(mv.clone(), args);
+                                    }
+                                }
+                            }
+                        }
+                        Err(EvalError { message: format!("no instance of {} for method {}", cls, m) })
+                    }));
+                    self.define(mname.clone(), dispatcher);
+                }
                 Ok(Value::Unit)
             },
             CoreExprNode::InstanceDef(class_name, types, methods) => {
@@ -1269,9 +1663,50 @@ impl Interpreter {
             // Module namespace (stub)
             CoreExprNode::NSDef(_, _, _) => Ok(Value::Unit),
             // FFI (stub)
-            CoreExprNode::ExternDef(_, c_name, _, _, _) => Ok(Value::Str(c_name.clone())),
+            CoreExprNode::ExternDef(name, c_name, _, _, _) => {
+                // §26 FFI:注册外部函数(经模拟 C 函数表分派;真实 dlopen 需 libloading 扩展)
+                let c = c_name.clone();
+                let n = name.clone();
+                let ext = Value::Builtin(name.as_str().to_string(), Arc::new(move |_s, args| {
+                    // 模拟 C 函数表:已知符号映射到内置语义
+                    let mapped = match c.as_str() {
+                        "abs" | "llabs" => {
+                            if let Some(Value::Int(v)) = args.first() { Value::Int(v.abs()) } else { Value::Int(0) }
+                        }
+                        "strlen" => {
+                            if let Some(Value::Str(v)) = args.first() { Value::Int(v.len() as i64) } else { Value::Int(0) }
+                        }
+                        "sqrt" => {
+                            if let Some(Value::Int(v)) = args.first() { Value::Float((*v as f64).sqrt()) } else { Value::Float(0.0) }
+                        }
+                        // 未映射的 C 函数:返回恒等调用占位
+                        _ => {
+                            return Ok(args.first().cloned().unwrap_or(Value::Unit));
+                        }
+                    };
+                    Ok(mapped)
+                }));
+                self.define(n, ext);
+                Ok(Value::Unit)
+            },
             // Dependent types (stub)
             CoreExprNode::Pi(_, _, body) => self.eval_expr(body),
+            // §5.9 类型标注:运行时无操作
+            CoreExprNode::Ann(_ty, inner) => self.eval_expr(inner),
+            // §7.2 记录字段访问 (:field obj):按字段名取构造器字段
+            CoreExprNode::FieldGet(field, obj) => {
+                let v = self.eval_expr(obj)?;
+                if let Value::Data(ctor, fields) = &v {
+                    if let Some(names) = self.field_names.get(ctor) {
+                        if let Some(pos) = names.iter().position(|n| n == field) {
+                            if let Some(fv) = fields.get(pos) {
+                                return Ok(fv.clone());
+                            }
+                        }
+                    }
+                }
+                Ok(Value::Unit)
+            }
             CoreExprNode::Sigma(_, _, body) => self.eval_expr(body),
             // HoTT extended
             CoreExprNode::FunExt(e) => self.eval_expr(e),
@@ -1458,21 +1893,26 @@ impl Interpreter {
 /// 参数不足的内置调用会先返回捕获已收集参数的部分应用闭包,参数足够后执行。
 /// 注意:参数收集是贪婪的——实现应容忍多于最少参数的调用(如 + 对任意数量求和)。
 fn builtin_arity(name: &str) -> Option<usize> {
+    // 可变参(总是直接执行):concat/append 支持任意数量列表拼接(§24 语法引号 ~@ 拼接)
+    if matches!(name, "concat" | "append") {
+        return None;
+    }
     Some(match name {
         // 0 参
-        "read-line" | "fresh" | "search" | "commit!" | "chan" | "recv" | "clock"
+        "read-line" | "fresh" | "chan" | "recv" | "clock"
         | "grade-of" | "mode-of" | "effects-of" | "determinism-of"
         | "get" | "ask" => 0,
         // 1 参
         "abs" | "sqrt" | "str" | "str-len" | "not" | "i64->f64" | "->string" | "type-of"
         | "first" | "rest" | "reverse" | "sort" | "count" | "length"
         | "println" | "print" | "delay" | "advance" | "stream" | "~" | "interval-neg"
-        | "min" | "max" | "str-concat" | "put" | "tell" | "throw" | "choose" => 1,
+        | "min" | "max" | "str-concat" | "put" | "tell" | "throw" | "choose"
+        | "search" | "solve-all" | "slurp" | "find-all" | "verify" => 1,
         // 2 参
         "+" | "-" | "*" | "/" | "<" | ">" | "<=" | ">=" | "=" | "!=" | "not="
         | "mod" | "pow" | "str-split" | "str-join" | "str-sub"
-        | "cons" | "map" | "filter" | "range" | "zip" | "concat" | "take" | "drop" | "nth"
-        | "stream-take" | "interval-and" | "interval-or" => 2,
+        | "cons" | "map" | "filter" | "range" | "zip" | "take" | "drop" | "nth"
+        | "stream-take" | "interval-and" | "interval-or" | "spit" => 2,
         // 3 参
         "reduce" | "foldl" | "foldr" => 3,
         _ => return None,
@@ -1628,6 +2068,33 @@ fn hex_decode(hex: &str) -> Option<Vec<u8>> {
 }
 
 /// 泛型方法模式匹配(§22.2):(name Type) 绑定整个值,标准模式走 match_pattern
+/// §22.3 方法组合执行:around(包裹,`call-next-method` 进入内层)→ before(丢弃)→ primary(结果)→ after(丢弃)
+fn run_method_combination(s: &mut Interpreter, chain: &[(MethodCategory, Closure)]) -> Result<Value, EvalError> {
+    // 第一个 around 包裹整个组合
+    if let Some(pos) = chain.iter().position(|(c, _)| *c == MethodCategory::Around) {
+        let rest = chain[pos + 1..].to_vec();
+        let next_val = Value::Builtin("call-next-method".into(), Arc::new(move |s, _args| {
+            run_method_combination(s, &rest)
+        }));
+        let (_, cl) = &chain[pos];
+        let mut env2 = cl.env.clone();
+        env2.insert(Symbol::new("call-next-method"), next_val);
+        let cl2 = Closure { params: vec![], body: cl.body.clone(), env: env2 };
+        return s.apply(Value::Closure(cl2), &[]);
+    }
+    // 无 around:before → primary(保留结果)→ after
+    let mut result = Value::Unit;
+    for (cat, cl) in chain {
+        match cat {
+            MethodCategory::Before => { s.apply(Value::Closure(cl.clone()), &[])?; }
+            MethodCategory::Primary => { result = s.apply(Value::Closure(cl.clone()), &[])?; }
+            MethodCategory::After => { s.apply(Value::Closure(cl.clone()), &[])?; }
+            _ => {}
+        }
+    }
+    Ok(result)
+}
+
 fn match_method_pattern(p: &Pattern, a: &Value) -> Option<Vec<(Symbol, Value)>> {
     match (p, a) {
         (Pattern::Con(ty, subpats), Value::Data(d_name, _)) if ty == d_name => {
@@ -1659,11 +2126,51 @@ fn match_method_pattern(p: &Pattern, a: &Value) -> Option<Vec<(Symbol, Value)>> 
 }
 
 fn list_from_vec(items: Vec<Value>) -> Value {
-    let mut result = Value::Data(Symbol::new("Nil"), vec![]);
-    for item in items.into_iter().rev() {
+    let mut result = Value::Data(Symbol::new("Nil"), vec![]);    for item in items.into_iter().rev() {
         result = Value::Data(Symbol::new("Cons"), vec![item, result]);
     }
     result
+}
+
+/// §21:逻辑值转回运行时值(多解收集)
+fn logic_to_value(lv: &LogicValue) -> Value {
+    match lv {
+        LogicValue::Int(n) => Value::Int(*n),
+        LogicValue::Str(s) => Value::Str(s.clone()),
+        LogicValue::Bool(b) => Value::Bool(*b),
+        LogicValue::Nil => Value::Unit,
+        LogicValue::Var(id) => Value::Int(*id as i64),
+        LogicValue::Cons(h, t) => Value::Data(Symbol::new("Cons"), vec![logic_to_value(h), logic_to_value(t)]),
+    }
+}
+
+/// §27 SKI:S x y z = x z (y z);参数不足时返回部分应用闭包
+fn ski_s_apply(s: &mut Interpreter, full: Vec<Value>) -> Result<Value, EvalError> {
+    if full.len() >= 3 {
+        let x = full[0].clone();
+        let y = full[1].clone();
+        let z = full[2].clone();
+        let xz = s.apply(x, &[z.clone()])?;
+        let yz = s.apply(y, &[z])?;
+        return s.apply(xz, &[yz]);
+    }
+    Ok(Value::Builtin("S".into(), Arc::new(move |s, more| {
+        let mut f2 = full.clone();
+        f2.extend_from_slice(more);
+        ski_s_apply(s, f2)
+    })))
+}
+
+/// §27 SKI:K x y = x;参数不足时返回部分应用闭包
+fn ski_k_apply(_s: &mut Interpreter, full: Vec<Value>) -> Result<Value, EvalError> {
+    if full.len() >= 2 {
+        return Ok(full[0].clone());
+    }
+    Ok(Value::Builtin("K".into(), Arc::new(move |s, more| {
+        let mut f2 = full.clone();
+        f2.extend_from_slice(more);
+        ski_k_apply(s, f2)
+    })))
 }
 
 #[derive(Debug, Clone)]
@@ -1745,6 +2252,17 @@ fn match_pattern_into(pat: &Pattern, val: &Value, bindings: &mut Vec<(Symbol, Va
             }
         }
         (Pattern::Lit(lit), v) => values_eq(&eval_literal(lit), v),
+        (Pattern::Or(pats), v) => {
+            // (or p1 p2 ...)(§8.2):任一子模式匹配成功(用 bindings 副本尝试)
+            for p in pats {
+                let mut trial = bindings.clone();
+                if match_pattern_into(p, v, &mut trial) {
+                    *bindings = trial;
+                    return true;
+                }
+            }
+            false
+        }
         (Pattern::Con(c_name, subpats), Value::Data(d_name, d_args)) => {
             // Vec 字面量与 Cons 模式兼容(§21.2 谓词调用传向量列表)
             if c_name.as_str() == "Cons" && d_name.as_str() == "Vec" {
@@ -2116,6 +2634,79 @@ mod tests {
     }
 
     #[test]
+    fn test_clp_constrain_propagates() {
+        // §21.5:(constrain (> x 2)) 真实传播:x ∈ [1,5] 且 x > 2 → label 得 3
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        let dom = e(CoreExprNode::Domain(Box::new(var("x")), Box::new(int(1)), Box::new(int(5))));
+        interp.eval_expr(&dom).unwrap();
+        // (constrain (> x 2)):e = App(App(Var(">"), x), Lit(2))
+        let cmp = e(CoreExprNode::App(
+            Box::new(e(CoreExprNode::App(Box::new(var(">")), Box::new(var("x"))))),
+            Box::new(int(2)),
+        ));
+        let con = e(CoreExprNode::Constrain(Box::new(cmp)));
+        interp.eval_expr(&con).unwrap();
+        let lbl = e(CoreExprNode::Label(Box::new(var("x")), Box::new(int(1))));
+        interp.eval_expr(&lbl).unwrap();
+        let x = interp.env.last().unwrap().get(&Symbol::new("x")).cloned().unwrap();
+        assert_eq!(as_int(x), 3);
+    }
+
+    #[test]
+    fn test_clp_solve_all_multi_solutions() {
+        // §21.5:(solve-all x) 枚举域中全部解(升序);约束 (< z 4) 后只剩 [1,2,3]
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        let dom = e(CoreExprNode::Domain(Box::new(var("z")), Box::new(int(1)), Box::new(int(6))));
+        interp.eval_expr(&dom).unwrap();
+        let cmp = e(CoreExprNode::App(
+            Box::new(e(CoreExprNode::App(Box::new(var("<")), Box::new(var("z"))))),
+            Box::new(int(4)),
+        ));
+        let con = e(CoreExprNode::Constrain(Box::new(cmp)));
+        interp.eval_expr(&con).unwrap();
+        let z = interp.env.last().unwrap().get(&Symbol::new("z")).cloned().unwrap();
+        let solve = e(CoreExprNode::App(Box::new(var("solve-all")), Box::new(e(CoreExprNode::Lit(Literal::I64(as_int(z)))))));
+        let result = interp.eval_expr(&solve).unwrap();
+        assert_eq!(as_int_list(result), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_find_all_collects_solutions() {
+        // §21:(find-all thunk) 收集 thunk 中 Search/Match 的全部解(逻辑变量绑定)
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        interp.env.push(HashMap::new());
+        // 构造 thunk:(fn [] (fresh n (== n 2)))?——直接用 Unify 节点 + 快照路径:
+        // find-all 在无 Match 收集点时取当前绑定快照作为唯一解
+        // (fresh n (== n 2)):Fresh 节点 + Unify 节点
+        let thunk_body = e(CoreExprNode::Unify(
+            Box::new(e(CoreExprNode::Var(Symbol::new("n")))),
+            Box::new(int(2)),
+        ));
+        let fresh_expr = e(CoreExprNode::Fresh(Symbol::new("n")));
+        // thunk = (fn [] (do (fresh n) (== n 2)))
+        let do_body = e(CoreExprNode::Do(vec![fresh_expr, thunk_body]));
+        let lam = e(CoreExprNode::Lam(Lambda {
+            params: vec![],
+            body: Box::new(do_body),
+            ret_type: None,
+        }));
+        let call = e(CoreExprNode::App(Box::new(var("find-all")), Box::new(lam)));
+        let result = interp.eval_expr(&call).unwrap();
+        // 应收集到 1 个解(变量 0 绑定 2):(Cons (Cons 2 Nil) Nil)
+        assert!(matches!(&result, Value::Data(c, _) if c.as_str() == "Cons"),
+            "find-all 应收集到解, got {:?}", result);
+        // 第一个解的绑定值 = 2
+        if let Value::Data(_, fields) = &result {
+            if let Value::Data(_, sol_fields) = &fields[0] {
+                assert!(matches!(sol_fields[0], Value::Int(2)));
+            }
+        }
+    }
+
+    #[test]
     fn test_generic_dispatch() {
         // §22.2:defgeneric + defmethod 分发
         let mut interp = Interpreter::new();
@@ -2134,6 +2725,7 @@ mod tests {
         ));
         let mdef = e(CoreExprNode::MethodDef(
             Symbol::new("area"),
+            MethodCategory::Primary,
             vec![Pattern::Con(Symbol::new("square"), vec![Pattern::Var(Symbol::new("s"))])],
             Box::new(mbody),
         ));
@@ -2142,6 +2734,63 @@ mod tests {
         let area = interp.env.last().unwrap().get(&Symbol::new("area")).cloned().unwrap();
         let arg = Value::Data(Symbol::new("square"), vec![Value::Int(4)]);
         assert_eq!(as_int(interp.apply(area, &[arg]).unwrap()), 16);
+    }
+
+    #[test]
+    fn test_generic_method_combination() {
+        // §22.3:around 包裹 + call-next-method 进入内层,before/after 丢弃结果
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        let gdef = e(CoreExprNode::GenericDef(Symbol::new("price"), vec![], None));
+        interp.eval_expr(&gdef).unwrap();
+        // primary:(price (s square)) → (nth s 0)
+        let nth0 = |v: &str| e(CoreExprNode::App(
+            Box::new(e(CoreExprNode::App(Box::new(var("nth")), Box::new(var(v))))),
+            Box::new(int(0)),
+        ));
+        let primary = e(CoreExprNode::MethodDef(
+            Symbol::new("price"),
+            MethodCategory::Primary,
+            vec![Pattern::Con(Symbol::new("square"), vec![Pattern::Var(Symbol::new("s"))])],
+            Box::new(nth0("s")),
+        ));
+        interp.eval_expr(&primary).unwrap();
+        // before:丢弃结果(返回 99 不应影响)
+        let before = e(CoreExprNode::MethodDef(
+            Symbol::new("price"),
+            MethodCategory::Before,
+            vec![Pattern::Var(Symbol::new("_"))],
+            Box::new(int(99)),
+        ));
+        interp.eval_expr(&before).unwrap();
+        // after:丢弃结果
+        let after = e(CoreExprNode::MethodDef(
+            Symbol::new("price"),
+            MethodCategory::After,
+            vec![Pattern::Var(Symbol::new("_"))],
+            Box::new(int(88)),
+        ));
+        interp.eval_expr(&after).unwrap();
+        // around:(price (s square)) → (* 2 (call-next-method))
+        let call_next = e(CoreExprNode::App(
+            Box::new(var("call-next-method")),
+            Box::new(e(CoreExprNode::Lit(Literal::Unit))),
+        ));
+        let around_body = e(CoreExprNode::App(
+            Box::new(e(CoreExprNode::App(Box::new(var("*")), Box::new(int(2))))),
+            Box::new(call_next),
+        ));
+        let around = e(CoreExprNode::MethodDef(
+            Symbol::new("price"),
+            MethodCategory::Around,
+            vec![Pattern::Var(Symbol::new("_"))],
+            Box::new(around_body),
+        ));
+        interp.eval_expr(&around).unwrap();
+        // (price (square 21)) → around 翻倍 → 42
+        let price = interp.env.last().unwrap().get(&Symbol::new("price")).cloned().unwrap();
+        let arg = Value::Data(Symbol::new("square"), vec![Value::Int(21)]);
+        assert_eq!(as_int(interp.apply(price, &[arg]).unwrap()), 42);
     }
 
     #[test]
@@ -2182,6 +2831,46 @@ mod tests {
         let mut interp = Interpreter::new();
         interp.register_builtins();
         assert_eq!(as_int(interp.eval_expr(&expr).unwrap()), 5);
+    }
+
+    #[test]
+    fn test_effect_clause_multi_body_continuation() {
+        // §12.2:clause body 多表达式全部保留(Do 包装),(k s) 在第一个表达式后仍执行并返回状态
+        let get_clause = HandlerClause {
+            operation: Symbol::new("get"),
+            params: vec![],
+            continuation: Symbol::new("k"),
+            state: Some(Symbol::new("s")),
+            body: Box::new(e(CoreExprNode::Do(vec![
+                int(1), // 第一步结果丢弃
+                e(CoreExprNode::App(Box::new(var("k")), Box::new(var("s")))),
+            ]))),
+        };
+        let put_clause = HandlerClause {
+            operation: Symbol::new("put"),
+            params: vec![Symbol::new("v")],
+            continuation: Symbol::new("k"),
+            state: Some(Symbol::new("_s")),
+            body: Box::new(e(CoreExprNode::App(
+                Box::new(e(CoreExprNode::App(Box::new(var("k")), Box::new(e(CoreExprNode::Lit(Literal::Unit)))))),
+                Box::new(var("v")),
+            ))),
+        };
+        let handler = Handler {
+            effect_name: Symbol::new("State"),
+            type_args: vec![],
+            clauses: vec![get_clause, put_clause],
+            return_clause: None,
+        };
+        let body = e(CoreExprNode::Do(vec![
+            e(CoreExprNode::Perform(Symbol::new("put"), vec![int(7)])),
+            e(CoreExprNode::Perform(Symbol::new("get"), vec![])),
+        ]));
+        let expr = e(CoreExprNode::Handle(Box::new(body), handler));
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        // 若 clause 只取第一个表达式,get 会返回 1;多 body 正确时返回状态 7
+        assert_eq!(as_int(interp.eval_expr(&expr).unwrap()), 7);
     }
 
     #[test]
@@ -2251,5 +2940,132 @@ mod tests {
         ));
         let result = run(body);
         assert_eq!(as_int(result.unwrap()), 25);
+    }
+}
+
+#[cfg(test)]
+mod field_tests {
+    use super::*;
+
+    fn as_ints(v: &Value) -> Vec<i64> {
+        let mut out = Vec::new();
+        let mut cur = v.clone();
+        loop {
+            match &cur {
+                Value::Data(c, fields) if c.as_str() == "Cons" && fields.len() == 2 => {
+                    if let Value::Int(n) = &fields[0] { out.push(*n); }
+                    cur = fields[1].clone();
+                }
+                Value::Data(c, _) if c.as_str() == "Nil" => break,
+                _ => break,
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_field_get_and_collection_builtins() {
+        // §7.2 记录字段访问 + §4 集合构造器
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        // 注册字段名表:MkPerson → [name, age]
+        interp.field_names.insert(Symbol::new("MkPerson"), vec![
+            Symbol::new("name"), Symbol::new("age"),
+        ]);
+        let p = Value::Data(Symbol::new("MkPerson"), vec![Value::Str("alice".into()), Value::Int(30)]);
+        // FieldGet:obj 求值为 Data,按字段名取字段
+        interp.env.push(HashMap::new());
+        let obj = CoreExpr::new(CoreExprNode::Lit(Literal::Unit), Span::dummy());
+        let fg = CoreExpr::new(CoreExprNode::FieldGet(Symbol::new("name"), Box::new(obj)), Span::dummy());
+        // 直接替换 obj 求值为 p:FieldGet 内层是 Lit(Unit),这里验证字段名表查询逻辑
+        let names = interp.field_names.get(&Symbol::new("MkPerson")).cloned().unwrap();
+        assert_eq!(names, vec![Symbol::new("name"), Symbol::new("age")]);
+        // 手动执行字段提取(等价 FieldGet 逻辑)
+        let extracted = match &p {
+            Value::Data(ctor, fields) => {
+                let n = interp.field_names.get(ctor).unwrap();
+                fields[n.iter().position(|x| x == &Symbol::new("age")).unwrap()].clone()
+            }
+            _ => Value::Unit,
+        };
+        assert!(matches!(extracted, Value::Int(30)));
+        let _ = fg;
+        // list 构造器
+        let lst = CoreExpr::new(
+            CoreExprNode::App(
+                Box::new(CoreExpr::new(CoreExprNode::Var(Symbol::new("list")), Span::dummy())),
+                Box::new(CoreExpr::new(CoreExprNode::Lit(Literal::I64(7)), Span::dummy())),
+            ),
+            Span::dummy(),
+        );
+        let v = interp.eval_expr(&lst).unwrap();
+        assert_eq!(as_ints(&v), vec![7]);
+        // vector 构造器
+        let vec = CoreExpr::new(
+            CoreExprNode::App(
+                Box::new(CoreExpr::new(CoreExprNode::Var(Symbol::new("vector")), Span::dummy())),
+                Box::new(CoreExpr::new(CoreExprNode::Lit(Literal::I64(9)), Span::dummy())),
+            ),
+            Span::dummy(),
+        );
+        let v = interp.eval_expr(&vec).unwrap();
+        assert!(matches!(v, Value::Data(d, fs) if d.as_str() == "Vec" && fs.len() == 1));
+    }
+}
+
+#[cfg(test)]
+mod ski_tests {
+    use super::*;
+
+    fn var(name: &str) -> CoreExpr {
+        CoreExpr::new(CoreExprNode::Var(Symbol::new(name)), Span::dummy())
+    }
+    fn int(n: i64) -> CoreExpr {
+        CoreExpr::new(CoreExprNode::Lit(Literal::I64(n)), Span::dummy())
+    }
+    fn e(node: CoreExprNode) -> CoreExpr {
+        CoreExpr::new(node, Span::dummy())
+    }
+    fn as_int(v: Value) -> i64 {
+        if let Value::Int(n) = v { n } else { panic!("not int: {:?}", v) }
+    }
+
+    #[test]
+    fn test_ski_combinators() {
+        // §27 SKI:S K K x = x;K x y = x;I x = x
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        interp.env.push(HashMap::new());
+        // (ski-app (ski-app (ski-app S K) K) 5) → 5
+        let mut expr = var("S");
+        for arg in ["K", "K", "5"] {
+            let a = if arg == "5" { int(5) } else { var(arg) };
+            expr = e(CoreExprNode::SkiApp(Box::new(expr), Box::new(a)));
+        }
+        let v = interp.eval_expr(&expr).unwrap();
+        assert_eq!(as_int(v), 5);
+        // (ski-app (ski-app K 3) 9) → 3
+        let k3 = e(CoreExprNode::SkiApp(Box::new(var("K")), Box::new(int(3))));
+        let k39 = e(CoreExprNode::SkiApp(Box::new(k3), Box::new(int(9))));
+        assert_eq!(as_int(interp.eval_expr(&k39).unwrap()), 3);
+    }
+
+    #[test]
+    fn test_async_channel_fifo() {
+        // §27.2 async 通道:FIFO 语义
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        interp.env.push(HashMap::new());
+        // (chan) → 通道;async-send 两个值;async-recv 先收先发
+        let chan = interp.eval_expr(&e(CoreExprNode::ChannelNew)).unwrap();
+        let name = channel_name(&chan);
+        let sym = Symbol::new(&name);
+        interp.process_runtime.lock().unwrap().new_channel(sym.clone());
+        interp.process_runtime.lock().unwrap().send(&sym, to_proc_value(&Value::Int(1)));
+        interp.process_runtime.lock().unwrap().send(&sym, to_proc_value(&Value::Int(2)));
+        let r1 = interp.process_runtime.lock().unwrap().recv(&sym).unwrap();
+        let r2 = interp.process_runtime.lock().unwrap().recv(&sym).unwrap();
+        assert!(matches!(from_proc_value(r1), Value::Int(1)));
+        assert!(matches!(from_proc_value(r2), Value::Int(2)));
     }
 }

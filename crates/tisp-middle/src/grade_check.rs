@@ -263,6 +263,11 @@ impl GradeChecker {
                     self.bind_pattern_vars(pat);
                 }
             }
+            Pattern::Or(pats) => {
+                for pat in pats {
+                    self.bind_pattern_vars(pat);
+                }
+            }
         }
     }
 
@@ -279,6 +284,11 @@ impl GradeChecker {
                 }
             }
             Pattern::Tuple(pats) => {
+                for pat in pats {
+                    self.unbind_pattern_vars(pat);
+                }
+            }
+            Pattern::Or(pats) => {
                 for pat in pats {
                     self.unbind_pattern_vars(pat);
                 }

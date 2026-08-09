@@ -4,6 +4,8 @@ use tisp_core::span::Span;
 #[derive(Logos, Debug, Clone, PartialEq)]
 #[logos(skip r"[ \t\r\n\f]+")]
 #[logos(skip r";[^\n]*")]
+// §3.2 块注释 #| ... |#(可跨行;内容为 非| 或 |后非# 的序列)
+#[logos(skip r"#\|([^|]|\|[^#])*\|#")]
 pub enum Token {
     #[token("(")] LParen,
     #[token(")")] RParen,
@@ -33,7 +35,27 @@ pub enum Token {
 
     #[regex(r#""([^"\\]|\\.)*""#, |lex| {
         let s = lex.slice();
-        Some(s[1..s.len()-1].to_string())
+        // §3.4 字符串转义解码:\n \t \r \\ \" \0
+        let raw = &s[1..s.len()-1];
+        let mut out = String::with_capacity(raw.len());
+        let mut chars = raw.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('r') => out.push('\r'),
+                    Some('0') => out.push('\0'),
+                    Some('\\') => out.push('\\'),
+                    Some('"') => out.push('"'),
+                    Some(other) => { out.push('\\'); out.push(other); }
+                    None => out.push('\\'),
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        Some(out)
     })]
     Str(String),
 

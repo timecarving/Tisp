@@ -102,6 +102,12 @@ No imperative escape hatch. System-level programming = declaring resource constr
 
 All process calculi (π, ρ, ambient, κ, spi, applied π, SKI) are specializations of the Communication effect family. Encoding relations = transformation functions between effect handlers. Verification = an effect handler that explores all paths.
 
+**Calculi over Algebraic Effects**: Calculi (process calculi, logic search, temporal streams, state transitions) are the *abstract core* of the language — users express programs in terms of calculi. Algebraic effects (handle/perform) are the *encoding and verification substrate*: every calculus is expressible as an effect family (Search effect = logic programming, Communication effect = process calculi, Signal effect = FRP), and handlers encode transformations between calculi. Effect handlers are therefore implementation machinery, not the primary abstraction; all high-level constructs decompose into "calculus + effect handler" combinations.
+
+### Principle 8: Strong Static Typing
+
+Tisp is a **strongly statically typed** language: all types are checked at compile time via type inference with polymorphism (`--typecheck`, REPL `:type`), and a program that passes checking is guaranteed free of runtime type errors. Types, effects, grades, modes, determinism, and regions are projections of one unified constraint system solved by fixpoint iteration (Principle 3). Consistent with the Reader Principle, type expressions are first-class runtime-manipulable values — static checking and runtime reflection are two faces of the same type language.
+
 ---
 
 ## 3. Lexical Structure

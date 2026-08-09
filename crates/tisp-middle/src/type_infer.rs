@@ -135,6 +135,91 @@ impl TypeInfer {
             Type::fun(Type::list(Type::Var(TypeVar { name: Symbol::new("a"), kind: Kind::Star, id: 26 })),
                 Type::fun(Type::i64(), Type::Var(TypeVar { name: Symbol::new("a"), kind: Kind::Star, id: 26 })))));
 
+        // ── 列表高阶内置(与解释器 register_builtins 对应)──
+        let tv = |id: u64, name: &str| TypeVar { name: Symbol::new(name), kind: Kind::Star, id };
+        env.insert(Symbol::new("map"), TypeScheme::poly(vec![tv(30, "a"), tv(31, "b")],
+            Type::fun(Type::fun(Type::Var(tv(30, "a")), Type::Var(tv(31, "b"))),
+                Type::fun(Type::list(Type::Var(tv(30, "a"))), Type::list(Type::Var(tv(31, "b")))))));
+        env.insert(Symbol::new("filter"), TypeScheme::poly(vec![tv(32, "a")],
+            Type::fun(Type::fun(Type::Var(tv(32, "a")), Type::bool()),
+                Type::fun(Type::list(Type::Var(tv(32, "a"))), Type::list(Type::Var(tv(32, "a")))))));
+        env.insert(Symbol::new("reduce"), TypeScheme::poly(vec![tv(33, "a"), tv(34, "b")],
+            Type::fun(Type::fun(Type::Var(tv(34, "b")), Type::fun(Type::Var(tv(33, "a")), Type::Var(tv(34, "b")))),
+                Type::fun(Type::Var(tv(34, "b")),
+                    Type::fun(Type::list(Type::Var(tv(33, "a"))), Type::Var(tv(34, "b")))))));
+        env.insert(Symbol::new("foldl"), TypeScheme::poly(vec![tv(35, "a"), tv(36, "b")],
+            Type::fun(Type::fun(Type::Var(tv(36, "b")), Type::fun(Type::Var(tv(35, "a")), Type::Var(tv(36, "b")))),
+                Type::fun(Type::Var(tv(36, "b")),
+                    Type::fun(Type::list(Type::Var(tv(35, "a"))), Type::Var(tv(36, "b")))))));
+        env.insert(Symbol::new("foldr"), TypeScheme::poly(vec![tv(37, "a"), tv(38, "b")],
+            Type::fun(Type::fun(Type::Var(tv(37, "a")), Type::fun(Type::Var(tv(38, "b")), Type::Var(tv(38, "b")))),
+                Type::fun(Type::Var(tv(38, "b")),
+                    Type::fun(Type::list(Type::Var(tv(37, "a"))), Type::Var(tv(38, "b")))))));
+        env.insert(Symbol::new("range"), TypeScheme::mono(
+            Type::fun(Type::i64(), Type::fun(Type::i64(), Type::list(Type::i64())))));
+        env.insert(Symbol::new("take"), TypeScheme::poly(vec![tv(39, "a")],
+            Type::fun(Type::list(Type::Var(tv(39, "a"))), Type::fun(Type::i64(), Type::list(Type::Var(tv(39, "a")))))));
+        env.insert(Symbol::new("drop"), TypeScheme::poly(vec![tv(40, "a")],
+            Type::fun(Type::list(Type::Var(tv(40, "a"))), Type::fun(Type::i64(), Type::list(Type::Var(tv(40, "a")))))));
+        env.insert(Symbol::new("reverse"), TypeScheme::poly(vec![tv(41, "a")],
+            Type::fun(Type::list(Type::Var(tv(41, "a"))), Type::list(Type::Var(tv(41, "a"))))));
+        env.insert(Symbol::new("sort"), TypeScheme::mono(Type::fun(Type::list(Type::i64()), Type::list(Type::i64()))));
+        env.insert(Symbol::new("count"), TypeScheme::poly(vec![tv(42, "a")],
+            Type::fun(Type::list(Type::Var(tv(42, "a"))), Type::i64())));
+        env.insert(Symbol::new("length"), TypeScheme::poly(vec![tv(43, "a")],
+            Type::fun(Type::list(Type::Var(tv(43, "a"))), Type::i64())));
+        env.insert(Symbol::new("zip"), TypeScheme::poly(vec![tv(44, "a"), tv(45, "b")],
+            Type::fun(Type::list(Type::Var(tv(44, "a"))),
+                Type::fun(Type::list(Type::Var(tv(45, "b"))),
+                    Type::list(Type::Tuple(vec![Type::Var(tv(44, "a")), Type::Var(tv(45, "b"))]))))));
+        env.insert(Symbol::new("concat"), TypeScheme::poly(vec![tv(46, "a")],
+            Type::fun(Type::list(Type::Var(tv(46, "a"))), Type::fun(Type::list(Type::Var(tv(46, "a"))), Type::list(Type::Var(tv(46, "a")))))));
+        env.insert(Symbol::new("append"), TypeScheme::poly(vec![tv(64, "a")],
+            Type::fun(Type::list(Type::Var(tv(64, "a"))), Type::fun(Type::list(Type::Var(tv(64, "a"))), Type::list(Type::Var(tv(64, "a")))))));
+        env.insert(Symbol::new("slurp"), TypeScheme::mono(Type::fun(Type::string(), Type::string())));
+        env.insert(Symbol::new("spit"), TypeScheme::mono(Type::fun(Type::string(), Type::fun(Type::string(), Type::unit()))));
+        // 算术补全
+        env.insert(Symbol::new("abs"), TypeScheme::mono(Type::fun(Type::i64(), Type::i64())));
+        env.insert(Symbol::new("sqrt"), TypeScheme::mono(Type::fun(Type::i64(), Type::f64())));
+        env.insert(Symbol::new("pow"), TypeScheme::mono(Type::fun(Type::i64(), Type::fun(Type::i64(), Type::i64()))));
+        // 字符串补全
+        env.insert(Symbol::new("str-sub"), TypeScheme::mono(Type::fun(Type::string(), Type::fun(Type::i64(), Type::string()))));
+        env.insert(Symbol::new("str-split"), TypeScheme::mono(Type::fun(Type::string(), Type::fun(Type::string(), Type::list(Type::string())))));
+        env.insert(Symbol::new("str-join"), TypeScheme::mono(Type::fun(Type::string(), Type::fun(Type::string(), Type::string()))));
+        // 逻辑/反射/效果/FRP/通道(尽力签名,与解释器行为一致)
+        env.insert(Symbol::new("=="), TypeScheme::poly(vec![tv(47, "a")],
+            Type::fun(Type::Var(tv(47, "a")), Type::fun(Type::Var(tv(47, "a")), Type::bool()))));
+        env.insert(Symbol::new("type-of"), TypeScheme::poly(vec![tv(48, "a")],
+            Type::fun(Type::Var(tv(48, "a")), Type::string())));
+        env.insert(Symbol::new("grade-of"), TypeScheme::poly(vec![tv(49, "a")], Type::fun(Type::Var(tv(49, "a")), Type::string())));
+        env.insert(Symbol::new("mode-of"), TypeScheme::poly(vec![tv(50, "a")], Type::fun(Type::Var(tv(50, "a")), Type::string())));
+        env.insert(Symbol::new("effects-of"), TypeScheme::poly(vec![tv(51, "a")], Type::fun(Type::Var(tv(51, "a")), Type::string())));
+        env.insert(Symbol::new("determinism-of"), TypeScheme::poly(vec![tv(52, "a")], Type::fun(Type::Var(tv(52, "a")), Type::string())));
+        env.insert(Symbol::new("get"), TypeScheme::poly(vec![tv(53, "a")], Type::fun(Type::unit(), Type::Var(tv(53, "a")))));
+        env.insert(Symbol::new("put"), TypeScheme::poly(vec![tv(54, "a")], Type::fun(Type::Var(tv(54, "a")), Type::unit())));
+        env.insert(Symbol::new("ask"), TypeScheme::poly(vec![tv(55, "a")], Type::fun(Type::unit(), Type::Var(tv(55, "a")))));
+        env.insert(Symbol::new("tell"), TypeScheme::poly(vec![tv(56, "a")], Type::fun(Type::Var(tv(56, "a")), Type::unit())));
+        env.insert(Symbol::new("throw"), TypeScheme::poly(vec![tv(57, "a")], Type::fun(Type::Var(tv(57, "a")), Type::unit())));
+        env.insert(Symbol::new("choose"), TypeScheme::poly(vec![tv(58, "a")], Type::fun(Type::Var(tv(58, "a")), Type::Var(tv(58, "a")))));
+        env.insert(Symbol::new("chan"), TypeScheme::mono(Type::fun(Type::unit(), Type::string())));
+        env.insert(Symbol::new("send"), TypeScheme::poly(vec![tv(59, "a")], Type::fun(Type::string(), Type::fun(Type::Var(tv(59, "a")), Type::unit()))));
+        env.insert(Symbol::new("recv"), TypeScheme::mono(Type::fun(Type::string(), Type::i64())));
+        env.insert(Symbol::new("stream"), TypeScheme::mono(Type::fun(Type::i64(), Type::Temporal(TemporalOp::Next, Box::new(Type::i64())))));
+        env.insert(Symbol::new("stream-take"), TypeScheme::mono(Type::fun(Type::Temporal(TemporalOp::Next, Box::new(Type::i64())), Type::fun(Type::i64(), Type::list(Type::i64())))));
+        env.insert(Symbol::new("delay"), TypeScheme::poly(vec![tv(60, "a")], Type::fun(Type::Var(tv(60, "a")), Type::Var(tv(60, "a")))));
+        env.insert(Symbol::new("advance"), TypeScheme::poly(vec![tv(61, "a")], Type::fun(Type::Var(tv(61, "a")), Type::Var(tv(61, "a")))));
+        env.insert(Symbol::new("clock"), TypeScheme::mono(Type::fun(Type::unit(), Type::string())));
+        env.insert(Symbol::new("~"), TypeScheme::mono(Type::fun(Type::bool(), Type::bool())));
+        env.insert(Symbol::new("interval-neg"), TypeScheme::mono(Type::fun(Type::bool(), Type::bool())));
+        env.insert(Symbol::new("interval-and"), TypeScheme::mono(Type::fun(Type::bool(), Type::fun(Type::bool(), Type::bool()))));
+        env.insert(Symbol::new("interval-or"), TypeScheme::mono(Type::fun(Type::bool(), Type::fun(Type::bool(), Type::bool()))));
+        env.insert(Symbol::new("fresh"), TypeScheme::mono(Type::fun(Type::unit(), Type::i64())));
+        env.insert(Symbol::new("search"), TypeScheme::poly(vec![tv(62, "a")], Type::fun(Type::Var(tv(62, "a")), Type::bool())));
+        env.insert(Symbol::new("solve-all"), TypeScheme::mono(Type::fun(Type::i64(), Type::list(Type::i64()))));
+        env.insert(Symbol::new("find-all"), TypeScheme::poly(vec![tv(65, "a")],
+            Type::fun(Type::Var(tv(65, "a")), Type::list(Type::list(Type::i64())))));
+        env.insert(Symbol::new("commit!"), TypeScheme::poly(vec![tv(63, "a")], Type::fun(Type::Var(tv(63, "a")), Type::unit())));
+
         env
     }
 
@@ -153,6 +238,21 @@ impl TypeInfer {
         let final_ty = self.apply_subst(&ty);
         let scheme = self.generalize(env, &final_ty);
         env.insert(def.name.clone(), scheme);
+
+        // §19.1:依赖类型注解(def.ty 为 Pi/Sigma)时,把推断的 Fun 提升为依赖类型并统一
+        if let Some(ann) = &def.ty {
+            if matches!(ann, Type::Pi(..) | Type::Sigma(..)) {
+                if let Type::Pi(name, _, _) = ann {
+                    if let Type::Fun(p, _, r) = &final_ty {
+                        let dep = Type::Pi(name.clone(), p.clone(), r.clone());
+                        self.unify(&dep, ann, def.span)?;
+                        return Ok(self.apply_subst(&dep));
+                    }
+                }
+                self.unify(&final_ty, ann, def.span)?;
+                return Ok(self.apply_subst(ann));
+            }
+        }
 
             // After unification, verify refined predicates with Z3/liquid checker
             let _final_ty = self.verify_refinements(&ty)?;
@@ -188,10 +288,23 @@ impl TypeInfer {
 
                 let body_ty = self.infer_expr(&mut local_env, &lambda.body)?;
 
-                // Build function type: p1 -> p2 -> ... -> body_ty
-                let mut result = body_ty;
+                // §19.1:返回类型注解为 Pi/Sigma 时构建依赖类型(单参数)
+                let mut result = body_ty.clone();
+                if let Some(ret) = &lambda.ret_type {
+                    if let Type::Pi(name, _, _) = ret {
+                        if param_types.len() == 1 {
+                            result = Type::Pi(name.clone(), Box::new(param_types[0].clone()), Box::new(body_ty));
+                        }
+                    }
+                }
                 for param_ty in param_types.into_iter().rev() {
                     result = Type::fun(param_ty, result);
+                }
+                // §19.1:Pi/Sigma 注解与推断结果统一(依赖类型检查)
+                if let Some(ret) = &lambda.ret_type {
+                    if matches!(ret, Type::Pi(..) | Type::Sigma(..)) {
+                        self.unify(&result, ret, expr.span)?;
+                    }
                 }
 
                 Ok(result)
@@ -299,7 +412,7 @@ impl TypeInfer {
             }
 
             CoreExprNode::Handle(body, _handler) => {
-                // TODO: proper effect handler typing
+                // §12.2/12.3:handle 处理 body 的效果;类型为 body 类型(效果行消减见 effect_infer)
                 self.infer_expr(env, body)
             }
 
@@ -424,6 +537,15 @@ impl TypeInfer {
                 }
                 Ok(Type::Tuple(types))
             }
+            Pattern::Or(pats) => {
+                // (or p1 p2 ...)(§8.2):各分支类型统一
+                let ty = self.fresh_var();
+                for pat in pats {
+                    let p_ty = self.infer_pattern(env, pat)?;
+                    self.unify(&ty, &p_ty, Span::dummy())?;
+                }
+                Ok(ty)
+            }
         }
     }
 
@@ -490,10 +612,18 @@ impl TypeInfer {
                 Ok(())
             }
             (Type::Tuple(ts1), Type::Tuple(ts2)) if ts1.len() == ts2.len() => {
-                for (t1, t2) in ts1.iter().zip(ts2.iter()) {
-                    self.unify(t1, t2, span)?;
+                for (t1, t2) in ts1.iter().zip(ts2.iter()) {                    self.unify(t1, t2, span)?;
                 }
                 Ok(())
+            }
+            // §19.1:依赖类型统一(结构相等,绑定名忽略)
+            (Type::Pi(_, d1, c1), Type::Pi(_, d2, c2)) => {
+                self.unify(d1, d2, span)?;
+                self.unify(c1, c2, span)
+            }
+            (Type::Sigma(_, d1, c1), Type::Sigma(_, d2, c2)) => {
+                self.unify(d1, d2, span)?;
+                self.unify(c1, c2, span)
             }
             // ── Refined type: unify as base type ──
             (Type::Refined(base, _), other) | (other, Type::Refined(base, _)) => {
@@ -583,6 +713,16 @@ impl TypeInfer {
             Type::Record(fields, rest) => Type::Record(
                 fields.iter().map(|(k, v)| (k.clone(), self.apply_subst(v))).collect(),
                 rest.as_ref().map(|r| Box::new(self.apply_subst(r))),
+            ),
+            Type::Pi(x, t, r) => Type::Pi(
+                x.clone(),
+                Box::new(self.apply_subst(t)),
+                Box::new(self.apply_subst(r)),
+            ),
+            Type::Sigma(x, t, r) => Type::Sigma(
+                x.clone(),
+                Box::new(self.apply_subst(t)),
+                Box::new(self.apply_subst(r)),
             ),
             _ => ty.clone(),
         }

@@ -38,7 +38,11 @@ impl ProcessRuntime {
     }
 
     pub fn recv(&self, chan_name: &Symbol) -> Option<Value> {
-        self.channels.get(chan_name).and_then(|ch| ch.buffer.lock().unwrap().pop())
+        // FIFO:从队首取(§27.2 通道语义)
+        self.channels.get(chan_name).and_then(|ch| {
+            let mut buf = ch.buffer.lock().unwrap();
+            if buf.is_empty() { None } else { Some(buf.remove(0)) }
+        })
     }
 
     pub fn has_channel(&self, name: &Symbol) -> bool {

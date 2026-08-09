@@ -24,6 +24,15 @@ impl<T> SpannedCore<T> {
     }
 }
 
+/// Method combination type for OOP dispatch (§22.3)
+#[derive(Debug, Clone, PartialEq)]
+pub enum MethodCategory {
+    Primary,
+    Around,
+    Before,
+    After,
+}
+
 #[derive(Debug, Clone)]
 pub enum CoreExprNode {
     // ── Base ──
@@ -146,12 +155,16 @@ pub enum CoreExprNode {
     Pi(Symbol, Type, Box<CoreExpr>),
     Sigma(Symbol, Type, Box<CoreExpr>),
 
+    // ── 类型标注与字段访问 ──
+    Ann(Box<Type>, Box<CoreExpr>),
+    FieldGet(Symbol, Box<CoreExpr>),
+
     // ── HoTT extended ──
     FunExt(Box<CoreExpr>),
 
     // ── Generic functions / OOP ──
     GenericDef(Symbol, Vec<Param>, Option<Type>),
-    MethodDef(Symbol, Vec<Pattern>, Box<CoreExpr>),
+    MethodDef(Symbol, MethodCategory, Vec<Pattern>, Box<CoreExpr>),
 
     // ── Typeclasses ──
     ClassDef(Symbol, Vec<Symbol>, Vec<(Symbol, Type)>),
@@ -214,6 +227,8 @@ pub enum Pattern {
     Lit(Literal),
     Con(Symbol, Vec<Pattern>),
     Tuple(Vec<Pattern>),
+    /// 或模式 (or p1 p2 ...)(§8.2):任一子模式匹配即成功
+    Or(Vec<Pattern>),
 }
 
 #[derive(Debug, Clone)]

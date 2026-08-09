@@ -156,6 +156,7 @@ impl ModeAnalyzer {
             Pattern::Lit(_) => false,
             Pattern::Con(_, subpats) => subpats.iter().any(|p| self.pattern_binds(var, p)),
             Pattern::Tuple(pats) => pats.iter().any(|p| self.pattern_binds(var, p)),
+            Pattern::Or(pats) => pats.iter().any(|p| self.pattern_binds(var, p)),
         }
     }
 }

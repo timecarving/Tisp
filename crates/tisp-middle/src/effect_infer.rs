@@ -18,6 +18,25 @@ impl std::fmt::Display for EffectError {
 
 impl std::error::Error for EffectError {}
 
+/// §12.5:从效果行中移除被 handler 处理的效果标签
+fn subtract_effects(row: &EffectRow, handled: &[EffectLabel]) -> EffectRow {
+    match row {
+        EffectRow::Pure => EffectRow::Pure,
+        EffectRow::Closed(labels) => {
+            let remaining: Vec<EffectLabel> = labels.iter()
+                .filter(|l| !handled.contains(l))
+                .cloned()
+                .collect();
+            if remaining.is_empty() {
+                EffectRow::Pure
+            } else {
+                EffectRow::Closed(remaining)
+            }
+        }
+        r => r.clone(),
+    }
+}
+
 pub struct EffectInferrer {
     effect_env: EffectEnv,
 }
@@ -99,12 +118,15 @@ impl EffectInferrer {
                 Ok(combined)
             }
 
-            CoreExprNode::Handle(body, _handler) => {
+            CoreExprNode::Handle(body, handler) => {
                 // Handler handles the effects in body
-                // For now, just return the body's effects minus the handled effect
+                // §12.5 行消减:移除被 handler clauses 处理的操作效果
                 let body_eff = self.infer_expr(body)?;
-                // TODO: properly remove handled effects
-                Ok(body_eff)
+                let handled: Vec<EffectLabel> = handler.clauses.iter()
+                    .map(|c| self.effect_env.lookup_operation(&c.operation)
+                        .unwrap_or_else(|| EffectLabel::Named(c.operation.clone())))
+                    .collect();
+                Ok(subtract_effects(&body_eff, &handled))
             }
 
             CoreExprNode::Perform(op_name, args) => {

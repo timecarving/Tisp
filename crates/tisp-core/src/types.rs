@@ -17,6 +17,10 @@ pub enum Type {
     Temporal(TemporalOp, Box<Type>),
     Cohesive(CohesiveOp, Box<Type>),
     Meta(Box<MetaType>),
+    /// 依赖函数类型 Π(x : T). R(§19.1)
+    Pi(Symbol, Box<Type>, Box<Type>),
+    /// 依赖对类型 Σ(x : T). R(§19.1)
+    Sigma(Symbol, Box<Type>, Box<Type>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -330,6 +334,8 @@ impl std::fmt::Display for Type {
             }
             Type::Path(a, x, y) => write!(f, "Path({}, {:?}, {:?})", a, x, y),
             Type::Interval => write!(f, "I"),
+            Type::Pi(name, dom, cod) => write!(f, "Π({} : {}). {}", name, dom, cod),
+            Type::Sigma(name, dom, cod) => write!(f, "Σ({} : {}). {}", name, dom, cod),
             _ => write!(f, "{:?}", self),
         }
     }

@@ -75,7 +75,8 @@ CLI flags:`--eval` `--print-ast` `--print-tokens` `--desugar` `--typecheck` `--r
 
 | 文档 | 说明 |
 |------|------|
-| [standard_doc/INDEX.md](./standard_doc/INDEX.md) | 语言标准文档(词法/核心语言/高级特性/参考) |
+| [standard_doc/INDEX.md](./standard_doc/INDEX.md) | 语言标准文档(词法/核心语言/高级特性/参考/实现状态) |
+| [standard_doc/04-implementation-status.md](./standard_doc/04-implementation-status.md) | spec 30 章实现状态与未实现特性清单 |
 | [CHANGELOG.md](./CHANGELOG.md) | 变更记录(0.1.0 变更声明 + 已知局限) |
 | [docs/spec.md](./docs/spec.md) | 原始设计规范(设计目标与语法定义,部分特性仍处设计阶段) |
 

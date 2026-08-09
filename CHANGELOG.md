@@ -47,6 +47,27 @@
 **测试**
 - 新增约 35 个单元测试,总计 105 个(效果处理器/通道/流/加密/CLP/泛型分发/IR/回溯/合并)
 
+**后续补齐批次(同一 0.1.0)**
+- §12.2 效果续延 k:clause 多 body 保留(此前只取第一个表达式)
+- §21.5 CLP 真实传播(`constrain` 编译为 add_lt/add_eq,常数提升 singleton)+ `solve-all` 多解枚举;`search` 内置真实化(1 参 thunk 回溯边界)
+- §21 find-all 多解收集(Search/Match 收集模式 + 逻辑变量快照,val_to_logic 识别变量 id)+ §21.6 abduce 返回假设列表
+- §22.3 泛型方法组合:`:around/:before/:after/:primary` 修饰符 + `call-next-method`
+- §13/§14 defpred 确定性注解(:det/:nondet/:cc_multi/:cc_nondet 等)写入 CoreDef
+- §19.1 Π/Σ 依赖类型:`(pi (x : T) R)`/`(sigma ...)` 语法、Pi/Sigma 显示与 unify/替换支持、`->` 返回类型注解修复(Sym 形式)、旧类型名别名(Int→i64 等)
+- §20.1 defsession 会话协议解析为 SessionType(Send/Recv/Choice/Offer/End)
+- §29 内置补全:append/slurp/spit + §4 list/vector/hash-map/hash-set 构造器
+- §8.2 or-pattern(Pattern::Or 全链路)、guard 双形式(`(when pat g)` + `pat :when g`,Match 求值检查 guard)、refined 模式 `{x : T | pred}`(parser Map 的 `:`/`|` 语法)
+- §3 词法:块注释 `#| ... |#`、字符串转义解码(\n \t \r \0 \\ \")
+- §5.9 `(ann expr Type)` 类型标注节点;§7.2 记录字段访问 `(:field obj)`(字段名表)与 `{name : T}` 记录字段语法
+- §24.1 语法引号:quote/syntax-quote 函数形式 + 'x/`x,~x 求值插入、~@xs concat 拼接(符号→字符串);concat/append 可变参
+- §27 进程演算:Async 通道(FIFO 修复)、ambient-new/enter/exit/open、ρ quote/drop/lift、κ bind/unbind/react、spi commit!/check!(加密摘要验证)、SKI 组合子(S/K/I 部分应用链)
+- §25 模块系统:ns (:require [lib])/(:require [lib :as a])/(:refer [f]) 解析、跨文件加载(base_dir + 防循环)
+- §26 FFI:defextern 注册外部函数(模拟 C 表 abs/strlen/sqrt);§30 编译指示 inline!/specialize!/opt-level 接受
+- §28 验证:defprop 属性声明 + verify 内置((verify name)/(verify thunk));CryptoVerify 改 verify!
+- §23 类型类:defclass 方法分发器(隐式字典按参数类型查 instance_dict)、definstance 方法参数绑定、构造器→ADT 映射
+- §12.5 效果行消减(Handle 移除被处理效果);§12.6 monadic 优化检测接入 cli
+- §18 时序模态类型:(next T)/(always T)/(eventually T) 语法与推断
+
 ### 修复
 
 - `range`/`zip`/`concat` 双重反转导致的倒序输出
@@ -63,6 +84,8 @@
 ### 文档
 
 - 重写 `standard_doc/`(INDEX + 01 语言核心 + 02 高级特性 + 03 参考),全部示例实测验证
+- 新增 `standard_doc/04-implementation-status.md`:spec 30 章逐章实现状态与未实现特性清单(12 项仅设计 + 31 项部分实现,含 file:line 证据)
+- 显式化核心设计思想:演算 > 代数效应(演算是抽象核心,effect handler 是编码/验证载体)、强静态类型(编译期检查/推断/多态/无运行时类型错误)——standard_doc 新增「核心设计思想」章节,spec.md 补充 Principle 7 扩展与 Principle 8
 - 本变更记录
 
 ### 已知局限

@@ -126,10 +126,10 @@ nil           ; Unit(也写作 `Unit`)
 ### 3.7 宏展开(§24)
 
 ```clojure
-(defmacro unless [cond then]
-  (if cond nil then))
+(defmacro double [x]
+  (* 2 x))
 
-(unless false 42)          ; => 42
+(double 21)                  ; => 42
 ```
 
 ---
@@ -221,11 +221,14 @@ nil           ; Unit(也写作 `Unit`)
 
 ## 6. 类型系统基础
 
+Tisp 是**强静态类型**语言:所有类型在编译期检查(类型推断 + 多态),通过检查的程序保证**无运行时类型错误**;类型本身是运行时一等公民(Reader Principle)。
+
 内置类型：`i8/i16/i32/i64/u8/u16/u32/u64/f32/f64/bool/String/Unit`。
 
 - 函数类型：`(a -> b)`、效果行 `(a ->[{IO}] b)`(§12.4)
-- 多态：类型参数经 defdata 声明，如 `(List a)`
-- 类型推断：`cargo run -- --typecheck <file>` 运行；对 ADT/函数/模式匹配推断
+- 多态：类型参数经 defdata 声明，如 `(List a)`；推断自动泛化(rank-n 保留 `forall`)
+- 类型推断：`cargo run -- --typecheck <file>` 检查整个文件；**REPL 中每行表达式自动显示推断类型**,`(:type EXPR)` 只查类型不求值
 - 等级(§QTT)：`Grade::Zero/One/Omega`，`grade_check` 校验线性资源
+- 六维注解：类型/效果/等级/模式/确定性/区域由统一约束系统求解(见 docs/spec.md §9)
 
 > 注：类型推断(`type_infer`)覆盖核心语言；部分高级节点(如 effect perform)的类型规则仍在完善中。
