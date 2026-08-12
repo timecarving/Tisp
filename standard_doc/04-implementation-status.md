@@ -17,7 +17,7 @@
 | 6 | Definitions | ⚠️ | def/defn/defpred/defmacro/defgeneric 等全有;私有语义、六维注解语法未解析 |
 | 7 | ADT | ⚠️ | defdata/记录/字段访问/GADT 可用;deriving (Eq/Show) 生成 eq-/show- 函数(结构递归);Ord 生成缺 |
 | 8 | Pattern Matching | ⚠️ | match/cons/通配符/穷尽性检查/or-pattern/guard 双形式/refined 模式齐; |
-| 9 | Type System Overview | ⚠️ | HM 推断+泛化+rank-n+行多态有;类型族(§9 声明/归约/悬挂报错)、类型反射(reflect-type)已实现;Value::Type 一等值、五维子类型缺 |
+| 9 | Type System Overview | ⚠️ | HM 推断+泛化+rank-n+行多态有;前向引用/相互递归/let 递归/零参 lambda(Unit -> T)类型正确;类型族(§9 声明/归约/悬挂报错)、类型反射(reflect-type)已实现;Value::Type 一等值、五维子类型缺 |
 | 10 | QTT | ✅ | Grade 0/1/ω + 依赖等级(数字/符号/复合表达式,上界检查,等级变量绑定);运行时 0 级擦除 + 1 级移动检查;符号等级 Z3 验证未做 |
 | 11 | Graded Modal Types | ⚠️ | `defresource-algebra` 真实解析(名称/单位元/运算/阶,`--desugar` 可见);□_r/◇_ε 无推理 |
 | 12 | Effect System | ✅ | defeffect/handle/perform/续延 k 语义(多 body+状态写回)齐;§12.5 行消减;§12.6 单处理器 handle 走直接状态传递(计数输出) |
@@ -81,7 +81,12 @@
 | 16 | ALP 多解解释 | §21.6 | 一致性验证已实现;多解解释枚举缺 |
 | 17 | 演算互编码完整 | §27.10 | π→SKI、ambient→消息已实现;观察等价验证缺 |
 
-## 3. 状态说明
+## 3. 已知运行时局限
+
+- **多顶层表达式 + 递归卡死**:含多个顶层表达式(如两个 `(println ...)`)的程序中,若顶层表达式调用递归函数(如 fib),`--run` 可能栈溢出;单顶层表达式正常。根因待查(Do 包装的 `__top__` 执行路径),非本次类型检查修复范围
+- **深递归栈溢出**:`(sum-to 100)` 等深度递归在默认栈下溢出(解释器自递归求值,无 TCO)
+
+## 4. 状态说明
 
 - 本清单随实现进度更新(见 [CHANGELOG.md](../CHANGELOG.md))
 - 优先级建议:§12 续延 k、§21 多解搜索、§22 方法组合是「演算 > 代数效应」核心思想的直接载体,建议优先

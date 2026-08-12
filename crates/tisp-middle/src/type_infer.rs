@@ -219,6 +219,13 @@ impl TypeInfer {
             }
         }
 
+        // 第一遍:全部 defs 插入 fresh 占位(§前向引用与相互递归支持)
+        for def in &program.defs {
+            let fresh_ty = self.fresh_var();
+            env.insert(def.name.clone(), TypeScheme::mono(fresh_ty));
+        }
+
+        // 第二遍:逐 def 推断(占位与推断结果 unify)
         for def in &program.defs {
             let ty = self.infer_def(&mut env, def)?;
             results.push((def.name.clone(), ty));
@@ -377,17 +384,23 @@ impl TypeInfer {
     }
 
     fn infer_def(&mut self, env: &mut TypeEnv, def: &CoreDef) -> Result<Type, TypeError> {
-        // For recursive definitions, add a fresh type variable to the environment first
-        let fresh_ty = self.fresh_var();
-        let scheme = TypeScheme::mono(fresh_ty.clone());
-        env.insert(def.name.clone(), scheme);
+        // 占位类型已由 infer_program 第一遍插入(前向引用/相互递归);兜底补插
+        let placeholder = match env.lookup(&def.name) {
+            Some(TypeScheme::Mono(ty)) => ty.clone(),
+            Some(TypeScheme::Poly(_, ty)) => ty.clone(),
+            None => {
+                let fresh_ty = self.fresh_var();
+                env.insert(def.name.clone(), TypeScheme::mono(fresh_ty.clone()));
+                fresh_ty
+            }
+        };
 
         // §9 类型族归约:重建函数体(参数类型/标注中的类型族应用归约)
         let body = self.reduce_body_families(&def.body)?;
         let ty = self.infer_expr(env, &body)?;
 
-        // Unify the inferred type with the fresh variable
-        self.unify(&fresh_ty, &ty, def.span)?;
+        // Unify the inferred type with the placeholder
+        self.unify(&placeholder, &ty, def.span)?;
 
         // Generalize and update the environment
         let final_ty = self.apply_subst(&ty);
@@ -458,6 +471,10 @@ impl TypeInfer {
                         }
                     }
                 }
+                // §零参 lambda:(fn [] body) → Unit -> body(与解释器零参闭包语义一致)
+                if param_types.is_empty() {
+                    result = Type::fun(Type::unit(), result);
+                }
                 for param_ty in param_types.into_iter().rev() {
                     result = Type::fun(param_ty, result);
                 }
@@ -486,14 +503,20 @@ impl TypeInfer {
             }
 
             CoreExprNode::Let(name, ty_ann, value, body) => {
-                let value_ty = self.infer_expr(env, value)?;
+                // §let 内递归:value 推断前先绑定 fresh 占位((let [f (fn ... (f ...))] ...))
+                let mut local_env = env.clone();
+                let placeholder = self.fresh_var();
+                local_env.insert(name.clone(), TypeScheme::mono(placeholder.clone()));
+
+                let value_ty = self.infer_expr(&mut local_env, value)?;
+                self.unify(&placeholder, &value_ty, expr.span)?;
 
                 if let Some(ann) = ty_ann {
                     self.unify(&value_ty, ann, expr.span)?;
                 }
 
-                let scheme = self.generalize(env, &value_ty);
-                let mut local_env = env.clone();
+                let final_ty = self.apply_subst(&value_ty);
+                let scheme = self.generalize(&local_env, &final_ty);
                 local_env.insert(name.clone(), scheme);
 
                 self.infer_expr(&mut local_env, body)

@@ -27,13 +27,13 @@
 
 ## 5. git 卫生
 
-- [ ] 5.1 `.gitignore` 追加 `target.tar`/`target.tar.zst`
-- [ ] 5.2 `git add -A`:三轮变更文件 + openspec/ + 新示例入库
-- [ ] 5.3 `git status` 验证:仅剩有意保留项(.agents/、.zcode/ 按现状);`git ls-files` 抽查关键新文件已追踪
-- [ ] 5.4 不自动 commit(提交由用户决定)
+- [x] 5.1 `.gitignore` 追加 `target.tar`/`target.tar.zst`
+- [x] 5.2 `git add -A`:三轮变更文件 + openspec/ + 新示例入库
+- [x] 5.3 `git status` 验证:仅剩有意保留项(.agents/、.zcode/ 按现状);`git ls-files` 抽查关键新文件已追踪
+- [x] 5.4 不自动 commit(提交由用户决定)
 
 ## 6. 最终验证
 
-- [ ] 6.1 `cargo test --workspace` 全绿、`cargo check --workspace` 零警告(文档变更不破坏构建)
-- [ ] 6.2 文档交叉核对:README/04/INDEX 的数字与链接一致;CHANGELOG 条目数与重排前一致
-- [ ] 6.3 最终 `git status` 快照确认
+- [x] 6.1 `cargo test --workspace` 全绿、`cargo check --workspace` 零警告(文档变更不破坏构建)
+- [x] 6.2 文档交叉核对:README/04/INDEX 的数字与链接一致;CHANGELOG 条目数与重排前一致
+- [x] 6.3 最终 `git status` 快照确认

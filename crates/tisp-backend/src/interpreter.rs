@@ -78,6 +78,13 @@ pub struct Interpreter {
 
     /// §12.6 单处理器 handle 优化计数(monadic 状态传递路径)
     pub monadic_handles: usize,
+
+    /// 调用深度(诊断)
+    pub call_depth: usize,
+    pub max_call_depth: usize,
+
+    /// eval 计数(诊断)
+    pub eval_count: u64,
 }
 
 /// 活跃的 effect handler(Handle 求值时入栈,退出时出栈)
@@ -187,7 +194,10 @@ impl Interpreter {
                gensym_counter: std::sync::atomic::AtomicU64::new(0),
                #[cfg(feature = "ffi")]
                extern_libs: Vec::new(),
-               monadic_handles: 0 }
+               monadic_handles: 0,
+               call_depth: 0,
+               eval_count: 0,
+               max_call_depth: 0 }
     }
 
     /// §26 真实 dlopen:经 libloading 解析符号并构造可调用内置(i64 → i64 C ABI)
@@ -335,7 +345,10 @@ impl Interpreter {
             }),
             bi("<", |_s, args| { let (a, b) = expect_two_ints(args)?; Ok(Value::Bool(a < b)) }),
             bi(">", |_s, args| { let (a, b) = expect_two_ints(args)?; Ok(Value::Bool(a > b)) }),
-            bi("<=", |_s, args| { let (a, b) = expect_two_ints(args)?; Ok(Value::Bool(a <= b)) }),
+            bi("<=", |_s, args| {
+                let (a, b) = expect_two_ints(args)?;
+                Ok(Value::Bool(a <= b))
+            }),
             bi(">=", |_s, args| { let (a, b) = expect_two_ints(args)?; Ok(Value::Bool(a >= b)) }),
             bi("=", |_s, args| {
                 if args.len() != 2 { return Err(EvalError { message: "= needs 2 args".into() }); }
@@ -1048,6 +1061,8 @@ impl Interpreter {
     }
 
     pub fn eval_expr(&mut self, expr: &CoreExpr) -> Result<Value, EvalError> {
+        if expr.span.start >= 60 && expr.span.start <= 75 {
+        }
         match &expr.node {
             CoreExprNode::Lit(lit) => Ok(eval_literal(lit)),
             CoreExprNode::Var(name) => {
@@ -1955,6 +1970,10 @@ impl Interpreter {
     }
 
     fn apply(&mut self, func: Value, args: &[Value]) -> Result<Value, EvalError> {
+        self.apply_inner(func, args)
+    }
+
+    fn apply_inner(&mut self, func: Value, args: &[Value]) -> Result<Value, EvalError> {
         match &func {
             Value::Builtin(name, f) => {
                 let name = name.clone();
@@ -3746,6 +3765,78 @@ mod ski_tests {
         }).unwrap().join().unwrap();
         assert_eq!(as_int(r2), 42, "Nat 等级参数应正常求值");
     }
+
+    #[test]
+    fn test_forward_reference_typecheck() {
+        // 前向引用:使用在前、定义在后 → typecheck 通过
+        let src = "(defn main [] (foo 1))\n(defn foo [x] (+ x 1))";
+        let prog = desugar(src);
+        let mut ti = tisp_middle::type_infer::TypeInfer::new();
+        assert!(ti.infer_program(&prog).is_ok(), "前向引用应通过类型检查");
+        let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert_eq!(as_int(r), 2, "run 应输出 2");
+    }
+
+    #[test]
+    fn test_mutual_recursion_typecheck() {
+        // 相互递归:is-even/is-odd 互调 → 通过
+        let src = "(defn is-even [n] (if (= n 0) true (is-odd (- n 1))))\n(defn is-odd [n] (if (= n 0) false (is-even (- n 1))))\n(defn main [] (is-even 10))";
+        let prog = desugar(src);
+        let mut ti = tisp_middle::type_infer::TypeInfer::new();
+        assert!(ti.infer_program(&prog).is_ok(), "相互递归应通过类型检查");
+        let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert!(matches!(r, Value::Bool(true)), "is-even 10 应为 true");
+    }
+
+    #[test]
+    fn test_let_recursion_typecheck() {
+        // let 内递归:局部 fact → 通过,run 输出 120
+        let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (let [fact (fn [n] (if (= n 0) 1 (* n (fact (- n 1)))))] (fact 5)))";
+            let prog = desugar(src);
+            let mut ti = tisp_middle::type_infer::TypeInfer::new();
+            assert!(ti.infer_program(&prog).is_ok(), "let 内递归应通过类型检查");
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert_eq!(as_int(r), 120, "fact 5 应为 120");
+    }
+
+    #[test]
+    fn test_recursive_closure_finite_and_infinite() {
+        // 有限类型递归返回闭包:通过 + run 3
+        let ok_src = "(defn make-adder-n [n] (if (= n 0) (fn [x] x) (fn [x] ((make-adder-n (- n 1)) (+ x 1)))))\n(defn main [] ((make-adder-n 3) 0))";
+        let prog = desugar(ok_src);
+        let mut ti = tisp_middle::type_infer::TypeInfer::new();
+        assert!(ti.infer_program(&prog).is_ok(), "有限递归闭包应通过");
+        let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert_eq!(as_int(r), 3);
+
+        // 无限类型(T = Unit -> T)拒绝(occurs check 正确行为)
+        let bad_src = "(defn make-countdown [n] (if (= n 0) (fn [] 0) (fn [] (make-countdown (- n 1)))))\n(defn main [] 1)";
+        let prog_bad = desugar(bad_src);
+        let mut ti2 = tisp_middle::type_infer::TypeInfer::new();
+        assert!(ti2.infer_program(&prog_bad).is_err(), "无限类型应被拒绝");
+    }
+
+    #[test]
+    fn test_real_type_error_still_rejected() {
+        // 负例:真实类型错误(i64 当函数)仍被拒绝(修复不引入误放行)
+        let src = "(defn main [] (1 2))";
+        let prog = desugar(src);
+        let mut ti = tisp_middle::type_infer::TypeInfer::new();
+        assert!(ti.infer_program(&prog).is_err(), "真实类型错误应被拒绝");
+    }
+
 
     #[test]
     fn test_zero_grade_param_not_evaluated() {

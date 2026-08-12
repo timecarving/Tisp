@@ -1,7 +1,7 @@
 ;; Fibonacci with graded types
-;; f uses @2 (twice per call), n uses @1 (linear)
+;; f uses @2 (twice per call), n uses @3 (if 条件 1 次 + 两个递归实参 2 次)
 
-(defn fib [{2 n : Int}] -> Int
+(defn fib [{3 n : Int}] -> Int
   (if (<= n 1)
     n
     (+ (fib (- n 1)) (fib (- n 2)))))
