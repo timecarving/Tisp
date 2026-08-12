@@ -38,7 +38,10 @@
 | `->string` | 值转字符串 |
 | `i64->f64` | 整数转浮点 |
 | `type-of` | 运行时类型名(i64/bool/...) |
-| `grade-of` `mode-of` `effects-of` `determinism-of` | 静态注解查询(占位) |
+| `reflect-type` | 定义签名反射(类型/效果/参数等级) |
+| `grade-of` | 查询定义参数等级列表(如 [Nat(3)]) |
+| `mode-of` `effects-of` `determinism-of` | 静态注解查询 |
+| `gensym` | 每次调用生成唯一符号(宏卫生) |
 
 ### 1.4 IO
 
@@ -116,9 +119,20 @@
 | `==` | 逻辑 unify |
 | `search` | 回溯边界(执行零参 thunk,失败返回 false 并恢复 trail) |
 | `solve-all` | 枚举 CLP 变量域中的全部解(升序去重) |
+| `find-all` | 收集 thunk 中 Search/Match 的全部解(逻辑变量绑定) |
+| `abduce` | 溯因:返回与目标一致的假设集(一致性验证) |
 | `commit!` | cut |
 
-### 1.11 部分应用(柯里化)
+### 1.11 验证与元(§28)
+
+| 函数 | 说明 |
+|------|------|
+| `verify` | 验证属性(defprop 名或 thunk,返回布尔) |
+| `find-attack` | 攻击场景搜索(机密泄露判定,深度受限) |
+| `check-equivalence` | 比较两个列表状态集(可达集等价) |
+| `verify!` | 加密验证(摘要校验) |
+
+### 1.12 部分应用(柯里化)
 
 多参内置可用单参调用获得部分应用：
 
@@ -156,13 +170,15 @@ tisp --ir examples/run-test.tisp    # 生成 IR
 tisp                                # 进入 REPL
 ```
 
+`--typecheck` 输出(按序):类型、效果、monadic 优化候选、等级检查、洞报告、确定性、模式、区域、特化数、优化统计、液态验证统计(verified/violated/warned)与违反明细、`type checking passed`。违反(液态/等级)时退出码非零。
+
 ---
 
 ## 3. 类型系统附录
 
 - 基本类型:`i8..i64/u8..u64/f32/f64/bool/String/Unit`
 - 复合类型:`(Fun a b)`、`(App t1 t2)`、`(Tuple ...)`、`(Record ...)`
-- 高级类型:`Refined`(液态)、`Path`(HoTT)、`Interval`、`Session`、`Modal`、`Temporal`、`Cohesive`、`Meta`
+- 高级类型:`Refined`(液态,`{x : T | pred}`)、`Path`(HoTT)、`Interval`、`Session`、`Modal`、`Temporal`、`Cohesive`、`Meta`
 - 效果行:`Pure` / `Closed([EffectLabel])` / `Open(vec, Box<row>)`
 - 等级:`Zero/One/Omega`;模式:`In/Free`;确定性:`Det/NonDet`
 
@@ -198,7 +214,10 @@ tisp                                # 进入 REPL
 | `logic-test.tisp` | `OK` | 逻辑编程(fresh/==/search) |
 | `frp-counter.tisp` | 定义型(无入口) | FRP 流(:::/⃝/advance) |
 | `logic-search.tisp` | 部分支持 | Search effect + Mercury 自由变量 |
-| `liquid-types-test.tisp` | 定义型(无入口) | 液态类型 |
+| `liquid-types-test.tisp` | 验证通过(8 verified) | 液态类型(精化/契约,需 z3) |
+| `liquid-types-violations.tisp` | 预期报错(退出码非零) | 液态类型负面用例(违反/反例) |
+| `remaining-gaps-demo.tisp` | 综合演示 | 类型族/多模式/cc/反射/特化/宏卫生 |
+| `dependent-linear-test.tisp` | 验证通过 | 依赖线性类型(等级表达式) |
 | `phase5-test.tisp` | 定义型(无入口) | 洞/确定性 |
 | `_qtt-test.tisp` | 定义型(无入口) | QTT |
 
@@ -209,7 +228,7 @@ tisp                                # 进入 REPL
 ## 6. 测试
 
 ```bash
-cargo test --workspace   # 105 个测试(0.1.0)
+cargo test --workspace   # 177 个测试
 ```
 
 覆盖:词法/解析、脱糖、效果处理器、通道/流/加密、CLP、泛型分发、IR 生成、逻辑回溯。

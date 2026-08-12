@@ -114,3 +114,52 @@ impl ModelChecker {
         VerificationResult { property_holds: false, trace: vec![], depth: self.max_depth }
     }
 }
+
+impl ModelChecker {
+    /// §28 find-attack:在状态空间内搜索攻击(目标状态可到达)。
+    /// 攻击模型由调用方定义:状态含攻击者知识,transitions 含拦截/转发;
+    /// 目标 = 机密进入攻击者知识。
+    pub fn find_attack<T: Clone + Eq + std::hash::Hash + std::fmt::Debug>(
+        &self,
+        initial: T,
+        attack_target: impl Fn(&T) -> bool,
+        transitions: impl Fn(&T) -> Vec<T>,
+    ) -> VerificationResult {
+        self.check_reachability(initial, attack_target, transitions)
+    }
+
+    /// §28 check-equivalence:比较两个状态系统的可达状态集(观察等价近似)
+    pub fn check_equivalence<T: Clone + Eq + std::hash::Hash + std::fmt::Debug>(
+        &self,
+        init_a: T,
+        transitions_a: impl Fn(&T) -> Vec<T>,
+        init_b: T,
+        transitions_b: impl Fn(&T) -> Vec<T>,
+    ) -> bool {
+        let sa = self.reachable_states(init_a, transitions_a);
+        let sb = self.reachable_states(init_b, transitions_b);
+        sa == sb
+    }
+
+    /// 收集可达状态集(BFS,深度受限)
+    pub fn reachable_states<T: Clone + Eq + std::hash::Hash + std::fmt::Debug>(
+        &self,
+        initial: T,
+        transitions: impl Fn(&T) -> Vec<T>,
+    ) -> std::collections::HashSet<String> {
+        let mut visited = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back((initial.clone(), 0));
+        visited.insert(format!("{:?}", initial));
+        while let Some((state, depth)) = queue.pop_front() {
+            if depth >= self.max_depth { continue; }
+            for next in transitions(&state) {
+                let key = format!("{:?}", next);
+                if visited.insert(key.clone()) {
+                    queue.push_back((next, depth + 1));
+                }
+            }
+        }
+        visited
+    }
+}

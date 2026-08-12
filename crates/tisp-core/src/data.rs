@@ -10,6 +10,8 @@ pub struct DataDecl {
     pub constructors: Vec<Constructor>,
     pub deriving: Vec<Symbol>,
     pub is_hit: bool,
+    /// HIT 路径构造器边界声明(§7.4/16.3):显示文本,如 "= loop base"
+    pub boundary: Option<String>,
     pub span: Span,
 }
 

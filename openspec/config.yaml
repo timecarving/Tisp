@@ -1,0 +1,46 @@
+schema: spec-driven
+
+# Project context (optional)
+# This is shown to AI when creating artifacts.
+# Add your tech stack, conventions, style guides, domain knowledge, etc.
+# Example:
+#   context: |
+#     Tech stack: TypeScript, React, Node.js
+#     We use conventional commits
+#     Domain: e-commerce platform
+context: |
+  Tisp 0.1.0 — 静态类型、纯声明式、系统级 Lisp 方言。Rust 2021 workspace,6 个 crate:
+  tisp-core(类型/AST/效果/等级/模式/区域/数据)、tisp-frontend(lexer/parser/reader/desugar+宏)、
+  tisp-middle(类型/效果/等级/模式/确定性/区域推断、液态类型、优化)、
+  tisp-backend(解释器、LLVM IR 生成)、tisp-runtime(逻辑/CLP/并发/FRP/进程/HoTT)、tisp-cli(CLI+REPL)。
+  技术栈:logos 0.14、im 15、miette 7 + ariadne 0.4、thiserror 2、clap 4、rustyline 14、
+  petgraph 0.6、inkwell 0.5(llvm17-0)+ llvm-sys 170(force-dynamic)、z3 0.12;LLVM_SYS_170_PREFIX=/usr/lib/llvm-17。
+  约定:注释用简体中文;单元测试内联 #[cfg(test)] 于各 crate 源文件;cargo test --workspace 保持全绿、
+  cargo check --workspace 零警告;git 提交用 `feat: 中文描述`;LLVM/Z3 代码用 feature 门控,勿破坏默认构建;
+  实现状态符号 ✅ 完全 / ⚠️ 部分 / ⬜ 设计;文档:docs/spec.md(30 章设计规范)、standard_doc/(语言标准)、
+  CHANGELOG.md(Keep a Changelog);完整档案见 openspec/project.md。
+  语言特性:ADT/GADT、模式匹配、效果系统(handle/perform)、逻辑编程(defpred/CLP)、宏(defmacro)、
+  OOP(defgeneric/defmethod)、FRP 流、进程演算通道与加密、QTT 等级、HoTT、时序类型、模块(ns)、FFI(defextern)、验证(defprop/verify)。
+  CLI flags:--eval --print-ast --print-tokens --desugar --typecheck --run --verify --ir --compile;REPL 表达式行先类型检查再求值。
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing

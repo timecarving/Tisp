@@ -1,0 +1,19 @@
+;; 液态类型违反用例(负面测试)—— 每个用例的 `--typecheck` 预期报错并给出反例
+;; 运行:`tisp --typecheck liquid-types-violations.tisp` 应失败(退出码非零)
+;; 注意:全部用例放在一个文件里时,验证器会报告所有违反;逐段取消注释可单独验证
+
+;; 违反 1:调用违反参数精化 —— (sqrt -1):x 不满足 (>= n 0),反例 x = -1
+(defn sqrt [x : {n : i64 | (>= n 0)}] -> i64 x)
+(defn bad-call [] (sqrt -1))
+
+;; 违反 2:返回精化违反 —— body 直接返回参数 x,可负;反例 x = -1
+(defn bad-ret [x] -> {n : i64 | (>= n 0)} x)
+(defn bad-ret-call [] (bad-ret 5))
+
+;; 违反 3:调用违反 requires —— (divide 1 0):d = 0 不满足 (!= d 0),反例 d = 0
+(defn divide [n d] :requires (!= d 0) (+ n d))
+(defn bad-divide-call [] (divide 1 0))
+
+;; 违反 4:ensures 违反 —— 无 requires 时 (+ x y) 不保证 > 0,反例 x = -1, y = -1
+(defn bad-ensures [x y] :ensures (> result 0) (+ x y))
+(defn bad-ensures-call [] (bad-ensures 1 2))

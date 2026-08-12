@@ -1,0 +1,30 @@
+;; 剩余缺口补齐综合演示(类型族/多模式/cc/反射/资源代数)
+;; 运行:tisp --typecheck remaining-gaps-demo.tisp(需 z3)
+
+;; §9 类型族:声明 + 归约
+(typefamily Elem (List a) a)
+
+;; §13 多模式谓词:(i o) 与 (o i)
+(defpred swap [x y] :mode (i o) :mode (o i) :det ([x] y))
+
+;; §14.3 committed-choice:cc 谓词提交首解
+(defpred pick [x] :cc_multi ([x] (= x 1)) ([x] (= x 2)))
+
+;; §11.1 资源代数
+(defresource-algebra Cost 0 + <=)
+
+;; §9 反射:返回定义签名(类型/效果/参数)
+(defn f [x : {n : i64 | (>= n 0)}] -> i64 x)
+
+;; §22.4 泛型特化
+(defgeneric describe [x])
+(defmethod describe [5] "five")
+(defmethod describe [9] "nine")
+
+;; §24 宏卫生:模板 let 绑定不被捕获
+(defmacro add1 [x] (let [y (+ x 1)] y))
+
+(defn main []
+  (println (reflect-type f))
+  (println (describe 5))
+  (println (add1 10)))

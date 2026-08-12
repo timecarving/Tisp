@@ -29,6 +29,8 @@ pub fn grade_add(a: &Grade, b: &Grade) -> Grade {
         (Grade::Zero, r) | (r, Grade::Zero) => r.clone(),
         (Grade::Omega, _) | (_, Grade::Omega) => Grade::Omega,
         (Grade::Nat(m), Grade::Nat(n)) => Grade::Nat(m + n),
+        (Grade::Nat(m), Grade::One) => Grade::Nat(m + 1),
+        (Grade::One, Grade::Nat(n)) => Grade::Nat(n + 1),
         (Grade::One, Grade::One) => Grade::Nat(2),
         _ => Grade::Add(Box::new(a.clone()), Box::new(b.clone())),
     }

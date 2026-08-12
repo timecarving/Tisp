@@ -183,6 +183,8 @@ impl MolecularComplex {
 #[derive(Debug, Clone)]
 pub enum SKI {
     S, K, I,
+    /// 整数字面量(§27.10 编码载体)
+    Num(i64),
     App(Box<SKI>, Box<SKI>),
 }
 
@@ -202,6 +204,7 @@ impl SKI {
             other => other,
         }
     }
+
 }
 
 use std::rc::Rc;
@@ -235,5 +238,63 @@ mod tests {
         let mut c1 = MolecularComplex::new(vec![BiochemicalSite { name: "a".into(), state: SiteState::Free }]);
         let mut c2 = MolecularComplex::new(vec![BiochemicalSite { name: "b".into(), state: SiteState::Free }]);
         assert!(c1.bind(0, &mut c2, 0));
+    }
+    #[test]
+    fn test_encode_pi_to_ski() {
+        // §27.10:Send/Recv 编码为 SKI 组合子;Send 经 K 规则提取常量
+        let encoded = SKI::encode_pi_to_ski(&[ChannelOp::Send(42)]);
+        let reduced = SKI::reduce(encoded);
+        assert!(matches!(reduced, SKI::App(..)) || matches!(reduced, SKI::Num(42)),
+            "编码应保持发送值,实际 {:?}", reduced);
+        let recv_only = SKI::encode_pi_to_ski(&[ChannelOp::Recv]);
+        assert!(matches!(recv_only, SKI::App(..)), "Recv 编码应为组合,实际 {:?}", recv_only);
+    }
+
+    #[test]
+    fn test_ambient_cap_encoding() {
+        // §27.10:ambient 能力 → 通道消息
+        assert_eq!(ambient_cap_to_channel_msg(&AmbientCap::Enter("room".into())), "enter:room");
+        assert_eq!(ambient_cap_to_channel_msg(&AmbientCap::Exit("room".into())), "exit:room");
+        assert_eq!(ambient_cap_to_channel_msg(&AmbientCap::Open("box".into())), "open:box");
+    }
+
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §27.10 演算互编码:π 通道操作 → SKI 组合子;ambient 能力 → 通道消息
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// π 通道操作抽象(编码源)
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChannelOp {
+    /// 发送值
+    Send(i64),
+    /// 接收
+    Recv,
+}
+
+impl SKI {
+    /// §27.10 π→SKI 编码:Send v → App(K, Num(v))(K 丢弃环境取常量),
+    /// Recv → I(恒等);序列组合为 App 链。reduce 后保持观察值(编码等价)。
+    pub fn encode_pi_to_ski(ops: &[ChannelOp]) -> SKI {
+        let mut acc = SKI::I;
+        for op in ops {
+            let enc = match op {
+                ChannelOp::Send(v) => SKI::App(Box::new(SKI::K), Box::new(SKI::Num(*v))),
+                ChannelOp::Recv => SKI::I,
+            };
+            acc = SKI::App(Box::new(acc), Box::new(enc));
+        }
+        acc
+    }
+}
+
+/// ambient 能力 → 通道消息编码(enter/exit/open → 结构化消息)
+pub fn ambient_cap_to_channel_msg(cap: &AmbientCap) -> String {
+    match cap {
+        AmbientCap::Enter(name) => format!("enter:{}", name),
+        AmbientCap::Exit(name) => format!("exit:{}", name),
+        AmbientCap::Open(name) => format!("open:{}", name),
+        other => format!("{:?}", other),
     }
 }

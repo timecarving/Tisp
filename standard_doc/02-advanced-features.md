@@ -106,16 +106,30 @@ h : (Int ->[{IO, State Int}] Bool)
 
 ---
 
-## 6. 液态类型(Liquid Types)⚠️
+## 6. 液态类型(Liquid Types)✅
 
 ```clojure
-;; 精化类型(refinement type)
-(defn safe-div [x : Int, y : Int] -> {Int | y != 0}
-  (/ x y))
+;; 精化类型(refinement type):调用点实参必须满足谓词
+(defn sqrt [x : {n : i64 | (>= n 0)}] -> i64
+  x)
+
+;; 返回精化:函数体所有路径满足返回谓词
+(defn abs [x] -> {n : i64 | (>= n 0)}
+  (if (>= x 0) x (- 0 x)))
+
+;; 函数契约:requires/ensures,result 绑定返回值
+(defn divide [n d]
+  :requires (!= d 0)
+  :requires (> d 0)
+  :ensures  (> result 0)
+  (+ n d))
 ```
 
-- `liquid_types.rs`、`holes.rs` 提供精化类型与洞(hole `?name`)的骨架
-- Z3 集成(z3_bridge)为可选后端，无 z3 时跳过
+- 精化类型 `{x : T | pred}` 与 `:requires`/`:ensures` 契约全链路解析(desugar → CoreDef)
+- `--typecheck` 运行 Z3(SMT-LIB2 外部进程)求解:调用点实参精化/契约、返回精化(if→ite 路径敏感)、`requires ⇒ ensures`;违反输出反例(`x = -1`)并退出非零
+- 无 `z3` 时降级为常量折叠(`apt install z3`);未知谓词/不可翻译表达式警告放行,不误报
+- 实现:后端 `liquid_verify.rs`(验证驱动)、`z3_bridge.rs`(SMT 桥);middle `liquid_types.rs`(谓词/表达式 → SMT 翻译)
+- 示例:`examples/liquid-types-test.tisp`(通过型)、`examples/liquid-types-violations.tisp`(负面用例)、`examples/dependent-linear-test.tisp`(依赖等级)、`examples/remaining-gaps-demo.tisp`(综合)
 
 ---
 

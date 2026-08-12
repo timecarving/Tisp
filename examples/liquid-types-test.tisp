@@ -1,31 +1,47 @@
-;; Phase 4 test: Liquid Types and Refinement Types
+;; Liquid Types and Refinement Types (§15)
+;; 通过型用例:精化类型参数、契约(requires/ensures)验证全链路(Z3 求解)
+;; 运行:`tisp --typecheck liquid-types-test.tisp`(需要 z3,apt install z3)
+;; 违反型用例见 liquid-types-violations.tisp
 
-;; Test 1: Basic refinement type parsing (only parsing, not checking yet)
-;; This should type-check successfully
+;; Test 1: 精化类型参数 —— 调用点实参必须满足精化谓词
+(defn sqrt [x : {n : i64 | (>= n 0)}] -> i64
+  x)
 
-;; Test 2: Simple function with contract
+;; Test 2: 精化返回类型 —— 函数体所有路径满足返回谓词(if → ite 路径敏感)
+(defn abs [x] -> {n : i64 | (>= n 0)}
+  (if (>= x 0) x (- 0 x)))
+
+;; Test 3: 契约 —— requires 合取 + ensures(result 绑定返回值)
 (defn divide [n d]
   :requires (!= d 0)
+  :requires (> d 0)
   (+ n d))
 
-;; Test 3: Refinement-annotated function
-(defn sqrt [x]
-  (if (>= x 0) (* x x) 0))
-
-;; Test 4: Contract with ensures
+;; Test 4: ensures 满足 —— 正参数保证正结果
 (defn add-positive [x y]
+  :requires (> x 0)
+  :requires (> y 0)
   :ensures (> result 0)
   (+ x y))
 
-;; Test 5: Multiple requires
+;; Test 5: 多 requires + 涉及算术的 ensures
 (defn safe-transfer [from-balance to-balance amount]
   :requires (>= from-balance amount)
   :requires (> amount 0)
   :ensures (= result (+ from-balance to-balance))
   (+ from-balance to-balance))
 
-;; Test 6: Using and/or in predicates
+;; Test 6: and/or 组合谓词
 (defn complex-check [x y]
   :requires (and (>= x 0) (>= y 0))
   :requires (< (+ x y) 1000)
   (+ x y))
+
+;; Test 7: 合法调用 —— 全部满足精化与契约
+(defn main []
+  (println (sqrt 9))
+  (println (abs -5))
+  (println (divide 10 3))
+  (println (add-positive 1 2))
+  (println (safe-transfer 100 50 30))
+  (println (complex-check 10 20)))

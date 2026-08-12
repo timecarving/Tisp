@@ -1,7 +1,9 @@
 # Tisp Language Specification
 
-**Version:** 0.1.0-draft  
+**Version:** 0.1.0  
 **Status:** Design specification for implementation
+
+> 状态符号(与 standard_doc/04-implementation-status.md 一致):✅ 完全实现 | ⚠️ 部分实现 | ⬜ 仅设计(2026-08)
 
 ---
 
@@ -40,7 +42,7 @@
 
 ---
 
-## 1. Introduction
+## 1. Introduction ✅
 
 Tisp is a **pure declarative**, **unified-method**, **multi-paradigm**, **high-performance**, **system-level** Lisp dialect.
 
@@ -59,7 +61,7 @@ Tisp is a **pure declarative**, **unified-method**, **multi-paradigm**, **high-p
 
 ---
 
-## 2. Design Philosophy
+## 2. Design Philosophy ⚠️
 
 ### Principle 1: Everything is an Annotated Relation
 
@@ -110,7 +112,7 @@ Tisp is a **strongly statically typed** language: all types are checked at compi
 
 ---
 
-## 3. Lexical Structure
+## 3. Lexical Structure ⚠️
 
 ### 3.1 Character Set
 
@@ -155,7 +157,7 @@ Reserved words: `true`, `false`, `nil`.
 
 ---
 
-## 4. Data Structures
+## 4. Data Structures ⚠️
 
 All data structures are **immutable** (persistent).
 
@@ -210,7 +212,7 @@ Type: `Unit` — the unit type with one value.
 
 ---
 
-## 5. Expressions
+## 5. Expressions ⚠️
 
 ### 5.1 Literals
 
@@ -275,7 +277,7 @@ x                 ; look up x in current scope
 
 ---
 
-## 6. Definitions
+## 6. Definitions ⚠️
 
 ### 6.1 Value Definition
 
@@ -336,7 +338,7 @@ Where:
 
 ---
 
-## 7. Algebraic Data Types
+## 7. Algebraic Data Types ⚠️
 
 ### 7.1 Data Type Definition
 
@@ -386,7 +388,7 @@ Where:
 
 ---
 
-## 8. Pattern Matching
+## 8. Pattern Matching ⚠️
 
 ### 8.1 Match Expression
 
@@ -427,7 +429,7 @@ The compiler verifies that all possible values are covered. Missing cases produc
 
 ---
 
-## 9. Type System Overview
+## 9. Type System Overview ⚠️
 
 Tisp's type system is a **unified modal dependent type theory** organized in layers:
 
@@ -472,7 +474,7 @@ Int                    ; → Type value
 
 ---
 
-## 10. Quantitative Type Theory (QTT)
+## 10. Quantitative Type Theory (QTT) ✅
 
 Every binding has a **multiplicity**: `0`, `1`, or `ω`.
 
@@ -537,7 +539,11 @@ Every binding has a **multiplicity**: `0`, `1`, or `ω`.
 
 ---
 
-## 11. Graded Modal Types
+### 10.4 依赖等级(实现,2026-08)
+
+等级可为**编译期数值表达式**:数字 `(5 x : a)` → Nat(5)、符号 `(n x : a)` → Var(n)(绑定自类型参数,如 `(Vec i64 n)` 的 n)、复合 `((+ n 1) x : a)` → Add。检查语义为**使用计数 ≤ 等级**(上界,参考 Idris 2);数字等级常量折叠检查,符号等级可常量判定时检查、不可判定时警告放行;分支合并取计数上界。`0/1/ω` 为特例(0 擦除/1 恰好一次/ω 不限)。
+
+## 11. Graded Modal Types ⚠️
 
 QTT's {0, 1, ω} is a special case. Graded modal types generalize to **arbitrary semirings**.
 
@@ -588,7 +594,7 @@ QTT's {0, 1, ω} is a special case. Graded modal types generalize to **arbitrary
 
 ---
 
-## 12. Effect System
+## 12. Effect System ✅
 
 ### 12.1 Effect Declaration
 
@@ -633,6 +639,8 @@ QTT's {0, 1, ω} is a special case. Graded modal types generalize to **arbitrary
 | `Signal` | subscribe, emit | FRP signals |
 | `Session` | send, recv, fork | Session-typed channels |
 
+> 实现注:表中部分操作(如 Channel 的 par/rep、Signal 的 subscribe/emit)在实现中为独立 Core AST 节点,而非 effect 操作;`--run` 走对应节点语义。
+
 ### 12.4 Effect Rows
 
 ```clojure
@@ -675,7 +683,7 @@ The compiler detects single-handler, no-nesting patterns and automatically compi
 
 ---
 
-## 13. Mode System
+## 13. Mode System ⚠️
 
 Mercury-style instantiation tracking.
 
@@ -714,7 +722,7 @@ Mercury-style instantiation tracking.
 
 ---
 
-## 14. Determinism
+## 14. Determinism ✅
 
 ### 14.1 Determinism Categories
 
@@ -747,26 +755,28 @@ Mercury-style instantiation tracking.
 
 ---
 
-## 15. Liquid Types
+## 15. Liquid Types ✅
 
 ### 15.1 Refinement Types
 
 ```clojure
-;; {x : T | predicate}
-(defn sqrt [x : {n : Float | (>= n 0.0)}] -> Float
-  ...)
+;; {x : T | predicate}(实现支持整数域 i64)
+(defn sqrt [x : {n : i64 | (>= n 0)}] -> i64
+  x)
 
-(sqrt 4.0)     ; OK
-(sqrt -1.0)    ; compile error
+(sqrt 9)      ; OK
+(sqrt -1)     ; 编译错误:实参不满足精化,反例 x = -1
 ```
 
-### 15.2 Liquid Type Inference
+### 15.2 返回精化验证(路径敏感)
 
 ```clojure
-(defn abs [x : Int] -> {n : Int | (>= n 0)}
-  (if (>= x 0) x (- x)))
-;; Compiler verifies: both branches return >= 0
+(defn abs [x : i64] -> {n : i64 | (>= n 0)}
+  (if (>= x 0) x (- 0 x)))
+;; 验证器以 if→ite 路径敏感方式验证两分支均满足返回精化
 ```
+
+> 实现状态:精化类型与契约经 Z3(SMT-LIB2)求解验证(调用点/返回/契约,违反带反例);谓词自动推断(Liquid Type Inference)未实现。
 
 ### 15.3 Design by Contract
 
@@ -791,7 +801,7 @@ Refinement predicates can use 0-multiplicity variables (verified at compile time
 
 ---
 
-## 16. Homotopy Type Theory
+## 16. Homotopy Type Theory ⚠️
 
 Enabled with `--cubical` compiler flag.
 
@@ -849,7 +859,9 @@ Enabled with `--cubical` compiler flag.
 
 ---
 
-## 17. Cohesive HoTT
+## 17. Cohesive HoTT ⚠️
+
+> 实现注(2026-08):ʃ(shape)以最小可区分语义落地(返回 Shape 容器,路径端点);`crisp` 上下文检查已实现;完整同伦语义(ʃ 形状代数、路径连通计算)未实现。
 
 Enabled with `--cohesion` compiler flag.
 
@@ -888,7 +900,7 @@ Enabled with `--cohesion` compiler flag.
 
 ---
 
-## 18. Temporal Types
+## 18. Temporal Types ⚠️
 
 ### 18.1 Temporal Modalities
 
@@ -945,7 +957,7 @@ Types that don't change over time. Can safely cross time steps.
 
 ---
 
-## 19. Dependent Graded Types
+## 19. Dependent Graded Types ⚠️
 
 ### 19.1 Graded Dependent Function (Π_r)
 
@@ -973,7 +985,7 @@ If `f : (Π [x : A]_r -> B x)` and `x` appears in `B x` with grade `s`, then tot
 
 ---
 
-## 20. Session Types
+## 20. Session Types ⚠️
 
 ### 20.1 Binary Session Types
 
@@ -1012,7 +1024,7 @@ If `f : (Π [x : A]_r -> B x)` and `x` appears in `B x` with grade `s`, then tot
 
 ---
 
-## 21. Logic Programming
+## 21. Logic Programming ⚠️
 
 ### 21.1 Predicate Definition
 
@@ -1100,7 +1112,7 @@ Abduction generates hypotheses that explain observations. Given a goal and abduc
 
 ---
 
-## 22. Generic Functions
+## 22. Generic Functions ⚠️
 
 ### 22.1 Declaration
 
@@ -1142,7 +1154,7 @@ Abduction generates hypotheses that explain observations. Given a goal and abduc
 
 ---
 
-## 23. Typeclasses
+## 23. Typeclasses ✅
 
 ### 23.1 Declaration
 
@@ -1182,7 +1194,7 @@ Abduction generates hypotheses that explain observations. Given a goal and abduc
 
 ---
 
-## 24. Macros
+## 24. Macros ⚠️
 
 ### 24.1 defmacro
 
@@ -1204,7 +1216,7 @@ Macros are hygienic by default. Use `gensym` for fresh names when needed.
 
 ---
 
-## 25. Module System
+## 25. Module System ✅
 
 ### 25.1 Namespace
 
@@ -1223,7 +1235,7 @@ Macros are hygienic by default. Use `gensym` for fresh names when needed.
 
 ---
 
-## 26. FFI & System-Level Programming
+## 26. FFI & System-Level Programming ⚠️
 
 ### 26.1 External Function Declaration
 
@@ -1259,7 +1271,7 @@ All system-level operations require the `Unsafe` effect. Code using `Unsafe` mus
 
 ---
 
-## 27. Process Calculi
+## 27. Process Calculi ✅
 
 All process calculi are specializations of the Communication effect family.
 
@@ -1365,7 +1377,7 @@ Encoded via OOP (generic functions + method combination).
 
 ---
 
-## 28. Verification
+## 28. Verification ⚠️
 
 **Verification and execution are the same code with different effect handlers.**
 
@@ -1421,7 +1433,7 @@ Encoded via OOP (generic functions + method combination).
 
 ---
 
-## 29. Built-in Functions
+## 29. Built-in Functions ⚠️
 
 ### 29.1 Arithmetic
 
@@ -1453,7 +1465,7 @@ Encoded via OOP (generic functions + method combination).
 
 ---
 
-## 30. Compiler Pragmas
+## 30. Compiler Pragmas ⚠️
 
 ### 30.1 Inline Hint
 
@@ -1515,12 +1527,15 @@ unquote-splice = '~@' expr
 true false nil
 def defn defn- def- defdata defdata-hit defpred defgeneric defmethod
 defclass definstance defeffect defmacro defextern defglobal-type
-defresource-algebra defprop
+defresource-algebra defprop defsession typefamily
 fn let if cond match when unless
-handle verify check-equivalence find-attack
+handle verify verify! check-equivalence find-attack
 ns require use import refer
 inline! specialize! opt-level suppress-warning
 ann quote syntax-quote
+fresh search solve-all find-all abduce constrain domain label
+send recv close chan spawn
+flat sharp shape crisp reflect-type gensym
 ```
 
 ## Appendix C: Operator Precedence
@@ -1562,14 +1577,20 @@ All operators are prefix (Lisp-style). No infix precedence needed.
 ## Appendix F: Example Program Index
 
 See `examples/` directory:
-- `hello.tisp` — Hello World
-- `fibonacci.tisp` — Fibonacci with graded types
-- `state-effect.tisp` — State effect handler
-- `graded-types.tisp` — Graded type examples
-- `logic-search.tisp` — Logic programming with search
-- `generic-dispatch.tisp` — Generic function dispatch
-- `manual-memory.tisp` — Manual region management
-- `session-types.tisp` — Session-typed protocols
-- `hott-circle.tisp` — Circle as HIT
-- `frp-counter.tisp` — FRP counter with temporal types
-- `security-protocol.tisp` — Protocol verification
+
+| 文件 | 运行结果 | 说明 |
+|------|---------|------|
+| `hello.tisp` | `Hello, Tisp!` | 顶层表达式 |
+| `fibonacci.tisp` | `55` | 递归 + 顶层 println |
+| `adt-test.tisp` | `just/nothing/3` | ADT + match |
+| `advanced-test.tisp` | `43/120` | 高阶函数 + 闭包 |
+| `run-test.tisp` | `Hello from Tisp!` / `42` | 综合 |
+| `type-infer-test.tisp` | `43` | 类型推断 |
+| `state-effect.tisp` | `3` | 效果系统(state) |
+| `logic-test.tisp` | `OK` | 逻辑编程(fresh/==/search) |
+| `frp-counter.tisp` | 定义型(无入口) | FRP 流(:::/⃝/advance) |
+| `logic-search.tisp` | 部分支持 | Search effect + Mercury 自由变量 |
+| `liquid-types-test.tisp` | 验证通过(8 verified) | 液态类型(精化/契约,需 z3) |
+| `liquid-types-violations.tisp` | 预期报错(退出码非零) | 液态类型负面用例 |
+| `phase5-test.tisp` | 定义型(无入口) | 洞/确定性 |
+| `_qtt-test.tisp` | 定义型(无入口) | QTT |

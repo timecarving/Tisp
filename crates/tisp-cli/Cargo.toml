@@ -20,6 +20,7 @@ miette.workspace = true
 [features]
 default = []
 llvm = ["dep:inkwell", "tisp-backend/llvm"]
+ffi = ["tisp-backend/ffi"]
 
 [dependencies.inkwell]
 workspace = true

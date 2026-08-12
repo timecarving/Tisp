@@ -37,4 +37,4 @@ inkwell = { version = "0.5", features = ["llvm17-0"] }
 # llvm-sys 直接依赖:强制动态链接(Debian llvm-17-dev 只有共享库,默认 prefer-static 会
 # 因缺少 libPolly.a 等静态库而构建失败)
 llvm-sys = { version = "170", features = ["force-dynamic"] }
-z3 = "0.12"
+libloading = "0.8"

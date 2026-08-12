@@ -13,7 +13,7 @@ thiserror.workspace = true
 [features]
 default = []
 llvm = ["dep:inkwell", "dep:llvm-sys"]
-z3 = ["dep:z3"]
+ffi = ["dep:libloading"]
 
 [dependencies.inkwell]
 workspace = true
@@ -23,6 +23,9 @@ optional = true
 workspace = true
 optional = true
 
-[dependencies.z3]
+[dependencies.libloading]
 workspace = true
 optional = true
+
+[dev-dependencies]
+tisp-frontend = { workspace = true }

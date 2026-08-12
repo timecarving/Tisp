@@ -49,6 +49,8 @@ impl Optimizer {
 
         CoreProgram {
             data_decls: program.data_decls.clone(),
+            type_families: program.type_families.clone(),
+            resource_algebras: program.resource_algebras.clone(),
             effect_decls: program.effect_decls.clone(),
             defs: optimized_defs,
         }

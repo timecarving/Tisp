@@ -1,0 +1,25 @@
+;; 依赖线性类型(§10 推广):等级由编译期数值表达式决定
+;; 运行:tisp --typecheck dependent-linear-test.tisp
+
+;; 数字等级:资源可用最多 5 次
+(defn use5 [(5 x : i64)] -> i64
+  (do x x x x x))
+
+;; 符号等级:等级变量 n 绑定自类型参数 (Vec i64 n)
+;; 向量每个元素线性使用一次 → 整体可用 n 次
+(defn sum-vec [xs : (Vec i64 n) (n acc : i64)] -> i64
+  (do acc acc acc))
+
+;; 复合等级:可用 (+ n 1) 次
+(defn use-n1 [xs : (Vec i64 n) ((+ n 1) y : i64)] -> i64
+  y)
+
+;; 分支上界:then 2 次、else 1 次,等级 3 → 上界 2 ≤ 3 通过
+(defn branch [(3 x : i64)] -> i64
+  (if true (do x x) x))
+
+;; 违反用例(取消注释验证报错):
+;; (defn bad [(3 x : i64)] -> i64 (do x x x x))   ; 4 次 > 3 → grade violation
+;; (defn unbound [(m x : i64)] -> i64 x)          ; m 未绑定 → 未绑定的等级变量
+
+(defn main [] (grade-of "use5"))

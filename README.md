@@ -45,7 +45,7 @@ crates/
 
 ```bash
 cargo build --release            # 构建
-cargo test --workspace           # 105 个测试(0.1.0)
+cargo test --workspace           # 177 个测试
 ```
 
 ### 运行
@@ -69,7 +69,7 @@ CLI flags:`--eval` `--print-ast` `--print-tokens` `--desugar` `--typecheck` `--r
 (println (fib 10))      ; => 55
 ```
 
-语言特性:ADT/GADT、模式匹配(同名变量一致性)、效果系统(handle/perform)、逻辑编程(defpred/CLP/回溯)、宏(defmacro)、OOP 泛型函数(defgeneric/defmethod)、FRP 流、进程演算通道与加密、QTT 等级、HoTT。
+语言特性:ADT/GADT、模式匹配(同名变量一致性)、效果系统(handle/perform)、逻辑编程(defpred/CLP/回溯/溯因)、宏(defmacro + 卫生/gensym)、OOP 泛型函数(defgeneric/defmethod + 编译期特化)、FRP 流、进程演算通道与加密、QTT 等级(含依赖线性等级表达式)、液态类型(Z3 验证)、类型族、多模式谓词、MPST 会话、验证(find-attack/check-equivalence)、HoTT。
 
 ### 文档
 
@@ -78,14 +78,15 @@ CLI flags:`--eval` `--print-ast` `--print-tokens` `--desugar` `--typecheck` `--r
 | [standard_doc/INDEX.md](./standard_doc/INDEX.md) | 语言标准文档(词法/核心语言/高级特性/参考/实现状态) |
 | [standard_doc/04-implementation-status.md](./standard_doc/04-implementation-status.md) | spec 30 章实现状态与未实现特性清单 |
 | [CHANGELOG.md](./CHANGELOG.md) | 变更记录(0.1.0 变更声明 + 已知局限) |
-| [docs/spec.md](./docs/spec.md) | 原始设计规范(设计目标与语法定义,部分特性仍处设计阶段) |
+| [docs/spec.md](./docs/spec.md) | 语言设计规范(30 章,状态符号 ✅/⚠️/⬜ 内联) |
+| [PLAN.md](./PLAN.md) | 项目现状与后续方向(替代历史分阶段计划) |
 
 ### 实现状态概览
 
-✅ 全链路可用:核心语言、效果系统、宏、OOP 泛型分发、逻辑编程(子句/CLP)、通道与加密、FRP 流、LLVM IR 文本生成
-⚠️ 部分实现:Search effect 续延搜索、液态类型(Z3)、HoTT、类型类实例查找、LLVM 真编译
-⬜ 设计阶段:详见 docs/spec.md 与 CHANGELOG 已知局限
+✅ 全链路可用:核心语言、效果系统、宏(卫生)、OOP 泛型分发(+特化)、逻辑编程(子句/CLP/溯因/多解)、通道与加密、FRP 流、液态类型(Z3 验证)、类型族、多模式谓词、committed-choice、MPST 会话、验证(find-attack)、依赖线性类型、LLVM IR 文本生成
+⚠️ 部分实现:Search effect 续延搜索、HoTT/Cohesive 最小语义、符号等级 Z3 严格验证、LLVM 真编译链、真实 dlopen 全签名
+⬜ 设计阶段:详见 docs/spec.md(30 章状态内联)与 standard_doc/04-implementation-status.md(唯一事实源)
 
 ### 示例程序
 
-`examples/` 下 13 个示例;8 个可运行输出正确(hello/fibonacci/adt/advanced/run/type-infer/state-effect/logic-test),4 个为定义型(无入口,用 `--typecheck` 检查),1 个部分支持(logic-search)。
+`examples/` 下 17 个示例;11 个可运行输出正确(hello/fibonacci/adt/advanced/run/type-infer/state-effect/logic-test/liquid-types-test/remaining-gaps-demo/dependent-linear-test),4 个为定义型(无入口,用 `--typecheck` 检查),1 个部分支持(logic-search),1 个预期报错(液态类型负面用例,`--typecheck` 演示违反与反例)。

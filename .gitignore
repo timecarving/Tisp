@@ -4,3 +4,7 @@
 # Reasonix 工具本地配置(不提交)
 .reasonix/
 reasonix.toml
+
+# 构建产物打包(备份用,不提交)
+target.tar
+target.tar.zst

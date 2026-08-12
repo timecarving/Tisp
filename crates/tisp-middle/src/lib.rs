@@ -8,3 +8,4 @@ pub mod effect_compile;
 pub mod optimize;
 pub mod liquid_types;
 pub mod holes;
+pub mod specialize;

@@ -114,6 +114,10 @@ pub enum CoreExprNode {
     Transp(Box<Type>, Box<CoreExpr>, Box<CoreExpr>),
     FlatMod(Box<CoreExpr>),
     SharpMod(Box<CoreExpr>),
+    /// §17 ʃ(Shape)模态:路径形状化(区间端点容器)
+    ShapeMod(Box<CoreExpr>),
+    /// §17 crisp 上下文标记(♭ 解包要求)
+    CrispMod(Box<CoreExpr>),
     Glue(Box<CoreExpr>, Box<CoreExpr>),
     Unglue(Box<CoreExpr>),
     HitDef(Symbol, Vec<(Symbol, Vec<Param>)>),
@@ -261,6 +265,10 @@ pub enum SessionOp {
 pub struct CoreProgram {
     pub data_decls: Vec<DataDecl>,
     pub effect_decls: Vec<EffectDecl>,
+    /// 类型族实例(§9)
+    pub type_families: Vec<crate::types::TypeFamilyInstance>,
+    /// 资源代数声明(§11.1)
+    pub resource_algebras: Vec<crate::types::ResourceAlgebra>,
     pub defs: Vec<CoreDef>,
 }
 
@@ -271,6 +279,8 @@ pub struct CoreDef {
     pub effects: EffectRow,
     pub grade: Grade,
     pub mode: Mode,
+    /// 多模式谓词签名(§13):每个元素是一个模式的参数 Mode 列表(如 [In, Out])
+    pub mode_sigs: Vec<Vec<Mode>>,
     pub determinism: Determinism,
     pub body: CoreExpr,
     pub requires: Option<Predicate>,

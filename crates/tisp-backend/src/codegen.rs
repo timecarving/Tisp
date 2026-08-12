@@ -443,6 +443,7 @@ mod tests {
             grade: tisp_core::types::Grade::Omega,
             mode: tisp_core::types::Mode::In,
             determinism: tisp_core::types::Determinism::Det,
+            mode_sigs: vec![],
             body,
             requires: None,
             ensures: None,
@@ -454,7 +455,8 @@ mod tests {
     fn test_ir_function_header() {
         // §30:define i64 @main() { 语法正确
         let body = expr(CoreExprNode::Lit(Literal::I64(42)));
-        let program = CoreProgram { data_decls: vec![], effect_decls: vec![], defs: vec![def("main", body)] };
+        let program = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![],
+            resource_algebras: vec![], defs: vec![def("main", body)] };
         let ir = IrGenerator::new().generate(&program);
         // 文本生成器以 define 开头;inkwell 输出带 ModuleID 头,统一断言包含定义
         assert!(ir.contains("define i64 @main() {"), "header malformed: {}", ir);
@@ -469,7 +471,8 @@ mod tests {
             Box::new(expr(CoreExprNode::App(Box::new(expr(CoreExprNode::Var(Symbol::new("+")))), Box::new(expr(CoreExprNode::Lit(Literal::I64(21))))))),
             Box::new(expr(CoreExprNode::Lit(Literal::I64(21)))),
         ));
-        let program = CoreProgram { data_decls: vec![], effect_decls: vec![], defs: vec![def("main", add)] };
+        let program = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![],
+            resource_algebras: vec![], defs: vec![def("main", add)] };
         let ir = IrGenerator::new().generate(&program);
         // LLVM IRBuilder 对常量操作数立即折叠(21+21 → 42,不发射 add 指令)
         #[cfg(feature = "llvm")]
@@ -490,7 +493,8 @@ mod tests {
             Box::new(expr(CoreExprNode::Lit(Literal::I64(1)))),
             Box::new(expr(CoreExprNode::Lit(Literal::I64(0)))),
         ));
-        let program = CoreProgram { data_decls: vec![], effect_decls: vec![], defs: vec![def("main", ife)] };
+        let program = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![],
+            resource_algebras: vec![], defs: vec![def("main", ife)] };
         let ir = IrGenerator::new().generate(&program);
         assert!(ir.contains("phi i64"), "expected phi: {}", ir);
         // 每处 ret i64 %N 引用的寄存器都有定义

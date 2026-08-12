@@ -107,6 +107,27 @@ pub enum Grade {
     Custom(Symbol, Box<Grade>),
 }
 
+/// 类型族实例(§9):(typefamily 名称 参数模式 结果)
+/// 资源代数声明(§11.1):(defresource-algebra 名称 单位元 二元运算 阶)
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResourceAlgebra {
+    pub name: Symbol,
+    /// 单位元显示文本(如 "0")
+    pub unit: String,
+    /// 二元运算名(如 "+")
+    pub op: Symbol,
+    /// 阶(preorder,可无)
+    pub order: Option<Symbol>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TypeFamilyInstance {
+    pub name: Symbol,
+    /// 参数模式(如 `(List a)` 中的 [Con(List), Var(a)])
+    pub params: Vec<Type>,
+    pub result: Type,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Mode {
     In,

@@ -29,6 +29,10 @@ pub struct TypeInfer {
     pub liquid_checker: LiquidChecker,
     /// Session type protocol state: channel_id → expected next operation
     session_state: HashMap<u64, SessionExpectation>,
+    /// 类型族实例表(§9)
+    type_families: Vec<TypeFamilyInstance>,
+    /// §17 crisp 上下文深度(♭ 解包要求)
+    crisp_depth: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +43,150 @@ enum SessionExpectation {
 }
 
 impl TypeInfer {
+
+    /// §9 类型族归约:对类型中的类型族应用 (F a1 ... an) 按实例归约;
+    /// 实例模式与实参匹配(变量绑定),结果替换后继续归约;无匹配实例报错
+    fn reduce_families(&self, ty: &Type) -> Result<Type, TypeError> {
+        match ty {
+            Type::App(_, _) => {
+                // 展开左结合应用链:(F a1 a2) = App(App(Con(F), a1), a2)
+                let (head, args) = self.collect_app(ty);
+                match &*head {
+                    Type::Con(tc) => {
+                        if let Some(inst) = self.type_families.iter().find(|i| i.name == tc.name) {
+                            let mut bindings = HashMap::new();
+                            if self.match_family_pattern(&inst.params, &args, &mut bindings) {
+                                let result = self.subst_family(&inst.result, &bindings);
+                                return self.reduce_families(&result);
+                            }
+                            return Err(TypeError {
+                                message: format!("type family '{}' application has no matching instance", tc.name),
+                                span: Span::dummy(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+                // 非类型族:递归归约各层
+                let f = self.reduce_families(&head)?;
+                let mut out = f;
+                for a in &args {
+                    let r = self.reduce_families(a)?;
+                    out = Type::App(Box::new(out), Box::new(r));
+                }
+                Ok(out)
+            }
+            Type::Fun(p, ann, r) => Ok(Type::Fun(
+                Box::new(self.reduce_families(p)?), ann.clone(), Box::new(self.reduce_families(r)?))),
+            Type::Forall(vars, body) => Ok(Type::Forall(vars.clone(), Box::new(self.reduce_families(body)?))),
+            Type::Tuple(items) => Ok(Type::Tuple(items.iter().map(|t| self.reduce_families(t)).collect::<Result<_, _>>()?)),
+            Type::Refined(base, pred) => Ok(Type::Refined(Box::new(self.reduce_families(base)?), pred.clone())),
+            Type::Pi(n, d, c) => Ok(Type::Pi(n.clone(), Box::new(self.reduce_families(d)?), Box::new(self.reduce_families(c)?))),
+            Type::Sigma(n, d, c) => Ok(Type::Sigma(n.clone(), Box::new(self.reduce_families(d)?), Box::new(self.reduce_families(c)?))),
+            Type::Record(fields, ext) => Ok(Type::Record(
+                fields.iter().map(|(n, t)| (n.clone(), self.reduce_families(t).unwrap())).collect(),
+                ext.as_ref().map(|e| Box::new(self.reduce_families(e).unwrap())))),
+            Type::Modal(op, t) => Ok(Type::Modal(op.clone(), Box::new(self.reduce_families(t)?))),
+            Type::Temporal(op, t) => Ok(Type::Temporal(op.clone(), Box::new(self.reduce_families(t)?))),
+            Type::Cohesive(op, t) => Ok(Type::Cohesive(op.clone(), Box::new(self.reduce_families(t)?))),
+            Type::Session(st) => Ok(Type::Session(st.clone())),
+            Type::Path(t, a, b) => Ok(Type::Path(Box::new(self.reduce_families(t)?), a.clone(), b.clone())),
+            Type::Meta(m) => Ok(Type::Meta(m.clone())),
+            Type::Interval => Ok(Type::Interval),
+            Type::Var(v) => Ok(Type::Var(v.clone())),
+            Type::Con(c) => Ok(Type::Con(c.clone())),
+        }
+    }
+
+    /// 展开类型应用链:(F a1 a2) → (head, [a1, a2]);head 为最内层非 App 类型
+    fn collect_app(&self, ty: &Type) -> (Box<Type>, Vec<Type>) {
+        match ty {
+            Type::App(f, a) => {
+                let (head, mut args) = self.collect_app(f);
+                args.push((**a).clone());
+                (head, args)
+            }
+            _ => (Box::new(ty.clone()), Vec::new()),
+        }
+    }
+
+    /// 实例模式与实参匹配:模式 Var 绑定实参,Con/App 递归(结构一致才匹配)
+    fn match_family_pattern(&self, pats: &[Type], args: &[Type], bindings: &mut HashMap<Symbol, Type>) -> bool {
+        if pats.len() != args.len() { return false; }
+        for (p, a) in pats.iter().zip(args) {
+            if !self.match_family_type(p, a, bindings) { return false; }
+        }
+        true
+    }
+
+    fn match_family_type(&self, pat: &Type, arg: &Type, bindings: &mut HashMap<Symbol, Type>) -> bool {
+        match pat {
+            Type::Var(v) => { bindings.insert(v.name.clone(), arg.clone()); true }
+            Type::Con(c) => matches!(arg, Type::Con(ac) if ac.name == c.name),
+            Type::App(pf, pa) => match arg {
+                Type::App(af, aa) => self.match_family_type(pf, af, bindings) && self.match_family_type(pa, aa, bindings),
+                _ => false,
+            },
+            _ => pat == arg,
+        }
+    }
+
+    /// 实例结果中绑定变量的替换
+    fn subst_family(&self, ty: &Type, bindings: &HashMap<Symbol, Type>) -> Type {
+        match ty {
+            Type::Var(v) => bindings.get(&v.name).cloned().unwrap_or_else(|| ty.clone()),
+            Type::App(f, a) => Type::App(Box::new(self.subst_family(f, bindings)), Box::new(self.subst_family(a, bindings))),
+            Type::Fun(p, ann, r) => Type::Fun(Box::new(self.subst_family(p, bindings)), ann.clone(), Box::new(self.subst_family(r, bindings))),
+            Type::Forall(vs, b) => Type::Forall(vs.clone(), Box::new(self.subst_family(b, bindings))),
+            _ => ty.clone(),
+        }
+    }
+
+    /// 重建函数体:归约 Lam 参数类型与 Let 类型标注中的类型族应用(§9)
+    fn reduce_body_families(&self, expr: &CoreExpr) -> Result<CoreExpr, TypeError> {
+        let span = expr.span.clone();
+        let node = match &expr.node {
+            CoreExprNode::Lam(lam) => {
+                let params = lam.params.iter().map(|p| {
+                    let mut p2 = p.clone();
+                    if let Some(ty) = &p.ty {
+                        p2.ty = Some(self.reduce_families(ty)?);
+                    }
+                    Ok(p2)
+                }).collect::<Result<Vec<_>, TypeError>>()?;
+                CoreExprNode::Lam(tisp_core::core_ast::Lambda {
+                    params,
+                    body: Box::new(self.reduce_body_families(&lam.body)?),
+                    ret_type: lam.ret_type.as_ref().map(|t| self.reduce_families(t)).transpose()?,
+                })
+            }
+            CoreExprNode::App(f, a) => CoreExprNode::App(
+                Box::new(self.reduce_body_families(f)?),
+                Box::new(self.reduce_body_families(a)?)),
+            CoreExprNode::If(c, t, e) => CoreExprNode::If(
+                Box::new(self.reduce_body_families(c)?),
+                Box::new(self.reduce_body_families(t)?),
+                Box::new(self.reduce_body_families(e)?)),
+            CoreExprNode::Let(n, ty, v, body) => CoreExprNode::Let(
+                n.clone(),
+                ty.as_ref().map(|t| self.reduce_families(t)).transpose()?,
+                Box::new(self.reduce_body_families(v)?),
+                Box::new(self.reduce_body_families(body)?)),
+            CoreExprNode::Do(items) => CoreExprNode::Do(
+                items.iter().map(|i| self.reduce_body_families(i)).collect::<Result<_, _>>()?),
+            CoreExprNode::Match(s, arms) => CoreExprNode::Match(
+                Box::new(self.reduce_body_families(s)?),
+                arms.iter().map(|a| {
+                    Ok(tisp_core::core_ast::MatchArm {
+                        pattern: a.pattern.clone(),
+                        guard: a.guard.as_ref().map(|g| Box::new(self.reduce_body_families(g).unwrap())),
+                        body: Box::new(self.reduce_body_families(&a.body)?),
+                    })
+                }).collect::<Result<Vec<_>, TypeError>>()?),
+            other => other.clone(),
+        };
+        Ok(CoreExpr::new(node, span))
+    }
     pub fn new() -> Self {
         Self {
             next_var: 0,
@@ -47,12 +195,17 @@ impl TypeInfer {
             hole_env: HoleEnv::new(),
             liquid_checker: LiquidChecker::new(),
             session_state: HashMap::new(),
+            type_families: Vec::new(),
+            crisp_depth: 0,
         }
     }
 
     pub fn infer_program(&mut self, program: &CoreProgram) -> Result<Vec<(Symbol, Type)>, TypeError> {
         let mut env = self.initial_env();
         let mut results = Vec::new();
+
+        // 类型族实例表(§9)
+        self.type_families = program.type_families.clone();
 
         // Register data declarations
         for decl in &program.data_decls {
@@ -229,7 +382,9 @@ impl TypeInfer {
         let scheme = TypeScheme::mono(fresh_ty.clone());
         env.insert(def.name.clone(), scheme);
 
-        let ty = self.infer_expr(env, &def.body)?;
+        // §9 类型族归约:重建函数体(参数类型/标注中的类型族应用归约)
+        let body = self.reduce_body_families(&def.body)?;
+        let ty = self.infer_expr(env, &body)?;
 
         // Unify the inferred type with the fresh variable
         self.unify(&fresh_ty, &ty, def.span)?;
@@ -239,8 +394,14 @@ impl TypeInfer {
         let scheme = self.generalize(env, &final_ty);
         env.insert(def.name.clone(), scheme);
 
+        // §9 类型族归约:def.ty 中的类型族应用归约,悬挂报错
+        let ann = match &def.ty {
+            Some(ty) => Some(self.reduce_families(ty)?),
+            None => None,
+        };
+
         // §19.1:依赖类型注解(def.ty 为 Pi/Sigma)时,把推断的 Fun 提升为依赖类型并统一
-        if let Some(ann) = &def.ty {
+        if let Some(ann) = &ann {
             if matches!(ann, Type::Pi(..) | Type::Sigma(..)) {
                 if let Type::Pi(name, _, _) = ann {
                     if let Type::Fun(p, _, r) = &final_ty {
@@ -441,9 +602,29 @@ impl TypeInfer {
                 Ok(self.apply_subst(&last_ty))
             }
 
-            // ── Session type protocol checking ──
+            // ── Session type protocol checking (§20.2)──
             CoreExprNode::Session(op, body) => {
-                // Check protocol compliance
+                // 协议顺序检查:期望操作与实际操作不符报错
+                let expected = self.session_state.get(&0).cloned();
+                let actual = match op {
+                    SessionOp::Send => Some("send"),
+                    SessionOp::Recv => Some("recv"),
+                    SessionOp::Close => Some("close"),
+                    SessionOp::Fork(_) => None,
+                };
+                if let (Some(exp), Some(act)) = (expected, actual) {
+                    let exp_str = match exp {
+                        SessionExpectation::Recv => "recv",
+                        SessionExpectation::Close => "close",
+                        SessionExpectation::End => "end",
+                    };
+                    if exp_str != act {
+                        return Err(TypeError {
+                            message: format!("会话协议顺序违反:期望 {} 实际 {}", exp_str, act),
+                            span: expr.span.clone(),
+                        });
+                    }
+                }
                 match op {
                     SessionOp::Send => {
                         // After send, expect recv
@@ -461,6 +642,23 @@ impl TypeInfer {
                 self.infer_expr(env, body)
             }
 
+            CoreExprNode::FlatMod(e) => {
+                // §17:♭ 解包需 crisp 上下文;非 crisp 上下文报错
+                if self.crisp_depth == 0 {
+                    return Err(TypeError {
+                        message: "cohesive 上下文错误:♭(flat)解包要求 crisp 上下文".into(),
+                        span: expr.span.clone(),
+                    });
+                }
+                self.infer_expr(env, e)
+            }
+            CoreExprNode::CrispMod(e) => {
+                self.crisp_depth += 1;
+                let r = self.infer_expr(env, e);
+                self.crisp_depth -= 1;
+                r
+            }
+            CoreExprNode::ShapeMod(e) => self.infer_expr(env, e),
             _ => Ok(self.fresh_var()),
         }
     }

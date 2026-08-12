@@ -95,8 +95,20 @@ fn compile_file(path: &str, cli: &Cli) -> miette::Result<()> {
         .map_err(|e| miette::miette!("{}", e))?;
 
     if cli.desugar {
+        // §11.1 资源代数
+        for alg in &core_program.resource_algebras {
+            println!("; resource-algebra {}: unit={}, op={}{}",
+                     alg.name, alg.unit, alg.op,
+                     alg.order.as_ref().map(|o| format!(", order={}", o)).unwrap_or_default());
+        }
         for def in &core_program.defs {
             println!("def {} : {} = {:#?}", def.name, def.ty.as_ref().map(|t| format!("{}", t)).unwrap_or_else(|| "?".into()), def.body);
+            if let Some(req) = &def.requires {
+                println!("  requires: {:#?}", req);
+            }
+            if let Some(ens) = &def.ensures {
+                println!("  ensures: {:#?}", ens);
+            }
         }
         return Ok(());
     }
@@ -168,13 +180,36 @@ fn compile_file(path: &str, cli: &Cli) -> miette::Result<()> {
             println!("{} regions: {:?}", name, region_list);
         }
 
+        // §22.4 泛型编译期特化
+        let mut specializer = tisp_middle::specialize::Specializer::new();
+        let specialized_program = specializer.specialize(&core_program);
+        if specializer.specialized > 0 {
+            println!("; specialization: {} generic call(s) specialized", specializer.specialized);
+        }
+
         // Optimization
         let mut optimizer = tisp_middle::optimize::optimizer::Optimizer::new();
-        let opt_program = optimizer.optimize(&core_program);
+        let opt_program = optimizer.optimize(&specialized_program);
         println!("; optimizations: {} inlined, {} folded, {} dead-eliminated",
                  optimizer.stats.inlined, optimizer.stats.folded, optimizer.stats.dead_eliminated);
         println!("; program size: {} defs → {} defs after optimization",
                  core_program.defs.len(), opt_program.defs.len());
+
+        // Liquid type verification (§15):精化类型 + 契约(Z3 求解)
+        let mut liquid_verifier = tisp_backend::liquid_verify::LiquidVerifier::new();
+        let liquid_report = liquid_verifier.verify_program(&core_program);
+        if liquid_report.degraded {
+            println!("; liquid types: z3 solver unavailable, degraded to constant folding (apt install z3)");
+        } else {
+            println!("; liquid types: {} verified, {} violated, {} warned",
+                     liquid_report.verified, liquid_report.violated, liquid_report.warned);
+        }
+        for err in &liquid_report.errors {
+            eprintln!("liquid type error: {}", err.message);
+        }
+        if liquid_report.violated > 0 {
+            miette::bail!("liquid type verification failed: {} violation(s)", liquid_report.violated);
+        }
 
         println!("; type checking passed");
         return Ok(());
@@ -187,6 +222,9 @@ fn compile_file(path: &str, cli: &Cli) -> miette::Result<()> {
             Ok(Some(result)) => {
                 let stats = interpreter.region_stats();
                 println!("=> {:?}", result);
+                if interpreter.monadic_handles > 0 {
+                    println!("; monadic optimization (§12.6): {} single-handler handle(s) via direct state passing", interpreter.monadic_handles);
+                }
                 println!("; region stats: {} allocs, {} deallocs, {} bytes (peak: {})",
                          stats.regions_allocated, stats.regions_deallocated,
                          stats.bytes_allocated, stats.bytes_peak);
@@ -273,6 +311,8 @@ fn repl(cli: &Cli) -> miette::Result<()> {
                     all_defs.extend(program.defs);
                     let program_all = tisp_core::core_ast::CoreProgram {
                         data_decls: data_decls.clone(),
+                        type_families: vec![],
+            resource_algebras: vec![],
                         effect_decls: effect_decls.clone(),
                         defs: all_defs,
                     };
@@ -330,6 +370,8 @@ fn repl(cli: &Cli) -> miette::Result<()> {
                             all_defs.extend(program.defs);
                             let program_all = tisp_core::core_ast::CoreProgram {
                                 data_decls: data_decls.clone(),
+                        type_families: vec![],
+            resource_algebras: vec![],
                                 effect_decls: effect_decls.clone(),
                                 defs: all_defs,
                             };
