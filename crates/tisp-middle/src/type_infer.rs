@@ -110,6 +110,7 @@ impl TypeInfer {
             Type::Con(c) => Ok(Type::Con(c.clone())),
             Type::TLambda(p, b) => Ok(Type::TLambda(Box::new(self.reduce_families(p)?), Box::new(self.reduce_families(b)?))),
             Type::Ref(t) => Ok(Type::Ref(Box::new(self.reduce_families(t)?))),
+            Type::Ptr(t) => Ok(Type::Ptr(Box::new(self.reduce_families(t)?))),
         }
     }
 
@@ -956,6 +957,8 @@ impl TypeInfer {
             }
             // ── 可变引用(Ref a):unify 元素类型 ──
             (Type::Ref(t1), Type::Ref(t2)) => self.unify(t1, t2, span),
+            // ── 裸指针(Ptr a):unify 元素类型 ──
+            (Type::Ptr(t1), Type::Ptr(t2)) => self.unify(t1, t2, span),
             _ => Err(TypeError {
                 message: format!("cannot unify {:?} with {:?}", t1, t2),
                 span,

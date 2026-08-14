@@ -25,6 +25,8 @@ pub enum Type {
     TLambda(Box<Type>, Box<Type>),
     /// 可变引用(§统一内存管理):Ref a 分级值(1 线性可变 / ω 共享读 / 0 擦除)
     Ref(Box<Type>),
+    /// 裸指针(§统一内存管理):Ptr a 手动 Unsafe(1 级线性指针,经 Unsafe 门控)
+    Ptr(Box<Type>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -365,6 +367,7 @@ impl std::fmt::Display for Type {
             Type::Sigma(name, dom, cod) => write!(f, "Σ({} : {}). {}", name, dom, cod),
             Type::TLambda(param, body) => write!(f, "{} => {}", param, body),
             Type::Ref(t) => write!(f, "Ref {}", t),
+            Type::Ptr(t) => write!(f, "Ptr {}", t),
             _ => write!(f, "{:?}", self),
         }
     }

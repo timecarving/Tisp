@@ -17,7 +17,7 @@
 
 ## 4. 手动 Unsafe 统一
 
-- [ ] 4.1 `ptr-read`/`ptr-write` 所有权并入 grade_check(1 级线性指针写后不可复用)
+- [x] 4.1 `ptr-read`/`ptr-write` 所有权并入 grade_check(1 级线性指针写后不可复用)
 - [x] 4.2 Unsafe 门控(effect_infer)与等级检查(grade_check)输出进共享约束图
 - [x] 4.3 单元测试:Unsafe 门控 + 线性裸指针
 
@@ -30,6 +30,6 @@
 ## 6. 文档重写与 git
 
 - [x] 6.1 重写教程系列文档(standard_doc/ 各篇:统一内存管理模型)
-- [ ] 6.2 docs/spec.md 同步 + CHANGELOG
-- [ ] 6.3 `cargo test --workspace` 全绿 + `cargo check --workspace` 零警告
-- [ ] 6.4 git 提交(追踪所有应追踪文件)
+- [x] 6.2 docs/spec.md 同步 + CHANGELOG
+- [x] 6.3 `cargo test --workspace` 全绿 + `cargo check --workspace` 零警告
+- [x] 6.4 git 提交(追踪所有应追踪文件)
