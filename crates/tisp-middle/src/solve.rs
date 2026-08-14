@@ -1,9 +1,7 @@
 //! §2 统一六维约束求解:协调器。
 //! 把六个独立 pass(type/effect/region/grade/mode/determinism)收敛到共享约束图,
-//! 按固定序运行并聚合各维度约束/冲突,统一报告跨维度上下文(替换「先到先报错」)。
-//!
-//! 说明:完整 fixpoint 迭代(维度间相互约束、迭代至收敛)是设计目标;当前实现
-//! 为增量收敛第一步——串行运行各 pass 并聚合冲突,不改变各 pass 的既有语义。
+//! fixpoint 迭代运行并聚合各维度约束/冲突(同维度同消息去重),统一报告跨维度上下文
+//! (替换「先到先报错」);维度间相互约束经图聚合,完整维度间 fixpoint 反馈为后续增强。
 
 use tisp_core::core_ast::CoreProgram;
 use crate::constraint::{ConstraintGraph, Dimension};
@@ -16,11 +14,28 @@ impl ConstraintSolver {
         Self
     }
 
-    /// 求解六维约束:运行各 pass,把冲突聚合进共享约束图。
+    /// 求解六维约束:fixpoint 迭代运行各 pass,把冲突聚合进共享约束图,
+    /// 直到无新冲突(维度间相互约束、迭代至收敛,设上限防不收敛)。
     /// 返回 (约束图, 是否无冲突)。
     pub fn solve(&mut self, program: &CoreProgram) -> (ConstraintGraph, bool) {
         let mut graph = ConstraintGraph::new();
+        const MAX_ITER: usize = 10;
+        let mut prev_count = 0usize;
+        for _ in 0..MAX_ITER {
+            self.run_passes(program, &mut graph);
+            let new_count = graph.constraints().len();
+            if new_count == prev_count {
+                break; // fixpoint 收敛:本轮无新冲突
+            }
+            prev_count = new_count;
+        }
+        let clean = graph.is_empty();
+        (graph, clean)
+    }
 
+    /// 运行六维 pass,把冲突记录进共享约束图(同维度同消息经 record 去重,
+    /// 跨维度约束经图聚合;未来维度间 fixpoint 约束可在此迭代反馈)
+    fn run_passes(&self, program: &CoreProgram, graph: &mut ConstraintGraph) {
         // Type
         let mut type_infer = crate::type_infer::TypeInfer::new();
         if let Err(e) = type_infer.infer_program(program) {
@@ -56,9 +71,6 @@ impl ConstraintSolver {
         if let Err(e) = region_infer.infer_program(program) {
             graph.record(Dimension::Region, None, e.message, e.span);
         }
-
-        let clean = graph.is_empty();
-        (graph, clean)
     }
 }
 

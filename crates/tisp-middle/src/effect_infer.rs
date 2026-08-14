@@ -77,7 +77,15 @@ impl EffectInferrer {
             CoreExprNode::App(func, arg) => {
                 let func_eff = self.infer_expr(func)?;
                 let arg_eff = self.infer_expr(arg)?;
-                Ok(row_union(&func_eff, &arg_eff))
+                // §静态纯声明式:效果操作(如 println/put/throw)经内置调用时,须附着其效果,
+                // 否则 (println ...) 会被误判为 Pure(违反纯声明式)
+                let builtin_eff = match &func.node {
+                    CoreExprNode::Var(name) => self.effect_env.lookup_operation(name)
+                        .map(|e| EffectRow::Closed(vec![e]))
+                        .unwrap_or(EffectRow::Pure),
+                    _ => EffectRow::Pure,
+                };
+                Ok(row_union(&row_union(&func_eff, &builtin_eff), &arg_eff))
             }
 
             CoreExprNode::Let(_, _, value, body) => {
@@ -269,6 +277,66 @@ impl EffectEnv {
             ],
         });
 
+        // Unsafe:ptr-read/ptr-write/region-alloc/region-free(§26)
+        env.register_effect(EffectDecl {
+            name: Symbol::new("Unsafe"),
+            type_params: Vec::new(),
+            operations: vec![
+                OperationDecl { name: Symbol::new("ptr-read"), params: vec![Type::i64()], return_type: Type::i64() },
+                OperationDecl { name: Symbol::new("ptr-write"), params: vec![Type::i64(), Type::i64()], return_type: Type::unit() },
+                OperationDecl { name: Symbol::new("region-alloc"), params: vec![Type::i64(), Type::i64()], return_type: Type::i64() },
+                OperationDecl { name: Symbol::new("region-free"), params: vec![Type::i64()], return_type: Type::unit() },
+            ],
+        });
+
+        // Search:choose(§21 回溯)
+        env.register_effect(EffectDecl {
+            name: Symbol::new("Search"),
+            type_params: Vec::new(),
+            operations: vec![
+                OperationDecl { name: Symbol::new("choose"), params: vec![Type::i64()], return_type: Type::i64() },
+            ],
+        });
+
+        // Channel:send/recv(§27 π)
+        env.register_effect(EffectDecl {
+            name: Symbol::new("Channel"),
+            type_params: vec![Symbol::new("a")],
+            operations: vec![
+                OperationDecl { name: Symbol::new("send"), params: vec![Type::string(), Type::i64()], return_type: Type::unit() },
+                OperationDecl { name: Symbol::new("recv"), params: vec![Type::string()], return_type: Type::i64() },
+            ],
+        });
+
+        // Reader:ask / Writer:tell
+        env.register_effect(EffectDecl {
+            name: Symbol::new("Reader"),
+            type_params: vec![Symbol::new("r")],
+            operations: vec![
+                OperationDecl { name: Symbol::new("ask"), params: Vec::new(), return_type: Type::i64() },
+            ],
+        });
+        env.register_effect(EffectDecl {
+            name: Symbol::new("Writer"),
+            type_params: vec![Symbol::new("w")],
+            operations: vec![
+                OperationDecl { name: Symbol::new("tell"), params: vec![Type::i64()], return_type: Type::unit() },
+            ],
+        });
+
+        // State:补充 ref/deref/set!(§统一内存管理)
+        env.register_effect(EffectDecl {
+            name: Symbol::new("State"),
+            type_params: vec![Symbol::new("s")],
+            operations: vec![
+                OperationDecl { name: Symbol::new("get"), params: Vec::new(), return_type: Type::i64() },
+                OperationDecl { name: Symbol::new("put"), params: vec![Type::i64()], return_type: Type::unit() },
+                OperationDecl { name: Symbol::new("ref"), params: vec![Type::i64()], return_type: Type::Ref(Box::new(Type::i64())) },
+                OperationDecl { name: Symbol::new("deref"), params: vec![Type::Ref(Box::new(Type::i64()))], return_type: Type::i64() },
+                OperationDecl { name: Symbol::new("set!"), params: vec![Type::Ref(Box::new(Type::i64())), Type::i64()], return_type: Type::unit() },
+            ],
+        });
+
         env
     }
 
@@ -285,5 +353,55 @@ impl EffectEnv {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tisp_core::core_ast::*;
+    use tisp_core::span::Span;
+    use tisp_core::symbol::Symbol;
+
+    fn e(node: CoreExprNode) -> CoreExpr {
+        CoreExpr::new(node, Span::dummy())
+    }
+
+    #[test]
+    fn test_println_is_io_not_pure() {
+        // 静态纯声明式:println 是 IO 效应操作,调用后不得判为 Pure
+        let call = e(CoreExprNode::App(
+            Box::new(e(CoreExprNode::Var(Symbol::new("println")))),
+            Box::new(e(CoreExprNode::Lit(Literal::String("hello".into())))),
+        ));
+        let mut infer = EffectInferrer::new();
+        let eff = infer.infer_expr(&call).unwrap();
+        assert!(
+            matches!(&eff, EffectRow::Closed(labels) if labels.iter().any(|l| matches!(l, EffectLabel::Named(n) if n.as_str() == "IO"))),
+            "println 应引入 IO 效应,实际 {:?}", eff
+        );
+    }
+
+    #[test]
+    fn test_pure_literal_is_pure() {
+        let lit = e(CoreExprNode::Lit(Literal::I64(42)));
+        let mut infer = EffectInferrer::new();
+        let eff = infer.infer_expr(&lit).unwrap();
+        assert!(matches!(eff, EffectRow::Pure), "字面量应为 Pure,实际 {:?}", eff);
+    }
+
+    #[test]
+    fn test_ptr_read_is_unsafe_not_pure() {
+        // 静态纯声明式:ptr-read 是 Unsafe 效应操作,调用后不得判为 Pure
+        let call = e(CoreExprNode::App(
+            Box::new(e(CoreExprNode::Var(Symbol::new("ptr-read")))),
+            Box::new(e(CoreExprNode::Lit(Literal::I64(0)))),
+        ));
+        let mut infer = EffectInferrer::new();
+        let eff = infer.infer_expr(&call).unwrap();
+        assert!(
+            matches!(&eff, EffectRow::Closed(labels) if labels.iter().any(|l| matches!(l, EffectLabel::Named(n) if n.as_str() == "Unsafe"))),
+            "ptr-read 应引入 Unsafe 效应,实际 {:?}", eff
+        );
     }
 }

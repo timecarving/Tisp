@@ -1222,6 +1222,25 @@ pub fn is_stable_type(ty: &Type) -> bool {
     }
 }
 
+/// §11 □_r/◇_ε 引入消去等级推导:不可推断的等级变量默认取 ω(与 spec 一致);
+/// 递归解析 Modal 嵌套中的等级变量。
+pub fn resolve_modal_grade(ty: &Type) -> Type {
+    match ty {
+        Type::Modal(ModalOp::Necessity(g), inner) => {
+            let g = match g {
+                Grade::Var(_) => Grade::Omega, // 不可推断 → 默认 ω(并可在上层警告)
+                other => other.clone(),
+            };
+            Type::Modal(ModalOp::Necessity(g), Box::new(resolve_modal_grade(inner)))
+        }
+        Type::Modal(op, inner) => Type::Modal(op.clone(), Box::new(resolve_modal_grade(inner))),
+        Type::Fun(p, ann, r) => Type::Fun(Box::new(resolve_modal_grade(p)), ann.clone(), Box::new(resolve_modal_grade(r))),
+        Type::Ref(t) => Type::Ref(Box::new(resolve_modal_grade(t))),
+        Type::Ptr(t) => Type::Ptr(Box::new(resolve_modal_grade(t))),
+        _ => ty.clone(),
+    }
+}
+
 /// §18.4 生产率:自递归且返回 next(流)的定义,递归调用须在 delay(⃝)下(受保护)。
 /// 返回未受保护的自递归调用数。
 fn unguarded_self_calls(name: &Symbol, expr: &CoreExpr, under_delay: bool) -> usize {
@@ -1386,6 +1405,22 @@ impl TypeEnv {
 #[cfg(test)]
 mod ltl_tests {
     use super::*;
+
+    #[test]
+    fn test_resolve_modal_grade() {
+        // §11 □_r 不可推断的等级变量默认取 ω
+        let x = Type::Modal(
+            ModalOp::Necessity(Grade::Var(Symbol::new("r"))),
+            Box::new(Type::i64()),
+        );
+        let resolved = resolve_modal_grade(&x);
+        match resolved {
+            Type::Modal(ModalOp::Necessity(Grade::Omega), inner) => {
+                assert_eq!(*inner, Type::i64());
+            }
+            other => panic!("等级变量应默认 ω,实际 {:?}", other),
+        }
+    }
 
     #[test]
     fn test_temporal_type_schemes() {

@@ -1666,6 +1666,37 @@ impl Interpreter {
                     Err(EvalError { message: "set! 需整数地址".into() })
                 }
             }),
+            // §16 完整立方填充:2 维 Kan(hcomp-2d top bottom left right)
+            // 四条边共享四角,角一致则填充成功,不一致报错(镜像 hott.rs kan_fill_2d)
+            bi("hcomp-2d", |s, args| {
+                if args.len() != 4 {
+                    return Err(EvalError { message: "hcomp-2d 需 (top bottom left right) 4 条边".into() });
+                }
+                let mut corner = |edge: &Value, i: bool| -> Value {
+                    s.apply(edge.clone(), &[interval_endpoint(i)]).unwrap_or(Value::Unit)
+                };
+                let tl_t = corner(&args[0], false);
+                let tl_l = corner(&args[2], false);
+                if !values_eq(&tl_t, &tl_l) {
+                    return Err(EvalError { message: "Kan 填充边界不一致:左上角".into() });
+                }
+                let tr_t = corner(&args[0], true);
+                let tr_r = corner(&args[3], false);
+                if !values_eq(&tr_t, &tr_r) {
+                    return Err(EvalError { message: "Kan 填充边界不一致:右上角".into() });
+                }
+                let bl_b = corner(&args[1], false);
+                let bl_l = corner(&args[2], true);
+                if !values_eq(&bl_b, &bl_l) {
+                    return Err(EvalError { message: "Kan 填充边界不一致:左下角".into() });
+                }
+                let br_b = corner(&args[1], true);
+                let br_r = corner(&args[3], true);
+                if !values_eq(&br_b, &br_r) {
+                    return Err(EvalError { message: "Kan 填充边界不一致:右下角".into() });
+                }
+                Ok(Value::Data(Symbol::new("KanFill2D"), vec![tl_t]))
+            }),
         ];
         for (name, value) in builtins {
             self.define(name, value);
@@ -2054,11 +2085,21 @@ impl Interpreter {
                 if let CoreExprNode::SharpMod(inner) = &e.node {
                     return self.eval_expr(inner);
                 }
+                // §17 adjoint-triple:♭∘ʃ = unit η(flat 的 shape 返回单元嵌入)
+                if let CoreExprNode::ShapeMod(inner) = &e.node {
+                    let v = self.eval_expr(inner)?;
+                    return Ok(Value::Data(Symbol::new("UnitFlatShape"), vec![v]));
+                }
                 let v = self.eval_expr(e)?;
                 Ok(Value::Data(Symbol::new("Flat"), vec![v]))
             },
             CoreExprNode::SharpMod(e) => {
                 // §17 ♯ sharp:嵌入 codiscrete 空间(与直通可区分)
+                // §17 adjoint-triple:♯∘♭ = unit η'(sharp 的 flat 返回单元嵌入)
+                if let CoreExprNode::FlatMod(inner) = &e.node {
+                    let v = self.eval_expr(inner)?;
+                    return Ok(Value::Data(Symbol::new("UnitSharpFlat"), vec![v]));
+                }
                 let v = self.eval_expr(e)?;
                 Ok(Value::Data(Symbol::new("Sharp"), vec![v]))
             },
@@ -5524,6 +5565,52 @@ mod ski_tests {
             interp.run_program(&prog).unwrap().unwrap()
         }).unwrap().join().unwrap();
         assert_eq!(as_int(r2), 42, "ʃ∘♭ 应返回原值 42");
+    }
+
+    /// §17 Cohesive adjoint-triple 的 unit(♯∘♭、♭∘ʃ 为单元嵌入,非直通)
+    #[test]
+    fn test_cohesive_adjoint_unit() {
+        // ♯(♭(42)) = UnitSharpFlat(unit η')
+        let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (sharp (flat 42)))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        match r {
+            Value::Data(tag, fields) => {
+                assert_eq!(tag.as_str(), "UnitSharpFlat", "♯∘♭ 应为单元嵌入");
+                assert_eq!(as_int(fields[0].clone()), 42);
+            }
+            other => panic!("expected UnitSharpFlat, got {:?}", other),
+        }
+    }
+
+    /// §16 完整立方填充:2 维 Kan(hcomp-2d)边界一致性
+    #[test]
+    fn test_hcomp_2d() {
+        // 四条常量边 → 四角一致 → KanFill2D
+        let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (hcomp-2d (fn [i] 7) (fn [i] 7) (fn [i] 7) (fn [i] 7)))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        match r {
+            Value::Data(tag, fields) => {
+                assert_eq!(tag.as_str(), "KanFill2D", "hcomp-2d 应返回 KanFill2D");
+                assert_eq!(fields.len(), 1);
+            }
+            other => panic!("expected KanFill2D, got {:?}", other),
+        }
+        // 边界不一致(top(i0)≠left(i0))→ 报错
+        let r2 = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (hcomp-2d (fn [i] (if i 1 2)) (fn [i] 2) (fn [i] 2) (fn [i] 2)))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog)
+        }).unwrap().join().unwrap();
+        assert!(r2.is_err(), "边界不一致应报错");
     }
 
     #[test]

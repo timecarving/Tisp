@@ -31,13 +31,26 @@ impl RegionInfer {
         Ok(regions)
     }
     /// 判断表达式是否把 `RegionAlloc` 的分配地址作为最终值(逃逸)。
+    /// 完整数据流:跟踪 Let 绑定到 `RegionAlloc` 的地址名,若该名在尾位置返回则逃逸;
     /// Do/Let 追尾;if 两分支均逃逸才算逃逸。
     fn check_escape(&self, expr: &CoreExpr) -> bool {
+        let mut allocs = std::collections::HashSet::new();
+        self.escape_walk(expr, &mut allocs)
+    }
+
+    fn escape_walk(&self, expr: &CoreExpr, allocs: &mut std::collections::HashSet<Symbol>) -> bool {
         match &expr.node {
             CoreExprNode::RegionAlloc(_, _) => true,
-            CoreExprNode::Do(es) => es.last().map_or(false, |e| self.check_escape(e)),
-            CoreExprNode::Let(_, _, _, body) => self.check_escape(body),
-            CoreExprNode::If(_, t, e) => self.check_escape(t) && self.check_escape(e),
+            CoreExprNode::Var(name) => allocs.contains(name),
+            CoreExprNode::Do(es) => es.last().map_or(false, |e| self.escape_walk(e, allocs)),
+            CoreExprNode::Let(name, _, value, body) => {
+                // 绑定到 RegionAlloc 的地址名标记为已分配(数据流逃逸跟踪)
+                if matches!(&value.node, CoreExprNode::RegionAlloc(_, _)) {
+                    allocs.insert(name.clone());
+                }
+                self.escape_walk(body, allocs)
+            }
+            CoreExprNode::If(_, t, e) => self.escape_walk(t, allocs) && self.escape_walk(e, allocs),
             _ => false,
         }
     }
@@ -128,5 +141,22 @@ mod tests {
         let body = e(CoreExprNode::Lit(Literal::I64(42)));
         let mut inf = RegionInfer::new();
         assert!(inf.infer_def(&def_with_body(body)).is_ok());
+    }
+
+    #[test]
+    fn test_region_escape_via_let_binding() {
+        // 数据流逃逸:(let [r (region-alloc ...)] r) → 分配的地址经 let 绑定返回 → 逃逸
+        let body = e(CoreExprNode::Let(
+            Symbol::new("r"),
+            None,
+            Box::new(e(CoreExprNode::RegionAlloc(
+                Box::new(e(CoreExprNode::Lit(Literal::Unit))),
+                Box::new(e(CoreExprNode::Lit(Literal::I64(42)))),
+            ))),
+            Box::new(e(CoreExprNode::Var(Symbol::new("r")))),
+        ));
+        let mut inf = RegionInfer::new();
+        let r = inf.infer_def(&def_with_body(body));
+        assert!(r.is_err(), "let 绑定的分配地址返回应报逃逸");
     }
 }

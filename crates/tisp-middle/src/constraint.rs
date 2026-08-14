@@ -52,9 +52,12 @@ impl ConstraintGraph {
         Self { constraints: Vec::new() }
     }
 
-    /// 记录一条约束/冲突(带维度与 span)
+    /// 记录一条约束/冲突(带维度与 span);同维度同消息去重(fixpoint 迭代不重复累积)
     pub fn record(&mut self, dimension: Dimension, name: Option<Symbol>, message: impl Into<String>, span: Span) {
-        self.constraints.push(Constraint { dimension, name, message: message.into(), span });
+        let message = message.into();
+        if !self.constraints.iter().any(|c| c.dimension == dimension && c.message == message) {
+            self.constraints.push(Constraint { dimension, name, message, span });
+        }
     }
 
     pub fn constraints(&self) -> &[Constraint] {
