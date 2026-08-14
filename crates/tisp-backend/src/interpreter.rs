@@ -1713,6 +1713,241 @@ impl Interpreter {
                     Err(EvalError { message: "N 维立方边界不一致(角不一致)".into() })
                 }
             }),
+            // §31 12 逻辑范式全链路:概率/归纳/模糊/可废止(接线 paradigms.rs 真实求解器)
+            // (plp-marginal query facts):facts 为 [atom prob atom prob ...]
+            bi("plp-marginal", |_s, args| {
+                use tisp_core::evolp::LTerm;
+                use tisp_runtime::paradigms::{marginal, ProbFact};
+                if args.len() != 2 {
+                    return Err(EvalError { message: "plp-marginal 需 (query facts) 2 参".into() });
+                }
+                let query = match &args[0] {
+                    Value::Int(n) => LTerm::atom(&n.to_string()),
+                    _ => return Err(EvalError { message: "plp-marginal:query 应为整数原子".into() }),
+                };
+                let items = list_to_vec(&args[1]);
+                if items.len() % 2 != 0 {
+                    return Err(EvalError { message: "plp-marginal:facts 长度须为偶数".into() });
+                }
+                let mut facts = Vec::new();
+                for pair in items.chunks(2) {
+                    let atom = match &pair[0] {
+                        Value::Int(n) => LTerm::atom(&n.to_string()),
+                        _ => return Err(EvalError { message: "plp-marginal:事实原子应为整数".into() }),
+                    };
+                    let prob = match &pair[1] {
+                        Value::Float(f) => *f,
+                        Value::Int(n) => *n as f64,
+                        _ => return Err(EvalError { message: "plp-marginal:概率应为浮点".into() }),
+                    };
+                    facts.push(ProbFact { atom, prob });
+                }
+                Ok(Value::Float(marginal(&query, &facts)))
+            }),
+            // (ilp-induce pos neg):归纳假设
+            bi("ilp-induce", |_s, args| {
+                use tisp_core::evolp::LTerm;
+                use tisp_runtime::paradigms::induce;
+                if args.len() != 2 {
+                    return Err(EvalError { message: "ilp-induce 需 (pos neg) 2 参".into() });
+                }
+                let pos: Vec<LTerm> = value_to_int_list(&args[0])?.into_iter().map(|n| LTerm::atom(&n.to_string())).collect();
+                let neg: Vec<LTerm> = value_to_int_list(&args[1])?.into_iter().map(|n| LTerm::atom(&n.to_string())).collect();
+                let result = induce(&pos, &neg);
+                let atoms: im::Vector<Value> = result.iter().filter_map(|t| match t {
+                    LTerm::Fun(n, _) => n.as_str().parse::<i64>().ok().map(Value::Int),
+                    _ => None,
+                }).collect();
+                Ok(Value::Vector(atoms))
+            }),
+            // (fuzzy-eval facts atoms):真值度 min 组合
+            bi("fuzzy-eval", |_s, args| {
+                use tisp_core::evolp::LTerm;
+                use tisp_runtime::paradigms::{fuzzy_and, FuzzyFact};
+                if args.len() != 2 {
+                    return Err(EvalError { message: "fuzzy-eval 需 (facts atoms) 2 参".into() });
+                }
+                let items = list_to_vec(&args[0]);
+                if items.len() % 2 != 0 {
+                    return Err(EvalError { message: "fuzzy-eval:facts 长度须为偶数".into() });
+                }
+                let mut facts = Vec::new();
+                for pair in items.chunks(2) {
+                    let atom = match &pair[0] {
+                        Value::Int(n) => LTerm::atom(&n.to_string()),
+                        _ => return Err(EvalError { message: "fuzzy-eval:事实原子应为整数".into() }),
+                    };
+                    let degree = match &pair[1] {
+                        Value::Float(f) => *f,
+                        Value::Int(n) => *n as f64,
+                        _ => return Err(EvalError { message: "fuzzy-eval:真值度应为浮点".into() }),
+                    };
+                    facts.push(FuzzyFact { atom, degree });
+                }
+                let atoms: Vec<LTerm> = value_to_int_list(&args[1])?.into_iter().map(|n| LTerm::atom(&n.to_string())).collect();
+                Ok(Value::Float(fuzzy_and(&facts, &atoms)))
+            }),
+            // (defeasible-settle rules):优先级裁决,rules 为 [head prio neg ...] 三元组
+            bi("defeasible-settle", |_s, args| {
+                use tisp_core::evolp::LTerm;
+                use tisp_runtime::paradigms::{settle, DefRule};
+                if args.len() != 1 {
+                    return Err(EvalError { message: "defeasible-settle 需 (rules) 1 参".into() });
+                }
+                let items = list_to_vec(&args[0]);
+                if items.len() % 3 != 0 {
+                    return Err(EvalError { message: "defeasible-settle:rules 长度须为 3 的倍数".into() });
+                }
+                let mut rules = Vec::new();
+                for triple in items.chunks(3) {
+                    let head = match &triple[0] {
+                        Value::Int(n) => LTerm::atom(&n.to_string()),
+                        _ => return Err(EvalError { message: "defeasible-settle:head 应为整数".into() }),
+                    };
+                    let priority = match &triple[1] {
+                        Value::Int(n) => *n as u32,
+                        _ => return Err(EvalError { message: "defeasible-settle:priority 应为整数".into() }),
+                    };
+                    let negated = match &triple[2] {
+                        Value::Bool(b) => *b,
+                        Value::Int(n) => *n != 0,
+                        _ => false,
+                    };
+                    rules.push(DefRule { head, priority, negated });
+                }
+                let result = settle(&rules);
+                let atoms: im::Vector<Value> = result.iter().filter_map(|t| match t {
+                    LTerm::Fun(n, _) => n.as_str().parse::<i64>().ok().map(Value::Int),
+                    _ => None,
+                }).collect();
+                Ok(Value::Vector(atoms))
+            }),
+            // §31 时序/情境/模态(接线真实求解器)
+            // (temporal-eventually facts atom):facts 为 [t1 a1 t2 a2 ...] (时刻, 原子) 对
+            bi("temporal-eventually", |_s, args| {
+                use tisp_core::evolp::LTerm;
+                use tisp_runtime::paradigms::TemporalKb;
+                if args.len() != 2 {
+                    return Err(EvalError { message: "temporal-eventually 需 (facts atom) 2 参".into() });
+                }
+                let items = list_to_vec(&args[0]);
+                let mut facts = Vec::new();
+                for pair in items.chunks(2) {
+                    let t = match &pair[0] { Value::Int(n) => *n as usize, _ => 0 };
+                    let atom = match &pair[1] { Value::Int(n) => LTerm::atom(&n.to_string()), _ => LTerm::atom("0") };
+                    facts.push((t, atom));
+                }
+                let query = match &args[1] { Value::Int(n) => LTerm::atom(&n.to_string()), _ => LTerm::atom("0") };
+                let kb = TemporalKb { facts };
+                Ok(Value::Bool(kb.eventually(&query)))
+            }),
+            // (modal-possible reach truths world atom):reach [from to ...],truths [world atom ...]
+            bi("modal-possible", |_s, args| {
+                use tisp_core::evolp::LTerm;
+                use tisp_core::symbol::Symbol;
+                use tisp_runtime::paradigms::ModalKb;
+                if args.len() != 4 {
+                    return Err(EvalError { message: "modal-possible 需 (reach truths world atom) 4 参".into() });
+                }
+                let reach_items = list_to_vec(&args[0]);
+                let mut reach = Vec::new();
+                for pair in reach_items.chunks(2) {
+                    let from = Symbol::new(&match &pair[0] { Value::Int(n) => n.to_string(), _ => "0".to_string() });
+                    let to = Symbol::new(&match &pair[1] { Value::Int(n) => n.to_string(), _ => "0".to_string() });
+                    reach.push((from, to));
+                }
+                let truth_items = list_to_vec(&args[1]);
+                let mut truths = std::collections::HashMap::new();
+                for pair in truth_items.chunks(2) {
+                    let world = Symbol::new(&match &pair[0] { Value::Int(n) => n.to_string(), _ => "0".to_string() });
+                    let atom = match &pair[1] { Value::Int(n) => LTerm::atom(&n.to_string()), _ => LTerm::atom("0") };
+                    truths.insert((world, atom), true);
+                }
+                let world = Symbol::new(&match &args[2] { Value::Int(n) => n.to_string(), _ => "0".to_string() });
+                let atom = match &args[3] { Value::Int(n) => LTerm::atom(&n.to_string()), _ => LTerm::atom("0") };
+                let kb = ModalKb { reach, truths };
+                Ok(Value::Bool(kb.possible(&world, &atom)))
+            }),
+            // (context-query contexts rules ctx atom):情境继承,contexts 为 [name parent ...] 对(parent=0 表示无父情境)
+            bi("context-query", |_s, args| {
+                use std::collections::HashMap;
+                use tisp_core::evolp::LTerm;
+                use tisp_core::symbol::Symbol;
+                use tisp_runtime::paradigms::{Context, ContextKb};
+                if args.len() != 4 {
+                    return Err(EvalError { message: "context-query 需 (contexts rules ctx atom) 4 参".into() });
+                }
+                let mut kb = ContextKb { contexts: HashMap::new() };
+                let ctx_items = list_to_vec(&args[0]);
+                for pair in ctx_items.chunks(2) {
+                    let name = Symbol::new(&match &pair[0] { Value::Int(n) => n.to_string(), _ => "0".to_string() });
+                    let parent = match &pair[1] {
+                        Value::Int(n) if *n != 0 => Some(Symbol::new(&n.to_string())),
+                        _ => None,
+                    };
+                    kb.contexts.insert(name.clone(), Context { name, parent, rules: im::HashSet::new() });
+                }
+                let rule_items = list_to_vec(&args[1]);
+                for pair in rule_items.chunks(2) {
+                    let ctx = Symbol::new(&match &pair[0] { Value::Int(n) => n.to_string(), _ => "0".to_string() });
+                    let atom = match &pair[1] { Value::Int(n) => LTerm::atom(&n.to_string()), _ => LTerm::atom("0") };
+                    if let Some(c) = kb.contexts.get_mut(&ctx) {
+                        c.rules.insert(atom);
+                    }
+                }
+                let ctx = Symbol::new(&match &args[2] { Value::Int(n) => n.to_string(), _ => "0".to_string() });
+                let atom = match &args[3] { Value::Int(n) => LTerm::atom(&n.to_string()), _ => LTerm::atom("0") };
+                Ok(Value::Bool(kb.query(&ctx, &atom)))
+            }),
+            // (higher-order-call pred-id arg):谓词作为值经 call 调用,0=正 1=非负 2=偶 3=非零
+            bi("higher-order-call", |_s, args| {
+                use tisp_runtime::paradigms::call;
+                if args.len() != 2 {
+                    return Err(EvalError { message: "higher-order-call 需 (pred-id arg) 2 参".into() });
+                }
+                let pred_id = match &args[0] { Value::Int(n) => *n, _ => 0 };
+                let arg = match &args[1] { Value::Int(n) => *n, _ => 0 };
+                let p: fn(&i64) -> bool = match pred_id {
+                    0 => |x| *x > 0,
+                    1 => |x| *x >= 0,
+                    2 => |x| x % 2 == 0,
+                    _ => |x| *x != 0,
+                };
+                Ok(Value::Bool(call(p, &arg)))
+            }),
+            // (typed-pred pred-id xs):一体化基底——静态类型谓词过滤列表,0=正 1=非负 2=偶 3=非零
+            bi("typed-pred", |_s, args| {
+                use tisp_runtime::paradigms::filter_by;
+                if args.len() != 2 {
+                    return Err(EvalError { message: "typed-pred 需 (pred-id xs) 2 参".into() });
+                }
+                let pred_id = match &args[0] { Value::Int(n) => *n, _ => 0 };
+                let xs = value_to_int_list(&args[1])?;
+                let p: fn(&i64) -> bool = match pred_id {
+                    0 => |x| *x > 0,
+                    1 => |x| *x >= 0,
+                    2 => |x| x % 2 == 0,
+                    _ => |x| *x != 0,
+                };
+                let filtered: Vec<&i64> = filter_by(p, &xs);
+                let out: im::Vector<Value> = filtered.iter().map(|&&x| Value::Int(x)).collect();
+                Ok(Value::Vector(out))
+            }),
+            // (reactive-eval rule-id sig):从信号派生,0=×2 1=+1 2=平方
+            bi("reactive-eval", |_s, args| {
+                use tisp_runtime::paradigms::{ReactiveRule, Signal};
+                if args.len() != 2 {
+                    return Err(EvalError { message: "reactive-eval 需 (rule-id sig) 2 参".into() });
+                }
+                let rule_id = match &args[0] { Value::Int(n) => *n, _ => 0 };
+                let sig = match &args[1] { Value::Int(n) => *n, _ => 0 };
+                let rule: ReactiveRule<i64, i64> = match rule_id {
+                    0 => ReactiveRule { derive: |x| x * 2 },
+                    1 => ReactiveRule { derive: |x| x + 1 },
+                    _ => ReactiveRule { derive: |x| x * x },
+                };
+                Ok(Value::Int(rule.eval(&Signal { value: sig })))
+            }),
         ];
         for (name, value) in builtins {
             self.define(name, value);
@@ -3373,6 +3608,11 @@ fn list_to_vec(val: &Value) -> Vec<Value> {
             Value::Data(c, fields) if c.as_str() == "Cons" && !fields.is_empty() => {
                 items.push(fields[0].clone());
                 if fields.len() >= 2 { cur = fields[1].clone(); continue; }
+            }
+            // 源码 [..] 字面量 → Vec 数据构造器:同样视为元素序列
+            Value::Data(c, fields) if c.as_str() == "Vec" => {
+                items.extend(fields.iter().cloned());
+                break;
             }
             // §4 持久化 Vector:视为元素序列
             Value::Vector(v) => {
@@ -5986,5 +6226,86 @@ mod persistent_tests {
         let bad = vec![int(7), int(7), int(7), int(7), int(7), int(7), int(7), int(8)];
         let r2 = interp.eval_expr(&app("hcomp-nd", vec![app("vector", bad)]));
         assert!(r2.is_err(), "角不一致应报错");
+    }
+
+    /// §31 12 逻辑范式全链路:概率/归纳/模糊/可废止(接线真实求解器)
+    #[test]
+    fn test_logic_paradigms_numeric() {
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        let float = |x: f64| CoreExpr::new(CoreExprNode::Lit(Literal::F64(x)), Span::dummy());
+        // plp-marginal:事实 heads=0.3,查询 heads → 0.3
+        let facts = vec![int(1), float(0.3)];
+        let r = interp.eval_expr(&app("plp-marginal", vec![int(1), app("vector", facts)])).unwrap();
+        assert_eq!(r, Value::Float(0.3), "plp-marginal 应返回 0.3");
+        // ilp-induce:正例 [1 2],负例 [2] → 假设 [1]
+        let r = interp.eval_expr(&app("ilp-induce", vec![app("vector", vec![int(1), int(2)]), app("vector", vec![int(2)])])).unwrap();
+        match r {
+            Value::Vector(v) => {
+                let xs: Vec<i64> = v.iter().filter_map(|x| if let Value::Int(n) = x { Some(*n) } else { None }).collect();
+                assert_eq!(xs, vec![1], "ilp-induce 应归纳出 [1]");
+            }
+            other => panic!("expected Vector, got {:?}", other),
+        }
+        // fuzzy-eval:事实 A=0.7 B=0.5,查询 [A B] → min=0.5
+        let facts = vec![int(1), float(0.7), int(2), float(0.5)];
+        let r = interp.eval_expr(&app("fuzzy-eval", vec![app("vector", facts), app("vector", vec![int(1), int(2)])])).unwrap();
+        assert_eq!(r, Value::Float(0.5), "fuzzy-eval 应返回 min 0.5");
+        // defeasible-settle:规则 a 优先级 1 正、a 优先级 2 否定 → a 被击败
+        let rules = vec![int(1), int(1), int(0), int(1), int(2), int(1)];
+        let r = interp.eval_expr(&app("defeasible-settle", vec![app("vector", rules)])).unwrap();
+        match r {
+            Value::Vector(v) => {
+                let xs: Vec<i64> = v.iter().filter_map(|x| if let Value::Int(n) = x { Some(*n) } else { None }).collect();
+                assert!(xs.is_empty(), "a 被更高优先级否定规则击败,应无结论");
+            }
+            other => panic!("expected Vector, got {:?}", other),
+        }
+    }
+
+    /// §31 12 逻辑范式端到端(源码 → typecheck → run):全链路可用
+    #[test]
+    fn test_logic_paradigms_full_chain_source() {
+        fn ints(v: &Value) -> Vec<i64> {
+            match v {
+                Value::Vector(v) => v.iter().filter_map(|x| if let Value::Int(n) = x { Some(*n) } else { None }).collect(),
+                Value::Data(c, fs) if c.as_str() == "Vec" => fs.iter().filter_map(|x| if let Value::Int(n) = x { Some(*n) } else { None }).collect(),
+                _ => panic!("expected list value, got {:?}", v),
+            }
+        }
+        fn run(src: &str) -> Value {
+            use tisp_frontend::desugar::Desugarer;
+            use tisp_frontend::reader::read;
+            let forms = read(src).unwrap();
+            let prog = Desugarer::new().desugar_program(forms).unwrap();
+            let mut ti = tisp_middle::type_infer::TypeInfer::new();
+            ti.infer_program(&prog).expect("类型检查应通过");
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }
+        // 1 高阶:higher-order-call 谓词 0(正)应用于 3 → true
+        assert_eq!(run("(defn main [] (higher-order-call 0 3))"), Value::Bool(true), "高阶谓词调用应成立");
+        // 2 归纳:ilp-induce 正 [1 2] 负 [2] → [1]
+        assert_eq!(ints(&run("(defn main [] (ilp-induce [1 2] [2]))")), vec![1], "归纳应得到 [1]");
+        // 3 概率:plp-marginal 查询 1,事实 [1 0.3] → 0.3
+        assert_eq!(run("(defn main [] (plp-marginal 1 [1 0.3]))"), Value::Float(0.3), "边际概率应 0.3");
+        // 4 时序:temporal-eventually [0 1 1 2] 查询 2 → true
+        assert_eq!(run("(defn main [] (temporal-eventually [0 1 1 2] 2))"), Value::Bool(true), "eventually 应成立");
+        // 5 描述:subsume [1 2] 概念 1 查询 2 → true
+        assert_eq!(run("(defn main [] (subsume [1 2] 1 2))"), Value::Bool(true), "概念包含应成立");
+        // 6 可废止:defeasible-settle [1 1 0 1 2 1] → 空(被更高优先级否定击败)
+        assert!(ints(&run("(defn main [] (defeasible-settle [1 1 0 1 2 1]))")).is_empty(), "应被击败无结论");
+        // 7 模糊:fuzzy-eval [1 0.7 2 0.5] 查询 [1 2] → 0.5
+        assert_eq!(run("(defn main [] (fuzzy-eval [1 0.7 2 0.5] [1 2]))"), Value::Float(0.5), "模糊合取应 0.5");
+        // 8 表格化:tabling 事实 [2] 规则 [1 2] 目标 1 → true
+        assert_eq!(run("(defn main [] (tabling [2] [1 2] 1))"), Value::Bool(true), "表格化应证明成功");
+        // 9 一体化基底:typed-pred 谓词 0(正)过滤 [1 -2 3] → [1 3]
+        assert_eq!(ints(&run("(defn main [] (typed-pred 0 [1 -2 3]))")), vec![1, 3], "类型谓词过滤应得 [1 3]");
+        // 10 响应式:reactive-eval 规则 0(×2)信号 21 → 42
+        assert_eq!(run("(defn main [] (reactive-eval 0 21))"), Value::Int(42), "响应式派生应 42");
+        // 11 情境:context-query 情境 [1 0 2 1] 规则 [1 5] 查询 (2,5) → true(子继承父)
+        assert_eq!(run("(defn main [] (context-query [1 0 2 1] [1 5] 2 5))"), Value::Bool(true), "情境继承应成立");
+        // 12 模态:modal-possible 可达 [1 2] 真值 [2 7] 查询 (1,7) → true
+        assert_eq!(run("(defn main [] (modal-possible [1 2] [2 7] 1 7))"), Value::Bool(true), "可能世界应成立");
     }
 }

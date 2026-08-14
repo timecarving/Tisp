@@ -445,6 +445,33 @@ impl TypeInfer {
         m("pf-dispatch", Type::fun(i64t.clone(), st.clone()));
         m("pf-stream-take", Type::fun(i64t.clone(), li.clone()));
         m("pf-aop-weave", Type::fun(i64t.clone(), i64t.clone()));
+        // §31 12 逻辑范式真实内置(接线 paradigms.rs 求解器,替换 pf-* 简化投影)
+        // 描述:subsume:(subsumes li, concept i64, query i64) → bool
+        m("subsume", Type::fun(li.clone(), Type::fun(i64t.clone(), Type::fun(i64t.clone(), bt.clone()))));
+        // 表格化:tabling:(facts li, rules li, goal i64) → bool
+        m("tabling", Type::fun(li.clone(), Type::fun(li.clone(), Type::fun(i64t.clone(), bt.clone()))));
+        // 概率:plp-marginal:(query i64, facts li) → f64
+        m("plp-marginal", Type::fun(i64t.clone(), Type::fun(li.clone(), f64t.clone())));
+        // 归纳:ilp-induce:(pos li, neg li) → li
+        m("ilp-induce", Type::fun(li.clone(), Type::fun(li.clone(), li.clone())));
+        // 模糊:fuzzy-eval:(facts li, atoms li) → f64
+        m("fuzzy-eval", Type::fun(li.clone(), Type::fun(li.clone(), f64t.clone())));
+        // 可废止:defeasible-settle:(rules li) → li
+        m("defeasible-settle", Type::fun(li.clone(), li.clone()));
+        // 时序:temporal-eventually:(facts li, atom i64) → bool
+        m("temporal-eventually", Type::fun(li.clone(), Type::fun(i64t.clone(), bt.clone())));
+        // 情境:context-query:(contexts li, rules li, ctx i64, atom i64) → bool
+        m("context-query", Type::fun(li.clone(), Type::fun(li.clone(),
+            Type::fun(i64t.clone(), Type::fun(i64t.clone(), bt.clone())))));
+        // 模态:modal-possible:(reach li, truths li, world i64, atom i64) → bool
+        m("modal-possible", Type::fun(li.clone(), Type::fun(li.clone(),
+            Type::fun(i64t.clone(), Type::fun(i64t.clone(), bt.clone())))));
+        // 高阶:higher-order-call:(pred-id i64, arg i64) → bool
+        m("higher-order-call", Type::fun(i64t.clone(), Type::fun(i64t.clone(), bt.clone())));
+        // 一体化基底:typed-pred:(pred-id i64, xs li) → li
+        m("typed-pred", Type::fun(i64t.clone(), Type::fun(li.clone(), li.clone())));
+        // 响应式:reactive-eval:(rule-id i64, sig i64) → i64
+        m("reactive-eval", Type::fun(i64t.clone(), Type::fun(i64t.clone(), i64t.clone())));
         // §统一内存管理:ref/deref/set! 为 State 效应操作,Ref a 分级值
         let ref_i64 = Type::Ref(Box::new(i64t.clone()));
         m("ref", Type::fun(i64t.clone(), ref_i64.clone()));

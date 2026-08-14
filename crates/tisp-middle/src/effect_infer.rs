@@ -289,12 +289,22 @@ impl EffectEnv {
             ],
         });
 
-        // Search:choose(§21 回溯)
+        // Search:choose(§21 回溯)+ ilp-induce(§31 归纳搜索)
         env.register_effect(EffectDecl {
             name: Symbol::new("Search"),
             type_params: Vec::new(),
             operations: vec![
                 OperationDecl { name: Symbol::new("choose"), params: vec![Type::i64()], return_type: Type::i64() },
+                OperationDecl { name: Symbol::new("ilp-induce"), params: vec![Type::list(Type::i64()), Type::list(Type::i64())], return_type: Type::list(Type::i64()) },
+            ],
+        });
+
+        // Signal:reactive-eval(§31 响应式信号派生)
+        env.register_effect(EffectDecl {
+            name: Symbol::new("Signal"),
+            type_params: Vec::new(),
+            operations: vec![
+                OperationDecl { name: Symbol::new("reactive-eval"), params: vec![Type::i64(), Type::i64()], return_type: Type::i64() },
             ],
         });
 

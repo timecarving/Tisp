@@ -9,6 +9,13 @@
 
 ### 新增
 
+**12 逻辑范式全链路(logic-paradigms-full-chain)**
+- 12 类 LP 范式全部接线真实求解器(tisp-runtime/paradigms.rs),替换 `pf-*` 简化投影:高阶 `higher-order-call`(谓词一等值 + `call`)、归纳 `ilp-induce`(`induce`)、概率 `plp-marginal`(`marginal` 精确枚举)、时序 `temporal-eventually`(`TemporalKb`)、描述逻辑 `subsume`(`Ontology::is_instance`)、可废止 `defeasible-settle`(`settle` 优先级裁决)、模糊 `fuzzy-eval`(`fuzzy_and` min)、表格化 `tabling`(`Tabler` 左递归终止)、一体化基底 `typed-pred`(`filter_by` 静态谓词过滤)、响应式 `reactive-eval`(`ReactiveRule` 信号派生)、情境 `context-query`(`ContextKb::query` 继承链)、模态 `modal-possible`(`ModalKb::possible` 可达世界)
+- type_infer 补 12 范式单态签名(`subsume`/`tabling`/`plp-marginal`/`ilp-induce`/`fuzzy-eval`/`defeasible-settle`/`temporal-eventually`/`context-query`/`modal-possible`/`higher-order-call`/`typed-pred`/`reactive-eval`)
+- effect_infer 效应门控:Search 注册 `ilp-induce`、Signal 注册 `reactive-eval`
+- `list_to_vec` 支持源码 `[..]` Vec 字面量,12 范式源码端到端(源码 → typecheck → run)全链路可用
+- 新增端到端测试 `test_logic_paradigms_numeric` + `test_logic_paradigms_full_chain_source`,总计 351 个单元测试
+
 **最终残余收尾(complete-final-residuals)**
 - §17 态射级自然性:一阶态射 `Morphism<A,B>` + counit/unit 自然变换方块(♭(f)∘η = η∘f)→ ✅
 - §26 跨区域/全局别名:region_infer 数据结构嵌入(Data)/match 分支别名逃逸 → ✅
