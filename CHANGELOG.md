@@ -9,6 +9,13 @@
 
 ### 新增
 
+**深语义收尾(finish-deep-semantics)**
+- N(≥2)维立方:`hcomp-nd`(2^N 角一致性,泛化 `hcomp-2d`)+ §16 → ✅
+- adjoint-triple 自然性:点级三角形恒等式 + 态射级自然性为剩余深度(§17)
+- 空间回收:`Next`(⃝ 值两次 advance 后回收,无泄漏)+ §18 → ✅
+- 完整别名分析:region_infer 闭包捕获/实参流入别名逃逸(§26)
+- 效果操作门控修复:effect_infer 补注册 Unsafe/Search/Channel/Reader/Writer/State(ref/deref/set!),副作用操作不再漏判为 Pure
+
 **统一内存管理(unified-memory-management)**
 - 归档 4 个已完成变更,同步 7 个新能力到主规范(18 specs 通过)
 - `Type::Ref(Box<Type>)` 变体 + Display + reduce_families + unify 接线

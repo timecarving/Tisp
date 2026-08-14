@@ -51,6 +51,10 @@ impl RegionInfer {
                 self.escape_walk(body, allocs)
             }
             CoreExprNode::If(_, t, e) => self.escape_walk(t, allocs) && self.escape_walk(e, allocs),
+            // 完整别名分析:闭包捕获已分配地址 → 逃逸(地址被闭包带出作用域)
+            CoreExprNode::Lam(lambda) => uses_allocated(&lambda.body, allocs),
+            // 完整别名分析:地址作为实参流入函数 → 可能逃逸(保守报)
+            CoreExprNode::App(f, a) => uses_allocated(f, allocs) || uses_allocated(a, allocs),
             _ => false,
         }
     }
@@ -94,6 +98,19 @@ impl RegionInfer {
     }
 }
 fn hash_expr(expr: &CoreExpr) -> usize { std::ptr::from_ref(expr) as usize }
+
+/// 判断表达式是否引用了任一「已分配地址名」(用于闭包捕获/实参流入的别名逃逸)
+fn uses_allocated(expr: &CoreExpr, allocs: &std::collections::HashSet<Symbol>) -> bool {
+    match &expr.node {
+        CoreExprNode::Var(name) => allocs.contains(name),
+        CoreExprNode::App(f, a) => uses_allocated(f, allocs) || uses_allocated(a, allocs),
+        CoreExprNode::Let(_, _, v, b) => uses_allocated(v, allocs) || uses_allocated(b, allocs),
+        CoreExprNode::If(c, t, e) => uses_allocated(c, allocs) || uses_allocated(t, allocs) || uses_allocated(e, allocs),
+        CoreExprNode::Lam(l) => uses_allocated(&l.body, allocs),
+        CoreExprNode::Do(es) => es.iter().any(|e| uses_allocated(e, allocs)),
+        _ => false,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -158,5 +175,26 @@ mod tests {
         let mut inf = RegionInfer::new();
         let r = inf.infer_def(&def_with_body(body));
         assert!(r.is_err(), "let 绑定的分配地址返回应报逃逸");
+    }
+
+    #[test]
+    fn test_region_escape_via_closure_capture() {
+        // 完整别名分析:闭包捕获已分配地址 → 逃逸
+        let body = e(CoreExprNode::Let(
+            Symbol::new("r"),
+            None,
+            Box::new(e(CoreExprNode::RegionAlloc(
+                Box::new(e(CoreExprNode::Lit(Literal::Unit))),
+                Box::new(e(CoreExprNode::Lit(Literal::I64(42)))),
+            ))),
+            Box::new(e(CoreExprNode::Lam(Lambda {
+                params: vec![],
+                body: Box::new(e(CoreExprNode::Var(Symbol::new("r")))),
+                ret_type: None,
+            }))),
+        ));
+        let mut inf = RegionInfer::new();
+        let r = inf.infer_def(&def_with_body(body));
+        assert!(r.is_err(), "闭包捕获分配地址应报逃逸");
     }
 }

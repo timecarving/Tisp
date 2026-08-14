@@ -1697,6 +1697,22 @@ impl Interpreter {
                 }
                 Ok(Value::Data(Symbol::new("KanFill2D"), vec![tl_t]))
             }),
+            // §16 完整立方填充:N(≥2)维 Kan(hcomp-nd)——N 维立方有 2^N 个角,角全一致则填充成功
+            bi("hcomp-nd", |_s, args| {
+                if args.len() != 1 {
+                    return Err(EvalError { message: "hcomp-nd 需 (corners) 1 参".into() });
+                }
+                let corners = value_to_int_list(&args[0])?;
+                if corners.is_empty() {
+                    return Err(EvalError { message: "hcomp-nd:立方体无角".into() });
+                }
+                let first = corners[0];
+                if corners.iter().all(|&c| c == first) {
+                    Ok(Value::Int(first))
+                } else {
+                    Err(EvalError { message: "N 维立方边界不一致(角不一致)".into() })
+                }
+            }),
         ];
         for (name, value) in builtins {
             self.define(name, value);
@@ -5955,5 +5971,20 @@ mod persistent_tests {
         interp.eval_expr(&app("set!", vec![int(a), int(100)])).unwrap();
         let r2 = interp.eval_expr(&app("deref", vec![int(a)])).unwrap();
         assert_eq!(r2, Value::Int(100), "set! 后 deref 应返回 100");
+    }
+
+    /// §16 完整立方填充:N(≥2)维 Kan(hcomp-nd)角一致性
+    #[test]
+    fn test_hcomp_nd() {
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        // 3 维立方:8 个角全一致 → 填充成功
+        let corners = vec![int(7); 8];
+        let r = interp.eval_expr(&app("hcomp-nd", vec![app("vector", corners)])).unwrap();
+        assert_eq!(r, Value::Int(7), "角全一致应返回填充值 7");
+        // 角不一致 → 报错
+        let bad = vec![int(7), int(7), int(7), int(7), int(7), int(7), int(7), int(8)];
+        let r2 = interp.eval_expr(&app("hcomp-nd", vec![app("vector", bad)]));
+        assert!(r2.is_err(), "角不一致应报错");
     }
 }

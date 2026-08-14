@@ -45,7 +45,7 @@ crates/
 
 ```bash
 cargo build --release            # 构建
-cargo test --workspace           # 319 个测试
+cargo test --workspace           # 346 个测试
 ```
 
 ### 运行

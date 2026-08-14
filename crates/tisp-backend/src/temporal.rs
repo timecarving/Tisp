@@ -63,6 +63,35 @@ impl<T: Clone + std::fmt::Debug> std::fmt::Debug for Stream<T> {
     }
 }
 
+/// §18 空间回收:⃝(next)值在两时刻(两次 advance)后回收,无空间泄漏。
+/// `delay v` 创建 next 值;`advance` 推进一个时刻;第二次 advance 后值被回收
+/// (内存清空,后续访问返回 None)。
+#[derive(Debug, Clone)]
+pub struct Next<T: Clone> {
+    value: Option<T>,
+    ticks: u64,
+}
+
+impl<T: Clone> Next<T> {
+    pub fn delay(v: T) -> Self {
+        Next { value: Some(v), ticks: 0 }
+    }
+
+    /// 推进一个时刻;两次 advance 后回收值(返回 None,无空间泄漏)
+    pub fn advance(&mut self) -> Option<T> {
+        if self.value.is_none() {
+            return None; // 已回收
+        }
+        self.ticks += 1;
+        if self.ticks >= 2 {
+            // 两时刻后回收:取出并清空,归还内存
+            self.value.take()
+        } else {
+            self.value.clone()
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Clock {
     pub name: String,
@@ -89,5 +118,17 @@ mod tests {
     fn test_fold() {
         let s = Stream::unfold(1, |n| n + 1);
         assert_eq!(s.fold(5, 0, |a, n| a + n), 15);
+    }
+
+    /// §18 空间回收:⃝ 值两次 advance 后回收(无泄漏)
+    #[test]
+    fn test_next_recycled_after_two_advances() {
+        let mut n = Next::delay(42);
+        // 第一次 advance:仍可用
+        assert_eq!(n.advance(), Some(42));
+        // 第二次 advance:回收值(取出并清空)
+        assert_eq!(n.advance(), Some(42));
+        // 第三次 advance:已回收,返回 None
+        assert_eq!(n.advance(), None);
     }
 }
