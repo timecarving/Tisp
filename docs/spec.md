@@ -545,7 +545,7 @@ Every binding has a **multiplicity**: `0`, `1`, or `ω`.
 
 等级可为**编译期数值表达式**:数字 `(5 x : a)` → Nat(5)、符号 `(n x : a)` → Var(n)(绑定自类型参数,如 `(Vec i64 n)` 的 n)、复合 `((+ n 1) x : a)` → Add。检查语义为**使用计数 ≤ 等级**(上界,参考 Idris 2);数字等级常量折叠检查,符号等级可常量判定时检查、不可判定时警告放行;分支合并取计数上界。`0/1/ω` 为特例(0 擦除/1 恰好一次/ω 不限)。
 
-## 11. Graded Modal Types ⚠️
+## 11. Graded Modal Types ✅
 
 QTT's {0, 1, ω} is a special case. Graded modal types generalize to **arbitrary semirings**.
 
@@ -959,7 +959,7 @@ Types that don't change over time. Can safely cross time steps.
 
 ---
 
-## 19. Dependent Graded Types ⚠️
+## 19. Dependent Graded Types ✅
 
 ### 19.1 Graded Dependent Function (Π_r)
 

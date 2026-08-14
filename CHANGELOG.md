@@ -7,8 +7,8 @@
 
 ## 当前状态(0.1.0 收尾,2026-08)
 
-- 6 crate / 64 Rust 源文件 / 26,527 行 / 351 单元测试 / 零编译警告
-- `docs/spec.md` 32 章 + 6 附录:30 ✅ / 2 ⚠️(§11 Graded Modal Types、§19 Dependent Graded Types)/ 0 ⬜
+- 6 crate / 64 Rust 源文件 / 26,527 行 / 358 单元测试 / 零编译警告
+- `docs/spec.md` 32 章 + 6 附录:32 ✅ / 0 ⚠️ / 0 ⬜(全部全链路可用)
 - 19 个示例;19 份 OpenSpec 能力规范
 - 逐章实现状态以 [standard_doc/04-implementation-status.md](./standard_doc/04-implementation-status.md) 为唯一事实源
 
@@ -17,6 +17,11 @@
 ## [0.1.0] - 2026-08
 
 ### 新增
+
+**分级类型推断补齐(complete-graded-type-inference)**
+- §11 Graded Modal Types:引入推导 `resolve_modal_grade_with_usage` 按使用次数推导 r/ε(□_r 等级变量 → `Nat(count)`,递归解析嵌套),接线 grade_check(`resolved_modal_types` 暴露)
+- §19 Dependent Graded Types:`GradeInequality` 结构化(携带 `Grade` 表达式 + 使用次数,替换调试字符串);`verify_grade_inequalities` 真实 Z3 判定(`grade_to_smt` 等级→SMT,自由等级变量按自然数 ≥ 0):可证恒真→verified、欠约束→明确警告带反例、降级→warned
+- §11/§19 由 ⚠️ 升 ✅,全部 32 章 ✅,无 ⚠️/⬜ 项
 
 **12 逻辑范式全链路(logic-paradigms-full-chain)**
 - 12 类 LP 范式全部接线真实求解器(tisp-runtime/paradigms.rs),替换 `pf-*` 简化投影:高阶 `higher-order-call`(谓词一等值 + `call`)、归纳 `ilp-induce`(`induce`)、概率 `plp-marginal`(`marginal` 精确枚举)、时序 `temporal-eventually`(`TemporalKb`)、描述逻辑 `subsume`(`Ontology::is_instance`)、可废止 `defeasible-settle`(`settle` 优先级裁决)、模糊 `fuzzy-eval`(`fuzzy_and` min)、表格化 `tabling`(`Tabler` 左递归终止)、一体化基底 `typed-pred`(`filter_by` 静态谓词过滤)、响应式 `reactive-eval`(`ReactiveRule` 信号派生)、情境 `context-query`(`ContextKb::query` 继承链)、模态 `modal-possible`(`ModalKb::possible` 可达世界)

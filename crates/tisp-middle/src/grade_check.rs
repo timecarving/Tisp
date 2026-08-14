@@ -19,10 +19,10 @@ impl std::fmt::Display for GradeError {
 
 impl std::error::Error for GradeError {}
 
-/// 符号等级不等式(§10):等级变量 n 的绑定被使用 count 次,待 Z3 验证 count ≤ n
+/// 符号等级不等式(§10/§19):等级表达式 grade 的绑定被使用 count 次,待 Z3 验证 count ≤ grade
 #[derive(Debug, Clone)]
 pub struct GradeInequality {
-    pub var: String,
+    pub grade: Grade,
     pub count: u64,
     pub span: Span,
 }
@@ -33,6 +33,10 @@ pub struct GradeChecker {
     type_usage: HashMap<Symbol, usize>,
     /// 符号等级不等式集合(验证层消费)
     pub inequalities: Vec<GradeInequality>,
+    /// §11 按使用次数推导 □_r 后的定义类型(定义名 → 解析后类型,供反射/展示)
+    pub resolved_modal_types: HashMap<Symbol, Type>,
+    /// §11 当前定义顶层 Lam 的模态等级变量 → 使用计数(□_Var(v) 参数经 effective_grade 绑定后统计)
+    modal_grade_usage: HashMap<Symbol, u64>,
 }
 
 /// 使用计数 Grade → u64(常量等级)
@@ -59,6 +63,8 @@ impl GradeChecker {
             usage_env: UsageEnv::new(),
             type_usage: HashMap::new(),
             inequalities: Vec::new(),
+            resolved_modal_types: HashMap::new(),
+            modal_grade_usage: HashMap::new(),
         }
     }
 
@@ -72,6 +78,7 @@ impl GradeChecker {
     fn check_def(&mut self, def: &CoreDef) -> Result<(), GradeError> {
         self.usage_env.clear();
         self.type_usage.clear();
+        self.modal_grade_usage.clear();
         // §19.3 r+s:先收集依赖绑定在返回类型中的使用次数(类型级使用)
         if let Some(ty) = &def.ty {
             self.collect_dependent_type_usage(ty);
@@ -129,6 +136,12 @@ impl GradeChecker {
                     }
                 }
             }
+        }
+
+        // §11 按使用次数推导 □_r:用 check_expr 收集的模态等级变量使用计数解析 def 类型注解
+        if let Some(ty) = &def.ty {
+            let resolved = crate::type_infer::resolve_modal_grade_with_usage(ty, &self.modal_grade_usage);
+            self.resolved_modal_types.insert(def.name.clone(), resolved);
         }
 
         Ok(())
@@ -267,10 +280,10 @@ impl GradeChecker {
                                     });
                                 }
                                 None => {
-                                    // 符号等级:收集不等式 (count ≤ n) 供 Z3 验证(§10)
+                                    // 符号等级:收集不等式 (count ≤ grade) 供 Z3 验证(§10/§19)
                                     let count = grade_usage_value(&total).unwrap_or(0);
                                     self.inequalities.push(GradeInequality {
-                                        var: format!("{:?}", other),
+                                        grade: other.clone(),
                                         count,
                                         span: expr.span.clone(),
                                     });
@@ -278,6 +291,16 @@ impl GradeChecker {
                             }
                         }
                         _ => {}
+                    }
+                }
+
+                // §11 收集 □_Var(v) 参数的使用计数,供 check_def 按使用次数推导模态等级
+                for param in &lambda.params {
+                    if let Some(Type::Modal(ModalOp::Necessity(Grade::Var(v)), _)) = &param.ty {
+                        let usage = self.usage_env.get_usage(&param.name);
+                        if let Some(c) = grade_usage_value(&usage) {
+                            self.modal_grade_usage.insert(v.clone(), c);
+                        }
                     }
                 }
 
@@ -721,6 +744,26 @@ mod tests {
         let d3 = def_with_lam("g", vec![p3], use3);
         let err = check(vec![d3]).unwrap_err();
         assert!(err.message.contains("grade violation"), "□_2 使用 3 次应违规,实际: {}", err.message);
+    }
+
+    #[test]
+    fn test_resolved_modal_types_from_usage() {
+        // §11 按使用次数推导:参数类型 □_Var(n) A,参数 x 用 3 次 → def.ty 的 □_n 推导为 □_Nat(3)
+        let p = Param {
+            name: Symbol::new("x"),
+            ty: Some(Type::Modal(ModalOp::Necessity(Grade::Var(Symbol::new("n"))), Box::new(Type::i64()))),
+            grade: Grade::Omega,
+            mode: tisp_core::types::Mode::In,
+        };
+        let body = CoreExprNode::Do(vec![e(var("x")), e(var("x")), e(var("x"))]);
+        let mut d = def_with_lam("f", vec![p], body);
+        // def 类型注解也含模态等级变量(返回 □_n i64)
+        d.ty = Some(Type::Modal(ModalOp::Necessity(Grade::Var(Symbol::new("n"))), Box::new(Type::i64())));
+        let mut g = GradeChecker::new();
+        let prog = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![], resource_algebras: vec![], defs: vec![d], pragmas: vec![] };
+        assert!(g.check_program(&prog).is_ok(), "□_n 使用 3 次应通过等级检查");
+        let resolved = g.resolved_modal_types.get(&Symbol::new("f")).expect("应解析模态类型");
+        assert!(matches!(resolved, Type::Modal(ModalOp::Necessity(Grade::Nat(3)), _)), "等级变量应按使用次数推导为 Nat(3),实际 {:?}", resolved);
     }
 }
 

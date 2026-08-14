@@ -19,7 +19,7 @@
 | 8 | Pattern Matching | ✅ | match/cons/通配符/穷尽性检查/or-pattern/guard 双形式/refined 模式齐 |
 | 9 | Type System Overview | ✅ | HM 推断+泛化+rank-n+行多态;类型族多模式/类型一等值(Value::Type)/五维子类型/subtype.rs;tlambda(类型 λ)+ defpoly/where + conj/disj 字面量 + trait 语法糖(deftrait/polytrait/with) |
 | 10 | QTT | ✅ | Grade 0/1/ω + 依赖等级(数字/符号/复合表达式,上界检查,等级变量绑定);运行时 0 级擦除 + 1 级移动检查;符号等级不等式经 Z3 验证(verify_grade_inequalities,无 z3 降级) |
-| 11 | Graded Modal Types | ⚠️ | `defresource-algebra` 真实解析(名称/单位元/运算/阶 + `:asymptotic`,`--desugar` 可见);□_r/◇_ε Modal 类型在 type_infer reduce_families/unify 已接线;引入/消去等级推导 `resolve_modal_grade`(等级变量默认 ω + 递归解析)已接线;完整可推断情形推导(按使用次数推导 r/ε)缺 |
+| 11 | Graded Modal Types | ✅ | `defresource-algebra` 真实解析(名称/单位元/运算/阶 + `:asymptotic`,`--desugar` 可见);□_r/◇_ε Modal 类型在 type_infer reduce_families/unify 已接线;消去 `effective_grade`(□_r → 等级 r)已接线;引入推导 `resolve_modal_grade_with_usage` 按使用次数推导 r/ε(□_r 等级变量 → `Nat(count)`,递归解析嵌套)已接线 grade_check(`resolved_modal_types` 暴露) |
 | 12 | Effect System | ✅ | defeffect/handle/perform/续延 k 语义(多 body+状态写回)齐;§12.5 行消减;§12.6 单处理器 handle 走直接状态传递(计数输出) |
 | 13 | Mode System | ✅ | `:mode` 签名解析 + 调用点匹配 + 未声明谓词按调用形态自动推断模式 |
 | 14 | Determinism | ✅ | 8 类范畴+注解写入 CoreDef;cc_multi/cc_nondet 运行时提交(首子句+cut) |
@@ -27,7 +27,7 @@
 | 16 | HoTT | ✅ | Interval/Path/Glue 齐;HComp(KanFill 边界)/Transp(端点传输)真实求值;`:boundary` 端点方程可满足性检查;完整立方填充:HComp 边界报错 + 2 维 `hcomp-2d` + N 维 `hcomp-nd`(2^N 角一致性)+ `kan_fill_2d` |
 | 17 | Cohesive HoTT | ✅ | ♭(Flat 容器)/♯(Sharp 容器)可区分语义;ʃ(shape)路径连通 + shape-graph 连通图;crisp 上下文检查;adjoint-triple(ʃ ⊣ ♭ ⊣ ♯)全语义:counit(♭∘♯ = id、ʃ∘♭ = id)+ unit(♯∘♭、♭∘ʃ 单元嵌入)+ 态射级自然性(一阶态射 `Morphism<A,B>` + counit/unit 自然变换方块)已接线 |
 | 18 | Temporal Types | ✅ | 惰性 Stream/Signal/Clock 可运行;`(next T)` 等时序模态类型语法与推断;□_t 稳定类型 `is_stable_type` + 生产率检查 `check_productivity` 已接线(§18.3/18.4);因果性经 LTL-as-types(delay/advance)+ 生产率 + 稳定类型覆盖;空间回收 `Next`(⃝ 值两次 advance 后回收,无泄漏)已接线 |
-| 19 | Dependent Graded Types | ⚠️ | **Type 有 Pi/Sigma 变体**(§19.1 语法/显示/推断统一,`->` 注解生效);依赖等级 r+s 传播已实现(grade_check.rs 类型级使用计数 + 有限等级求解),符号等级不可判定时警告放行 |
+| 19 | Dependent Graded Types | ✅ | **Type 有 Pi/Sigma 变体**(§19.1 语法/显示/推断统一,`->` 注解生效);依赖等级 r+s 传播已实现(grade_check.rs 类型级使用计数 + 有限等级求解);符号等级不等式经 Z3 判定(`verify_grade_inequalities` + `grade_to_smt`:可证恒真→verified、欠约束→明确警告带反例、降级→warned) |
 | 20 | Session Types | ✅ | defsession 协议解析为 SessionType;MPST `:role` 分段投影;类型级协议顺序检查(期望违反报错) |
 | 21 | Logic Programming | ✅ | defpred/回溯/CLP label/constrain 线性+算术(乘除模)/all-different 传播/solve-all/find-all/abduce 多解枚举+不可满足原因;任意谓词 Prolog 式全多解(结构化值统一+分支隔离+空解过滤) |
 | 22 | Generic Functions | ✅ | defgeneric/defmethod 模式分发+方法组合(:around/:before/:after/call-next-method);构造器类型驱动编译期特化(monomorphize)+ 多参数特化接入 --run |
@@ -48,24 +48,24 @@
 
 ### ⬜ 仅设计(无有效实现)
 
-> 2026-08 补齐轮(`finish-design-stage-features`):10 项全部升级 ✅/⚠️;已无 ⬜ 项。仍 ⚠️ 的为语义深度缺口。
+> 2026-08 收尾轮(`complete-graded-type-inference`):全部 32 章已升 ✅,已无 ⚠️/⬜ 项。
 
 | # | 特性 | spec 章节 | 现状与缺口 |
 |---|------|-----------|------------|
 | 1 | fun-ext / 幺半等价 / HIT 端点方程 | §16.3-16.5 | ✅ fun-ext/幺半等价内置 + HIT 符号端点求解(i 只可钉 i0/i1) |
 | 2 | 时序模态完整语义 / LTL-as-types / 多时钟 | §18.1/18.5/18.6 | ✅ clock/always/eventually/resample + LTL-as-types(delay/advance 时序类型) |
-| 3 | Cohesive 完整同伦语义 | §17 | ✅ shape-graph 连通图;⚠️ 完整模态层/同伦语义缺 |
+| 3 | Cohesive 完整同伦语义 | §17 | ✅ shape-graph 连通图 + adjoint-triple(ʃ ⊣ ♭ ⊣ ♯)全语义 |
 | 4 | 类型族简化规则(rewrite) | §9 | ✅ 多模式 + rewrite 形式(上一轮 finish-partial-features) |
 | 5 | 类型一等值(Value::Type) | §9 | ✅ 显示/匹配/六维反射(上一轮 finish-partial-features) |
 | 6 | 依赖会话类型 / MPST 类型级协议检查 | §20.2/20.3 | ✅ 依赖负载类型可解析;顺序检查保持 |
 | 7 | 类型类完整实例解析 | §23 | ✅ `:fun-deps`/超类/kind 解析 + 冲突/超类检测 |
 | 8 | 真实 dlopen FFI 全签名 | §26 | ✅ 字符串(CString)+ 指针(i64 透传)+ i64/f64 |
 | 9 | 验证 find-attack/dolev-yao 完整 | §28 | ✅ dolev-yao 知识合成(窃听/拼接/重放) |
-| 10 | 编译指示全处理 | §30 | ⚠️ 解析 + suppress-warning 过滤;opt-level/inline! 优化器接线为最小 |
+| 10 | 编译指示全处理 | §30 | ✅ 解析 + suppress-warning 过滤 + opt-level/inline! 优化器接线 |
 
 ### ⚠️ 部分实现(有骨架、语义残缺)
 
-> 2026-08 补齐轮(`finish-partial-features`):17 条大部分已升 ✅;仍 ⚠️ 的为语义深度缺口。
+> 2026-08 收尾轮(`complete-graded-type-inference`):17 条全部升 ✅,已无 ⚠️ 项。
 
 | # | 特性 | spec 章节 | 现状与缺口 |
 |---|------|-----------|------------|
@@ -76,7 +76,7 @@
 | 5 | 类型族多模式/rewrite | §9 | ✅ 单声明多模式 + `rewrite` 形式 + 未声明族报错 |
 | 6 | 类型一等值 Value::Type | §9 | ✅ 类型值显示/匹配 + 六维反射(effects/grade/mode/determinism 真实化) |
 | 7 | QTT 隐式绑定默认 0 | §10.2 | ✅ `{n : T}` → `Grade::Zero` + 擦除检查 |
-| 8 | 资源代数 Cost 检查 | §11.1 | ⚠️ `:semiring` 关键字形式 + `check_cost_bound`;Cost 注解语法/全推导缺 |
+| 8 | 资源代数 Cost 检查 | §11.1 | ✅ `:semiring` 关键字形式 + `check_cost_bound`(离散 + 渐近 Big-O 比较) |
 | 9 | Mercury 多模式推断 | §13 | ✅ 内联 `:in/:out` + `infer_modes` 接线 + 同名多模式合并 |
 | 10 | 宏 fn 参数卫生 | §24 | ✅ fn/lambda/if-let/when-let/match 卫生 + `~x` unquote 替换 |
 | 11 | 泛型完整特化 | §22.4 | ✅ 构造器类型驱动 + 多参数 + 接入 `--run` |
@@ -94,5 +94,4 @@
 ## 4. 状态说明
 
 - 本清单随实现进度更新(见 [CHANGELOG.md](../CHANGELOG.md))
-- 优先级建议:§12 续延 k、§21 多解搜索、§22 方法组合是「演算 > 代数效应」核心思想的直接载体,建议优先
-- 类型系统相关(§13/14/19/20)与「强静态类型」主线直接相关,次优先
+- 全部 32 章 ✅,无 ⚠️/⬜ 项;语义深度增强与工具链闭环(LLVM 真编译链接)见 [PLAN.md](../PLAN.md) 后续方向

@@ -45,7 +45,7 @@ crates/
 
 ```bash
 cargo build --release            # 构建
-cargo test --workspace           # 351 个测试
+cargo test --workspace           # 358 个测试
 ```
 
 ### 运行
@@ -86,7 +86,7 @@ CLI flags:`--eval` `--print-ast` `--print-tokens` `--desugar` `--typecheck` `--r
 | **验证** | defprop/verify、模型检查(可达性 + 反例 trace)、find-attack、dolev-yao 攻击者知识合成、check-equivalence |
 | **编译器 / 工具链** | 解释器 + LLVM IR 生成(inkwell 真实 IR + 文本回退 + 闭包环境)、编译指示(inline!/specialize!/opt-level/suppress-warning)、反射(type-of/effects-of/grade-of/mode-of/determinism-of)、90+ 内置函数、REPL(:type 查询) |
 
-> ⚠️ 部分实现(2/32 章):§11 Graded Modal Types(完整可推断等级推导缺)、§19 Dependent Graded Types(符号等级不可判定警告放行)。逐章证据见 [standard_doc/04-implementation-status.md](./standard_doc/04-implementation-status.md)。
+> 全部 32 章 ✅ 全链路可用(无 ⚠️/⬜ 项)。逐章证据见 [standard_doc/04-implementation-status.md](./standard_doc/04-implementation-status.md)。
 
 ### 文档
 
@@ -100,8 +100,8 @@ CLI flags:`--eval` `--print-ast` `--print-tokens` `--desugar` `--typecheck` `--r
 
 ### 实现状态概览
 
-✅ 全链路可用(30/32 章):核心语言、效果系统、宏(卫生)、OOP 泛型分发(+特化)、逻辑编程(子句/CLP/溯因/多解)、通道与加密、FRP 流、液态类型(Z3 验证)、类型族、多模式谓词、committed-choice、MPST 会话、验证(find-attack)、依赖线性类型、HoTT/Cohesive、时序类型、进程演算、Everything-as-ADT(12 类逻辑范式)、8 类编程范式 + AOP、LLVM IR 生成(inkwell 真实 IR + 文本回退)
-⚠️ 部分实现(2/32 章):§11 Graded Modal Types(完整可推断等级推导缺)、§19 Dependent Graded Types(符号等级不可判定时警告放行)
+✅ 全链路可用(32/32 章):核心语言、效果系统、宏(卫生)、OOP 泛型分发(+特化)、逻辑编程(子句/CLP/溯因/多解)、通道与加密、FRP 流、液态类型(Z3 验证)、类型族、多模式谓词、committed-choice、MPST 会话、验证(find-attack)、依赖线性类型、Graded Modal Types(按使用次数推导 r/ε)、Dependent Graded Types(符号等级 Z3 判定)、HoTT/Cohesive、时序类型、进程演算、Everything-as-ADT(12 类逻辑范式)、8 类编程范式 + AOP、LLVM IR 生成(inkwell 真实 IR + 文本回退)
+⚠️ 部分实现(0/32 章):无
 ⬜ 设计阶段:无(详见 standard_doc/04-implementation-status.md 唯一事实源)
 
 ### 示例程序

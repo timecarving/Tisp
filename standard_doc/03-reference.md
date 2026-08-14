@@ -231,7 +231,7 @@ tisp                                # 进入 REPL
 ## 6. 测试
 
 ```bash
-cargo test --workspace   # 351 个测试
+cargo test --workspace   # 358 个测试
 ```
 
 覆盖:词法/解析、脱糖、效果处理器、通道/流/加密、CLP、泛型分发、IR 生成、逻辑回溯、12 类逻辑范式、编程范式/AOP。

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use tisp_core::core_ast::{CoreDef, CoreExpr, CoreExprNode, CoreProgram};
 use tisp_core::span::Span;
 use tisp_core::symbol::Symbol;
-use tisp_core::types::{Predicate, Type};
+use tisp_core::types::{Grade, Predicate, Type};
 use tisp_middle::grade_check::GradeInequality;
 use tisp_middle::liquid_types::{expr_to_smt, pred_free_vars, pred_to_smt, pred_to_smt_bound, smt_var};
 
@@ -104,12 +104,64 @@ impl LiquidVerifier {
         self.report.clone()
     }
 
-    /// §10 符号等级诊断:count ≤ n 在自由等级变量 n 下无法静态判定(任何 count 都有 n=0 反例),
-    /// 记录诊断性警告(含使用次数);复合等级的可折叠部分由 grade_check 常量检查处理
+    /// §19 符号等级判定:对每条 `count ≤ grade` 用 Z3 判定——
+    /// 可证恒真 → verified;存在反例(等级欠约束)→ warned 并给出反例;z3 不可用/不可判定 → warned 降级。
+    /// 自由等级变量按自然数语义(≥ 0)约束。
     pub fn verify_grade_inequalities(&mut self, ineqs: &[GradeInequality]) {
         for ineq in ineqs {
-            self.report.warned += 1;
-            let _ = ineq;
+            // ω 无界:不产生任何约束
+            if matches!(ineq.grade, Grade::Omega) {
+                continue;
+            }
+            let Some(grade_smt) = grade_to_smt(&ineq.grade) else {
+                // 自定义/不可翻译等级:无法判定,降级警告
+                self.report.warned += 1;
+                continue;
+            };
+            let Some(z3) = &mut self.z3 else {
+                // z3 不可用:降级
+                self.report.warned += 1;
+                continue;
+            };
+            // 收集自由等级变量并声明为自然数(≥ 0)
+            let mut vars: Vec<Symbol> = Vec::new();
+            grade_free_vars(&ineq.grade, &mut vars);
+            if z3.push().is_err() {
+                self.report.warned += 1;
+                continue;
+            }
+            for v in &vars {
+                let _ = z3.declare_int(v.as_str());
+                let _ = z3.assert_ge(v.as_str(), 0);
+            }
+            // 验证 count ≤ grade 是否恒真:否定可满足 → 存在反例 → 欠约束
+            let conclusion = format!("(<= {} {})", ineq.count, grade_smt);
+            let outcome = (|| -> Result<VerifyOutcome, String> {
+                z3.assert(&format!("(not {})", conclusion))?;
+                match z3.check_sat()?.as_str() {
+                    "unsat" => Ok(VerifyOutcome::Unsat),
+                    "sat" => {
+                        let model = z3.get_model(&vars.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                        Ok(VerifyOutcome::Sat(model))
+                    }
+                    _ => Ok(VerifyOutcome::Unknown),
+                }
+            })();
+            let _ = z3.pop();
+            match outcome {
+                Ok(VerifyOutcome::Unsat) => self.report.verified += 1,
+                Ok(VerifyOutcome::Sat(model)) => {
+                    self.report.warned += 1;
+                    self.report.errors.push(LiquidError {
+                        message: format!(
+                            "依赖等级 {} 未约束使用 {} 次(反例 {})",
+                            grade_smt, ineq.count, format_counterexample(&model)
+                        ),
+                        span: ineq.span.clone(),
+                    });
+                }
+                _ => self.report.warned += 1,
+            }
         }
     }
 
@@ -313,6 +365,41 @@ fn collect_call_chain(expr: &CoreExpr) -> Option<(Symbol, Vec<CoreExpr>)> {
     }
 }
 
+/// §19 等级 → SMT 表达式(自由变量名与 Grade 变量同名,自然数语义)
+fn grade_to_smt(g: &Grade) -> Option<String> {
+    match g {
+        Grade::Zero => Some("0".to_string()),
+        Grade::One => Some("1".to_string()),
+        Grade::Nat(n) => Some(n.to_string()),
+        Grade::Omega => None, // 无界:调用方跳过
+        Grade::Var(v) => Some(v.as_str().to_string()),
+        Grade::Add(a, b) => {
+            let x = grade_to_smt(a)?;
+            let y = grade_to_smt(b)?;
+            Some(format!("(+ {} {})", x, y))
+        }
+        Grade::Mul(a, b) => {
+            let x = grade_to_smt(a)?;
+            let y = grade_to_smt(b)?;
+            Some(format!("(* {} {})", x, y))
+        }
+        Grade::Custom(_, _) => None, // 未知代数:不可翻译
+    }
+}
+
+/// 收集等级表达式中的自由等级变量
+fn grade_free_vars(g: &Grade, out: &mut Vec<Symbol>) {
+    match g {
+        Grade::Var(v) => { if !out.contains(v) { out.push(v.clone()); } }
+        Grade::Add(a, b) | Grade::Mul(a, b) => {
+            grade_free_vars(a, out);
+            grade_free_vars(b, out);
+        }
+        Grade::Custom(_, inner) => grade_free_vars(inner, out),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +516,65 @@ mod tests {
         let r = verify(src);
         assert_eq!(r.violated, 0, "不可翻译谓词不应报违反:{}", errors_text(&r));
         assert!(r.warned >= 1, "应产生警告计数");
+    }
+
+    #[test]
+    fn test_grade_to_smt_translation() {
+        // §19 等级 → SMT
+        assert_eq!(grade_to_smt(&Grade::Nat(3)).unwrap(), "3");
+        assert_eq!(grade_to_smt(&Grade::Var(Symbol::new("n"))).unwrap(), "n");
+        assert_eq!(grade_to_smt(&Grade::Add(Box::new(Grade::Nat(2)), Box::new(Grade::Var(Symbol::new("n"))))).unwrap(), "(+ 2 n)");
+        assert_eq!(grade_to_smt(&Grade::Mul(Box::new(Grade::Nat(2)), Box::new(Grade::Var(Symbol::new("n"))))).unwrap(), "(* 2 n)");
+        assert!(grade_to_smt(&Grade::Omega).is_none(), "ω 无界不翻译");
+        assert!(grade_to_smt(&Grade::Custom(Symbol::new("L"), Box::new(Grade::Zero))).is_none(), "自定义代数不可翻译");
+    }
+
+    #[test]
+    fn test_verify_grade_inequalities_provable() {
+        // §19 恒真:(+ 5 n) 计数 3 → 3 ≤ 5+n 恒真 → verified(无警告)
+        let mut v = LiquidVerifier::new();
+        if v.degraded() {
+            return; // 无 z3 跳过(其余液态测试同环境假设)
+        }
+        let ineqs = vec![GradeInequality {
+            grade: Grade::Add(Box::new(Grade::Nat(5)), Box::new(Grade::Var(Symbol::new("n")))),
+            count: 3,
+            span: Span::dummy(),
+        }];
+        v.verify_grade_inequalities(&ineqs);
+        assert_eq!(v.report().verified, 1, "可证恒真的等级应 verified");
+        assert_eq!(v.report().warned, 0, "不应有警告");
+    }
+
+    #[test]
+    fn test_verify_grade_inequalities_underconstrained() {
+        // §19 欠约束:Var(n) 计数 3 → 存在反例 n=2 → 明确警告带反例
+        let mut v = LiquidVerifier::new();
+        if v.degraded() {
+            return;
+        }
+        let ineqs = vec![GradeInequality {
+            grade: Grade::Var(Symbol::new("n")),
+            count: 3,
+            span: Span::dummy(),
+        }];
+        v.verify_grade_inequalities(&ineqs);
+        assert_eq!(v.report().warned, 1, "欠约束的符号等级应明确警告");
+        let text = errors_text(v.report());
+        assert!(text.contains("反例"), "警告应带反例:{}", text);
+    }
+
+    #[test]
+    fn test_verify_grade_inequalities_omega_skipped() {
+        // ω 无界:不产生约束,也不计数
+        let mut v = LiquidVerifier::new();
+        let ineqs = vec![GradeInequality {
+            grade: Grade::Omega,
+            count: 99,
+            span: Span::dummy(),
+        }];
+        v.verify_grade_inequalities(&ineqs);
+        assert_eq!(v.report().warned, 0);
+        assert_eq!(v.report().verified, 0);
     }
 }

@@ -1250,20 +1250,27 @@ pub fn is_stable_type(ty: &Type) -> bool {
 }
 
 /// §11 □_r/◇_ε 引入消去等级推导:不可推断的等级变量默认取 ω(与 spec 一致);
-/// 递归解析 Modal 嵌套中的等级变量。
+/// 递归解析 Modal 嵌套中的等级变量。等价于空使用表的 `resolve_modal_grade_with_usage`。
 pub fn resolve_modal_grade(ty: &Type) -> Type {
+    resolve_modal_grade_with_usage(ty, &std::collections::HashMap::new())
+}
+
+/// §11 按使用次数推导 r/ε:□_r 中的等级变量从实际使用计数推导为 `Nat(count)`(Nat 代数精确计数);
+/// 无计数的等级变量仍默认 ω(不可推断);`◇_ε` 的 ε 即效应行(已具体,原样保留)。
+/// 递归解析 Modal 嵌套中的等级变量。
+pub fn resolve_modal_grade_with_usage(ty: &Type, usage: &std::collections::HashMap<Symbol, u64>) -> Type {
     match ty {
         Type::Modal(ModalOp::Necessity(g), inner) => {
             let g = match g {
-                Grade::Var(_) => Grade::Omega, // 不可推断 → 默认 ω(并可在上层警告)
+                Grade::Var(v) => usage.get(v).copied().map(Grade::Nat).unwrap_or(Grade::Omega),
                 other => other.clone(),
             };
-            Type::Modal(ModalOp::Necessity(g), Box::new(resolve_modal_grade(inner)))
+            Type::Modal(ModalOp::Necessity(g), Box::new(resolve_modal_grade_with_usage(inner, usage)))
         }
-        Type::Modal(op, inner) => Type::Modal(op.clone(), Box::new(resolve_modal_grade(inner))),
-        Type::Fun(p, ann, r) => Type::Fun(Box::new(resolve_modal_grade(p)), ann.clone(), Box::new(resolve_modal_grade(r))),
-        Type::Ref(t) => Type::Ref(Box::new(resolve_modal_grade(t))),
-        Type::Ptr(t) => Type::Ptr(Box::new(resolve_modal_grade(t))),
+        Type::Modal(op, inner) => Type::Modal(op.clone(), Box::new(resolve_modal_grade_with_usage(inner, usage))),
+        Type::Fun(p, ann, r) => Type::Fun(Box::new(resolve_modal_grade_with_usage(p, usage)), ann.clone(), Box::new(resolve_modal_grade_with_usage(r, usage))),
+        Type::Ref(t) => Type::Ref(Box::new(resolve_modal_grade_with_usage(t, usage))),
+        Type::Ptr(t) => Type::Ptr(Box::new(resolve_modal_grade_with_usage(t, usage))),
         _ => ty.clone(),
     }
 }
@@ -1446,6 +1453,50 @@ mod ltl_tests {
                 assert_eq!(*inner, Type::i64());
             }
             other => panic!("等级变量应默认 ω,实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resolve_modal_grade_infers_from_usage() {
+        // §11 按使用次数推导 r:□_r 中 Var(r) 且使用 3 次 → Nat(3)
+        let x = Type::Modal(
+            ModalOp::Necessity(Grade::Var(Symbol::new("r"))),
+            Box::new(Type::i64()),
+        );
+        let mut usage = std::collections::HashMap::new();
+        usage.insert(Symbol::new("r"), 3u64);
+        let resolved = resolve_modal_grade_with_usage(&x, &usage);
+        match resolved {
+            Type::Modal(ModalOp::Necessity(Grade::Nat(3)), inner) => {
+                assert_eq!(*inner, Type::i64());
+            }
+            other => panic!("等级变量应按使用次数推导为 Nat(3),实际 {:?}", other),
+        }
+        // 无计数的变量仍默认 ω
+        let resolved2 = resolve_modal_grade_with_usage(&x, &std::collections::HashMap::new());
+        assert!(matches!(resolved2, Type::Modal(ModalOp::Necessity(Grade::Omega), _)));
+    }
+
+    #[test]
+    fn test_resolve_modal_grade_nested() {
+        // §11 递归解析嵌套:□_r (□_s A),r/s 各自按使用表推导
+        let nested = Type::Modal(
+            ModalOp::Necessity(Grade::Var(Symbol::new("r"))),
+            Box::new(Type::Modal(
+                ModalOp::Necessity(Grade::Var(Symbol::new("s"))),
+                Box::new(Type::i64()),
+            )),
+        );
+        let mut usage = std::collections::HashMap::new();
+        usage.insert(Symbol::new("r"), 2u64);
+        usage.insert(Symbol::new("s"), 4u64);
+        let resolved = resolve_modal_grade_with_usage(&nested, &usage);
+        match resolved {
+            Type::Modal(ModalOp::Necessity(Grade::Nat(2)), inner) => match *inner {
+                Type::Modal(ModalOp::Necessity(Grade::Nat(4)), _) => {}
+                other => panic!("内层应推导 Nat(4),实际 {:?}", other),
+            },
+            other => panic!("外层应推导 Nat(2),实际 {:?}", other),
         }
     }
 
