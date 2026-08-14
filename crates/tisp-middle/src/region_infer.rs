@@ -55,6 +55,13 @@ impl RegionInfer {
             CoreExprNode::Lam(lambda) => uses_allocated(&lambda.body, allocs),
             // 完整别名分析:地址作为实参流入函数 → 可能逃逸(保守报)
             CoreExprNode::App(f, a) => uses_allocated(f, allocs) || uses_allocated(a, allocs),
+            // 跨区域/全局别名:地址嵌入数据结构(Data)→ 堆逃逸
+            CoreExprNode::Data(_, args) => args.iter().any(|a| uses_allocated(a, allocs)),
+            // 跨区域/全局别名:地址在 match 分支中使用 → 逃逸
+            CoreExprNode::Match(s, arms) => {
+                uses_allocated(s, allocs)
+                    || arms.iter().any(|arm| uses_allocated(&arm.body, allocs))
+            }
             _ => false,
         }
     }
@@ -196,5 +203,25 @@ mod tests {
         let mut inf = RegionInfer::new();
         let r = inf.infer_def(&def_with_body(body));
         assert!(r.is_err(), "闭包捕获分配地址应报逃逸");
+    }
+
+    #[test]
+    fn test_region_escape_via_data_embed() {
+        // 跨区域/全局别名:地址嵌入数据结构(Data)→ 堆逃逸
+        let body = e(CoreExprNode::Let(
+            Symbol::new("r"),
+            None,
+            Box::new(e(CoreExprNode::RegionAlloc(
+                Box::new(e(CoreExprNode::Lit(Literal::Unit))),
+                Box::new(e(CoreExprNode::Lit(Literal::I64(42)))),
+            ))),
+            Box::new(e(CoreExprNode::Data(Symbol::new("Cons"), vec![
+                e(CoreExprNode::Var(Symbol::new("r"))),
+                e(CoreExprNode::Lit(Literal::Unit)),
+            ]))),
+        ));
+        let mut inf = RegionInfer::new();
+        let r = inf.infer_def(&def_with_body(body));
+        assert!(r.is_err(), "地址嵌入数据结构应报逃逸");
     }
 }

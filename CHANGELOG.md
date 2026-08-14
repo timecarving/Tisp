@@ -9,6 +9,11 @@
 
 ### 新增
 
+**最终残余收尾(complete-final-residuals)**
+- §17 态射级自然性:一阶态射 `Morphism<A,B>` + counit/unit 自然变换方块(♭(f)∘η = η∘f)→ ✅
+- §26 跨区域/全局别名:region_infer 数据结构嵌入(Data)/match 分支别名逃逸 → ✅
+- §30 inkwell 闭包堆分配:`@closure_env` 全局槽 + 捕获计数(llvm feature 门控,默认回退文本 IR)→ ✅
+
 **深语义收尾(finish-deep-semantics)**
 - N(≥2)维立方:`hcomp-nd`(2^N 角一致性,泛化 `hcomp-2d`)+ §16 → ✅
 - adjoint-triple 自然性:点级三角形恒等式 + 态射级自然性为剩余深度(§17)

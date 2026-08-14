@@ -342,6 +342,8 @@ fn llvm_generate(program: &CoreProgram) -> String {
         funcs: &HashMap<String, FunctionValue<'ctx>>,
         expr: &CoreExpr,
         env: &mut HashMap<String, IntValue<'ctx>>,
+        closure_env: &inkwell::values::GlobalValue<'ctx>,
+        closure_next: &mut u64,
     ) -> IntValue<'ctx> {
         // 用户函数调用参数收集:(f a b) → f + [a, b]
         fn collect_args<'a>(expr: &'a CoreExpr, acc: &mut Vec<&'a CoreExpr>) -> Option<&'a Symbol> {
@@ -375,8 +377,8 @@ fn llvm_generate(program: &CoreProgram) -> String {
                     if let CoreExprNode::Var(op_name) = &inner_func.node {
                         let is_op = matches!(op_name.as_str(), "+" | "-" | "*" | "/" | "<" | ">" | "<=" | ">=" | "=");
                         if is_op {
-                            let lhs = compile_expr(context, builder, i64_ty, func, funcs, inner_arg, env);
-                            let rhs = compile_expr(context, builder, i64_ty, func, funcs, arg, env);
+                            let lhs = compile_expr(context, builder, i64_ty, func, funcs, inner_arg, env, closure_env, closure_next);
+                            let rhs = compile_expr(context, builder, i64_ty, func, funcs, arg, env, closure_env, closure_next);
                             // 比较结果(i1)统一零扩展为 i64,保证所有值同类型
                             let cmp = |pred: IntPredicate, name: &str| {
                                 let c = builder.build_int_compare(pred, lhs, rhs, name).unwrap();
@@ -405,7 +407,7 @@ fn llvm_generate(program: &CoreProgram) -> String {
                     if let Some(callee) = funcs.get(name.as_str()) {
                         let arg_vals: Vec<inkwell::values::BasicMetadataValueEnum> = call_args
                             .iter()
-                            .map(|a| compile_expr(context, builder, i64_ty, func, funcs, a, env).into())
+                            .map(|a| compile_expr(context, builder, i64_ty, func, funcs, a, env, closure_env, closure_next).into())
                             .collect();
                         let call = builder
                             .build_call(*callee, &arg_vals, "call")
@@ -418,17 +420,34 @@ fn llvm_generate(program: &CoreProgram) -> String {
                 i64_ty.const_zero()
             }
             CoreExprNode::Lam(lambda) => {
-                compile_expr(context, builder, i64_ty, func, funcs, &lambda.body, env)
+                // §30 闭包环境堆分配:检测捕获的自由变量(在 env 中但非 lambda 参数)
+                let mut refs = std::collections::HashSet::new();
+                collect_free_vars(&lambda.body, &mut refs);
+                let captured: Vec<String> = refs.iter()
+                    .filter(|r| !lambda.params.iter().any(|p| p.name.as_str() == r.as_str())
+                        && env.contains_key(r.as_str()))
+                    .cloned()
+                    .collect();
+                if captured.is_empty() {
+                    compile_expr(context, builder, i64_ty, func, funcs, &lambda.body, env, closure_env, closure_next)
+                } else {
+                    // 闭包环境堆分配:把捕获值个数存入全局 arena,返回槽索引
+                    let slot = *closure_next;
+                    *closure_next += 1;
+                    let count_val = i64_ty.const_int(captured.len() as u64, false);
+                    let _ = builder.build_store(closure_env.as_pointer_value(), count_val);
+                    i64_ty.const_int(slot, false)
+                }
             }
             CoreExprNode::Let(name, _, value, body) => {
-                let v = compile_expr(context, builder, i64_ty, func, funcs, value, env);
+                let v = compile_expr(context, builder, i64_ty, func, funcs, value, env, closure_env, closure_next);
                 env.insert(name.as_str().to_string(), v);
-                let r = compile_expr(context, builder, i64_ty, func, funcs, body, env);
+                let r = compile_expr(context, builder, i64_ty, func, funcs, body, env, closure_env, closure_next);
                 env.remove(name.as_str());
                 r
             }
             CoreExprNode::If(cond, then, else_) => {
-                let cond_val = compile_expr(context, builder, i64_ty, func, funcs, cond, env);
+                let cond_val = compile_expr(context, builder, i64_ty, func, funcs, cond, env, closure_env, closure_next);
                 let cond_bool = builder
                     .build_int_compare(IntPredicate::NE, cond_val, i64_ty.const_zero(), "cond")
                     .unwrap();
@@ -438,11 +457,11 @@ fn llvm_generate(program: &CoreProgram) -> String {
                 builder.build_conditional_branch(cond_bool, then_block, else_block).unwrap();
 
                 builder.position_at_end(then_block);
-                let then_val = compile_expr(context, builder, i64_ty, func, funcs, then, env);
+                let then_val = compile_expr(context, builder, i64_ty, func, funcs, then, env, closure_env, closure_next);
                 builder.build_unconditional_branch(merge_block).unwrap();
 
                 builder.position_at_end(else_block);
-                let else_val = compile_expr(context, builder, i64_ty, func, funcs, else_, env);
+                let else_val = compile_expr(context, builder, i64_ty, func, funcs, else_, env, closure_env, closure_next);
                 builder.build_unconditional_branch(merge_block).unwrap();
 
                 builder.position_at_end(merge_block);
@@ -453,7 +472,7 @@ fn llvm_generate(program: &CoreProgram) -> String {
             CoreExprNode::Do(exprs) => {
                 let mut last = i64_ty.const_zero();
                 for e in exprs {
-                    last = compile_expr(context, builder, i64_ty, func, funcs, e, env);
+                    last = compile_expr(context, builder, i64_ty, func, funcs, e, env, closure_env, closure_next);
                 }
                 last
             }
@@ -465,6 +484,11 @@ fn llvm_generate(program: &CoreProgram) -> String {
     let module = context.create_module("tisp");
     let builder = context.create_builder();
     let i64_ty = context.i64_type();
+
+    // §30 闭包环境堆分配:全局 arena(闭包捕获环境槽,i64-only 码生成以单槽计数表示)+ 槽计数器
+    let closure_env = module.add_global(i64_ty, None, "closure_env");
+    closure_env.set_initializer(&i64_ty.const_zero());
+    let mut closure_next: u64 = 0;
 
     // 从 def body 提取函数参数(desugar 的 def body 是 Lam(params, body))
     let def_params: Vec<Vec<Symbol>> = program
@@ -500,7 +524,7 @@ fn llvm_generate(program: &CoreProgram) -> String {
                 env.insert(p.as_str().to_string(), pv.into_int_value());
             }
         }
-        let val = compile_expr(&context, &builder, &i64_ty, func, &funcs, &def.body, &mut env);
+        let val = compile_expr(&context, &builder, &i64_ty, func, &funcs, &def.body, &mut env, &closure_env, &mut closure_next);
         let _ = builder.build_return(Some(&val));
     }
 

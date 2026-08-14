@@ -185,10 +185,45 @@ pub fn kan_fill_2d(
 
 /// §17 adjoint-triple 自然性(三角形恒等式):点级自然性平凡成立——
 /// counit(♭∘♯ = id、ʃ∘♭ = id)与 unit(♯∘♭、♭∘ʃ)在点值上往返保持;
-/// 态射级自然性(对任意 f:A→B 的自然变换方块交换)需一阶态射表示,为剩余深度。
+/// 态射级自然性见下方 `naturality_counit`/`naturality_unit`。
 pub fn naturality_point(x: &PointValue) -> bool {
     let _ = x;
     true
+}
+
+/// §17 一阶态射:函数 A → B 作为值(自然性的前提)
+pub struct Morphism<A, B>(pub Box<dyn Fn(A) -> B + Send + Sync>);
+
+impl<A, B> Morphism<A, B> {
+    pub fn apply(&self, a: A) -> B {
+        (self.0)(a)
+    }
+}
+
+/// §17 adjoint-triple 态射级自然性(counit ε 方块):
+/// ε_A: ♭(A) → A(unwrap)。对任意 f:A→B 与 ♭(f):♭(A)→♭(B),
+/// 自然性要求 f(ε_A(x)) = ε_B(♭(f)(x))。
+pub fn naturality_counit<A: Clone + PartialEq, B: Clone + PartialEq>(
+    f: &Morphism<A, B>,
+    flat_of_f: &Morphism<Flat<A>, Flat<B>>,
+    x: A,
+) -> bool {
+    let lhs = f.apply(x.clone()); // f(ε_A(Flat(x))) = f(x)
+    let rhs = flat_of_f.apply(Flat(x)).0; // ε_B(♭(f)(Flat(x)))
+    lhs == rhs
+}
+
+/// §17 adjoint-triple 态射级自然性(unit η 方块):
+/// η_A: A → ♯(♭(A))。对任意 f:A→B 与 ♯♭(f),
+/// 自然性要求 ♯♭(f)(η_A(x)) = η_B(f(x))。
+pub fn naturality_unit<A: Clone + PartialEq, B: Clone + PartialEq>(
+    f: &Morphism<A, B>,
+    sharp_flat_of_f: &Morphism<Sharp<Flat<A>>, Sharp<Flat<B>>>,
+    x: A,
+) -> bool {
+    let lhs = sharp_flat_of_f.apply(Sharp(Flat(x.clone()))).0.0; // ♯♭(f)(η_A(x))
+    let rhs = f.apply(x); // η_B(f(x)) 的底层值
+    lhs == rhs
 }
 
 #[cfg(test)]
@@ -199,6 +234,26 @@ mod tests {
     fn test_naturality_point() {
         // §17 自然性:点级三角形恒等式平凡成立
         assert!(naturality_point(&PointValue::Int(42)));
+    }
+
+    #[test]
+    fn test_naturality_counit_square() {
+        // §17 态射级自然性:counit 方块交换
+        let f = Morphism(Box::new(|x: i64| x * 2));
+        // ♭(f) 与 f 一致(在底层值上)→ 自然性成立
+        let flat_of_f = Morphism(Box::new(|fx: Flat<i64>| Flat(fx.0 * 2)));
+        assert!(naturality_counit(&f, &flat_of_f, 21), "自然性方块应交换");
+        // ♭(f) 与 f 不一致(♭(f) 三倍,而 f 两倍)→ 自然性违反
+        let flat_of_f_bad = Morphism(Box::new(|fx: Flat<i64>| Flat(fx.0 * 3)));
+        assert!(!naturality_counit(&f, &flat_of_f_bad, 21), "不一致的 ♭(f) 应违反自然性");
+    }
+
+    #[test]
+    fn test_naturality_unit_square() {
+        // §17 态射级自然性:unit 方块交换
+        let f = Morphism(Box::new(|x: i64| x + 1));
+        let sf_of_f = Morphism(Box::new(|s: Sharp<Flat<i64>>| Sharp(Flat(s.0.0 + 1))));
+        assert!(naturality_unit(&f, &sf_of_f, 5), "unit 自然性方块应交换");
     }
 
     #[test] fn test_interval_neg() {
