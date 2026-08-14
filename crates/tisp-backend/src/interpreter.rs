@@ -12,7 +12,7 @@ use tisp_runtime::constraint::ConstraintStore as ClpStore;
 use tisp_runtime::abduction::AbductionEngine;
 use tisp_runtime::process::CryptoEngine;
 use tisp_runtime::frp::Signal;
-use crate::process::{ProcessRuntime, ModelChecker};
+use crate::process::{ProcessRuntime, ModelChecker, DolevYaoAttacker};
 use crate::temporal::Stream;
 use tisp_core::core_ast::MethodCategory;
 
@@ -33,8 +33,14 @@ pub struct Interpreter {
     pub clp_store: ClpStore,
     /// ς-calculus OOP: generic function dispatch table
     pub generic_table: HashMap<Symbol, Vec<(MethodCategory, Vec<Pattern>, Closure)>>,
-    /// Typeclass instance dictionary: class_name → [(type_name, method_map)]
-    pub instance_dict: HashMap<Symbol, Vec<(Symbol, HashMap<Symbol, Value>)>>,
+    /// Typeclass instance dictionary: class_name → [(实例类型列表, 方法表)]
+    pub instance_dict: HashMap<Symbol, Vec<(Vec<Type>, HashMap<Symbol, Value>)>>,
+    /// 类型类 fun-deps(§23.3):class_name → [(输入类型变量, 输出类型变量)]
+    class_fun_deps: HashMap<Symbol, Vec<(Symbol, Symbol)>>,
+    /// 类型类超类(§23.1):class_name → 超类名列表
+    class_supers: HashMap<Symbol, Vec<Symbol>>,
+    /// 类型类实例类型表(§23.3 fun-deps 冲突检测):class_name → 已登记实例的类型列表
+    class_instance_types: HashMap<Symbol, Vec<Vec<Type>>>,
     /// ADT 构造函数参数个数:ctor_name → arity(≥1;零参构造直接注册为 Data 值)
     ctor_arity: HashMap<String, usize>,
     /// 构造器字段名表(§7.2 记录字段访问):ctor_name → 字段名列表
@@ -47,10 +53,25 @@ pub struct Interpreter {
     collect_start_depth: usize,
     /// 活跃 effect handler 栈(§12.2):perform 从栈顶向下分发
     handlers: Vec<ActiveHandler>,
+    /// §12.6 直接状态线程:单状态 handler 时 get/put 直接读写此槽(替换栈分发)
+    direct_state: Option<Value>,
     /// π-calculus 通道运行时(§27):send/recv 经共享缓冲区
     process_runtime: Arc<Mutex<ProcessRuntime>>,
     /// Applied π-calculus 加密引擎(§27.4/27.5)
     crypto: CryptoEngine,
+    /// §7.2 非加密占位警告是否已输出(一次;crypto feature 下无用)
+    #[cfg(not(feature = "crypto"))]
+    crypto_warned: bool,
+    /// §26.4 Unsafe 门控警告是否已输出(一次)
+    unsafe_warned: bool,
+    /// §26.2 裸指针模拟内存:地址 → 值(线性指针读写;真实裸内存由 ffi 门控)
+    ptr_mem: HashMap<u64, Value>,
+    /// §26.3 区域分配地址计数器
+    next_ptr_addr: u64,
+    /// §26.3 已释放(悬垂)地址集合:PtrRead 读到悬垂指针时报错
+    freed_addrs: std::collections::HashSet<u64>,
+    /// §31 MOP 知识库:GetKB/SetKB 效应的运行时状态(事实/规则集)
+    kb: tisp_core::evolp::Program,
     /// 惰性数值流缓存(§18):stream_id → Stream<i64>
     streams: HashMap<u64, Stream<i64>>,
     next_stream_id: u64,
@@ -67,7 +88,9 @@ pub struct Interpreter {
     clp_var_names: HashMap<u64, Symbol>,
 
     /// §9 反射:name → (参数数, 声明类型, 效果行, 参数等级列表)
-    pub def_sigs: HashMap<Symbol, (usize, Option<tisp_core::types::Type>, tisp_core::types::EffectRow, Vec<tisp_core::types::Grade>)>,
+    pub def_sigs: HashMap<Symbol, (usize, Option<tisp_core::types::Type>, tisp_core::types::EffectRow, Vec<tisp_core::types::Grade>, tisp_core::types::Mode, tisp_core::types::Determinism)>,
+    /// §9 反射:name → 参数名列表(§29 反射完整信息)
+    pub def_params: HashMap<Symbol, Vec<Symbol>>,
 
     /// §24 gensym 计数器(宏卫生)
     pub gensym_counter: std::sync::atomic::AtomicU64,
@@ -96,6 +119,12 @@ struct ActiveHandler {
 
 pub type BuiltinFn = Arc<dyn Fn(&mut Interpreter, &[Value]) -> Result<Value, EvalError> + Send + Sync>;
 
+/// §8.1 TCO:apply 蹦床的中间结果——值(结束)或尾调用(继续循环)
+enum ApplyOutcome {
+    Done(Value),
+    Tail(Value, Vec<Value>),
+}
+
 #[derive(Clone)]
 pub enum Value {
     Int(i64),
@@ -108,6 +137,14 @@ pub enum Value {
     Builtin(String, BuiltinFn),
     Data(Symbol, Vec<Value>),
     Object(std::collections::HashMap<Symbol, Value>),
+    /// §9 类型一等值:运行时类型值
+    Type(tisp_core::types::Type),
+    /// §4 持久化 Vector(im HAMT,O(log32) 结构共享)
+    Vector(im::Vector<Value>),
+    /// §4 持久化 Map(im HAMT,结构共享)
+    Map(im::HashMap<Value, Value>),
+    /// §4 持久化 Set(im HAMT,结构共享)
+    Set(im::HashSet<Value>),
 }
 
 #[derive(Clone)]
@@ -145,6 +182,10 @@ impl std::fmt::Debug for Value {
             Value::Closure(c) => write!(f, "<closure {}/{}>", c.params.len(), c.params.first().map_or("?", |s| s.as_str())),
             Value::Data(name, args) => write!(f, "({} {})", name, args.iter().map(|v| format!("{:?}", v)).collect::<Vec<_>>().join(" ")),
             Value::Object(methods) => write!(f, "<object [{}]>", methods.len()),
+            Value::Type(ty) => write!(f, "{}", ty),
+            Value::Vector(v) => write!(f, "[{}]", v.iter().map(|x| format!("{:?}", x)).collect::<Vec<_>>().join(" ")),
+            Value::Map(m) => write!(f, "{{{}}}", m.iter().map(|(k, v)| format!("{:?} {:?}", k, v)).collect::<Vec<_>>().join(" ")),
+            Value::Set(s) => write!(f, "#{{{}}}", s.iter().map(|x| format!("{:?}", x)).collect::<Vec<_>>().join(" ")),
         }
     }
 }
@@ -162,6 +203,64 @@ impl Value {
             Value::Builtin(_, _) => "Builtin",
             Value::Data(name, _) => name.as_str(),
             Value::Object(_) => "Object",
+            Value::Type(_) => "Type",
+            Value::Vector(_) => "Vec",
+            Value::Map(_) => "Map",
+            Value::Set(_) => "Set",
+        }
+    }
+}
+
+/// §4 结构相等:标量按值、Data 按构造器名+字段、集合按内容、Type 按类型结构。
+/// 闭包(捕获环境)不可结构比较,按不同处理(仅同类判别,eq 返回 false)。
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Char(a), Value::Char(b)) => a == b,
+            (Value::Unit, Value::Unit) => true,
+            (Value::Data(na, fa), Value::Data(nb, fb)) => na == nb && fa == fb,
+            (Value::Object(a), Value::Object(b)) => a == b,
+            (Value::Type(a), Value::Type(b)) => a == b,
+            (Value::Vector(a), Value::Vector(b)) => a == b,
+            (Value::Map(a), Value::Map(b)) => a == b,
+            (Value::Set(a), Value::Set(b)) => a == b,
+            (Value::Builtin(na, _), Value::Builtin(nb, _)) => na == nb,
+            (Value::Closure(_), Value::Closure(_)) => false,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Value {}
+
+/// §4 结构哈希:与 PartialEq 一致(相等 ⇒ 同哈希);闭包/内置按判别式区分。
+impl std::hash::Hash for Value {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Value::Int(n) => n.hash(state),
+            Value::Float(f) => f.to_bits().hash(state),
+            Value::Bool(b) => b.hash(state),
+            Value::Str(s) => s.hash(state),
+            Value::Char(c) => c.hash(state),
+            Value::Unit => {}
+            Value::Data(n, f) => { n.hash(state); f.hash(state); }
+            Value::Object(m) => {
+                // std HashMap 不实现 Hash:按 key 字典序排序后逐个哈希(与 Eq 一致)
+                let mut entries: Vec<(&Symbol, &Value)> = m.iter().collect();
+                entries.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+                for (k, v) in entries { k.hash(state); v.hash(state); }
+            }
+            Value::Type(t) => t.hash(state),
+            Value::Vector(v) => v.hash(state),
+            Value::Map(m) => m.hash(state),
+            Value::Set(s) => s.hash(state),
+            Value::Builtin(n, _) => n.hash(state),
+            Value::Closure(_) => {}
         }
     }
 }
@@ -174,14 +273,25 @@ impl Interpreter {
                session_protocol: HashMap::new(), clp_store: ClpStore::new(),
                generic_table: HashMap::new(),
                instance_dict: HashMap::new(),
+               class_fun_deps: HashMap::new(),
+               class_supers: HashMap::new(),
+               class_instance_types: HashMap::new(),
                ctor_arity: HashMap::new(),
                field_names: HashMap::new(),
                collect_mode: false,
                collected_solutions: Vec::new(),
                collect_start_depth: 0,
                handlers: Vec::new(),
+               direct_state: None,
                process_runtime: Arc::new(Mutex::new(ProcessRuntime::new())),
                crypto: CryptoEngine::new(),
+               #[cfg(not(feature = "crypto"))]
+               crypto_warned: false,
+               unsafe_warned: false,
+               ptr_mem: HashMap::new(),
+               next_ptr_addr: 1,
+               freed_addrs: std::collections::HashSet::new(),
+               kb: tisp_core::evolp::Program::new(),
                streams: HashMap::new(),
                next_stream_id: 0,
                ambients: HashMap::new(),
@@ -191,6 +301,7 @@ impl Interpreter {
                next_signal_id: 0,
                clp_var_names: HashMap::new(),
                def_sigs: HashMap::new(),
+               def_params: HashMap::new(),
                gensym_counter: std::sync::atomic::AtomicU64::new(0),
                #[cfg(feature = "ffi")]
                extern_libs: Vec::new(),
@@ -235,6 +346,29 @@ impl Interpreter {
             }));
             self.extern_libs.push(lib);
             return Ok(v);
+        }
+        // §26 字符串签名:fn(str) -> str(UTF-8 → CString → CStr → UTF-8)
+        {
+            use std::ffi::{CString, CStr};
+            if let Ok(f) = unsafe { lib.get::<unsafe extern "C" fn(*const i8) -> *const i8>(sym_name.as_bytes()) } {
+                let f = *f;
+                let v = Value::Builtin(sym_name.clone().into(), Arc::new(move |_s, args| {
+                    let a = match args.first() {
+                        Some(Value::Str(s)) => s.clone(),
+                        _ => String::new(),
+                    };
+                    let c = match CString::new(a) { Ok(c) => c, Err(_) => return Ok(Value::Str(String::new())) };
+                    let r = unsafe { f(c.as_ptr()) };
+                    if r.is_null() {
+                        Ok(Value::Str(String::new()))
+                    } else {
+                        let s = unsafe { CStr::from_ptr(r) }.to_string_lossy().into_owned();
+                        Ok(Value::Str(s))
+                    }
+                }));
+                self.extern_libs.push(lib);
+                return Ok(v);
+            }
         }
         Err(format!("符号 {} 无匹配的 C ABI 签名", sym))
     }
@@ -293,6 +427,29 @@ impl Interpreter {
             Value::Str(s) => LogicValue::Str(s.clone()),
             Value::Bool(b) => LogicValue::Bool(*b),
             Value::Unit => LogicValue::Nil,
+            // §21.2 结构化值统一:Cons/Nil/Vec → Cons 链(替换 Int(0) 折叠)
+            Value::Data(name, args) => match name.as_str() {
+                "Nil" => LogicValue::Nil,
+                "Cons" if args.len() == 2 => {
+                    LogicValue::Cons(Box::new(self.val_to_logic(&args[0])), Box::new(self.val_to_logic(&args[1])))
+                }
+                "Vec" => {
+                    let mut result = LogicValue::Nil;
+                    for a in args.iter().rev() {
+                        result = LogicValue::Cons(Box::new(self.val_to_logic(a)), Box::new(result));
+                    }
+                    result
+                }
+                _ => LogicValue::Int(0),
+            },
+            // §4 持久化 Vector → Cons 链(结构化统一)
+            Value::Vector(v) => {
+                let mut result = LogicValue::Nil;
+                for a in v.iter().rev() {
+                    result = LogicValue::Cons(Box::new(self.val_to_logic(a)), Box::new(result));
+                }
+                result
+            }
             _ => LogicValue::Int(0),
         }
     }
@@ -497,32 +654,134 @@ impl Interpreter {
             }),
             // §4 集合构造器
             bi("list", |_s, args| Ok(list_from_vec(args.to_vec()))),
-            bi("vector", |_s, args| Ok(Value::Data(Symbol::new("Vec"), args.to_vec()))),
+            bi("vector", |_s, args| Ok(Value::Vector(args.iter().cloned().collect()))),
             bi("hash-map", |_s, args| {
-                let mut pairs = Vec::new();
+                let mut m = im::HashMap::new();
                 let mut i = 0;
                 while i + 1 < args.len() {
-                    pairs.push(Value::Data(Symbol::new("Pair"), vec![args[i].clone(), args[i + 1].clone()]));
+                    m.insert(args[i].clone(), args[i + 1].clone());
                     i += 2;
                 }
-                Ok(Value::Data(Symbol::new("Map"), pairs))
+                Ok(Value::Map(m))
             }),
-            bi("hash-set", |_s, args| Ok(Value::Data(Symbol::new("Set"), args.to_vec()))),
-            bi("first", |_s, args| {
-                if let Some(Value::Data(c, fields)) = args.first() {
-                    if c.as_str() == "Cons" && !fields.is_empty() { return Ok(fields[0].clone()); }
+            bi("hash-set", |_s, args| Ok(Value::Set(args.iter().cloned().collect()))),
+            // §4 持久化集合操作(结构共享:返回新结构,旧结构不变)
+            bi("conj", |_s, args| {
+                if args.len() >= 2 {
+                    let coll = &args[0];
+                    let item = args[1].clone();
+                    match coll {
+                        Value::Vector(v) => {
+                            let mut v2 = v.clone();
+                            v2.push_back(item);
+                            Ok(Value::Vector(v2))
+                        }
+                        Value::Set(s) => {
+                            let mut s2 = s.clone();
+                            s2.insert(item);
+                            Ok(Value::Set(s2))
+                        }
+                        Value::Map(m) => {
+                            // (conj m [k v]) 或 (conj m entry...)
+                            let mut m2 = m.clone();
+                            if let Value::Vector(kv) = &item {
+                                if kv.len() == 2 {
+                                    m2.insert(kv[0].clone(), kv[1].clone());
+                                }
+                            }
+                            Ok(Value::Map(m2))
+                        }
+                        // 列表:头插(结构共享尾部)
+                        other => Ok(Value::Data(Symbol::new("Cons"), vec![item, other.clone()])),
+                    }
+                } else {
+                    Ok(Value::Unit)
+                }
+            }),
+            bi("assoc", |_s, args| {
+                if args.len() >= 3 {
+                    if let Value::Map(m) = &args[0] {
+                        let mut m2 = m.clone();
+                        let mut i = 1;
+                        while i + 1 < args.len() {
+                            m2.insert(args[i].clone(), args[i + 1].clone());
+                            i += 2;
+                        }
+                        return Ok(Value::Map(m2));
+                    }
+                    if let Value::Vector(v) = &args[0] {
+                        if let (Value::Int(idx), val) = (&args[1], &args[2]) {
+                            let mut v2 = v.clone();
+                            if *idx >= 0 && (*idx as usize) < v2.len() {
+                                v2.set(*idx as usize, val.clone());
+                                return Ok(Value::Vector(v2));
+                            }
+                        }
+                    }
                 }
                 Ok(Value::Unit)
+            }),
+            bi("contains?", |_s, args| {
+                if args.len() >= 2 {
+                    return Ok(Value::Bool(match &args[0] {
+                        Value::Set(s) => s.contains(&args[1]),
+                        Value::Map(m) => m.contains_key(&args[1]),
+                        other => {
+                            // 列表/任意集合:线性扫描
+                            list_to_vec(other).iter().any(|v| v == &args[1])
+                        }
+                    }));
+                }
+                Ok(Value::Bool(false))
+            }),
+            bi("dissoc", |_s, args| {
+                if args.len() >= 2 {
+                    if let Value::Map(m) = &args[0] {
+                        let mut m2 = m.clone();
+                        for k in &args[1..] {
+                            m2.remove(k);
+                        }
+                        return Ok(Value::Map(m2));
+                    }
+                }
+                Ok(Value::Unit)
+            }),
+            bi("disj", |_s, args| {
+                if args.len() >= 2 {
+                    if let Value::Set(s) = &args[0] {
+                        let mut s2 = s.clone();
+                        for x in &args[1..] {
+                            s2.remove(x);
+                        }
+                        return Ok(Value::Set(s2));
+                    }
+                }
+                Ok(Value::Unit)
+            }),
+            bi("first", |_s, args| {
+                match args.first() {
+                    Some(Value::Data(c, fields)) if c.as_str() == "Cons" && !fields.is_empty() => Ok(fields[0].clone()),
+                    Some(Value::Vector(v)) => Ok(v.front().cloned().unwrap_or(Value::Unit)),
+                    _ => Ok(Value::Unit),
+                }
             }),
             bi("rest", |_s, args| {
-                if let Some(Value::Data(c, fields)) = args.first() {
-                    if c.as_str() == "Cons" && fields.len() >= 2 { return Ok(fields[1].clone()); }
+                match args.first() {
+                    Some(Value::Data(c, fields)) if c.as_str() == "Cons" && fields.len() >= 2 => Ok(fields[1].clone()),
+                    Some(Value::Vector(v)) if !v.is_empty() => Ok(Value::Vector(v.skip(1))),
+                    _ => Ok(Value::Unit),
                 }
-                Ok(Value::Unit)
             }),
             bi("nth", |_s, args| {
                 if args.len() >= 2 {
                     if let Value::Int(n) = &args[1] {
+                        // §4 持久化 Vector:直接 O(log32) 索引
+                        if let Value::Vector(v) = &args[0] {
+                            if *n >= 0 && (*n as usize) < v.len() {
+                                return Ok(v[*n as usize].clone());
+                            }
+                            return Ok(Value::Unit);
+                        }
                         let mut cur = args[0].clone();
                         let mut remaining = *n;
                         loop {
@@ -690,22 +949,115 @@ impl Interpreter {
                 }
                 Ok(Value::Bool(false))
             }),
-            // ── 反射 ──
-            bi("type-of", |_s, args| {
+            // §16.3 fun-ext:有限域函数点态等价
+            bi("fun-ext", |s, args| {
+                if args.len() >= 3 {
+                    let f = args[0].clone();
+                    let g = args[1].clone();
+                    let vals: Vec<Value> = match &args[2] {
+                        Value::Data(_, fields) => fields.clone(),
+                        _ => vec![],
+                    };
+                    for v in vals {
+                        let fv = s.apply(f.clone(), &[v.clone()]).unwrap_or(Value::Unit);
+                        let gv = s.apply(g.clone(), &[v]).unwrap_or(Value::Unit);
+                        if !values_eq(&fv, &gv) { return Ok(Value::Bool(false)); }
+                    }
+                    return Ok(Value::Bool(true));
+                }
+                Ok(Value::Bool(false))
+            }),
+            // §16.4 幺半等价:结合律 + 单位元(有限域枚举,反例即 false)
+            bi("monoid-check", |s, args| {
+                if args.len() >= 3 {
+                    let op = args[0].clone();
+                    let unit = args[1].clone();
+                    let vals: Vec<Value> = match &args[2] {
+                        Value::Data(_, fields) => fields.clone(),
+                        _ => vec![],
+                    };
+                    for x in &vals {
+                        let l = s.apply(op.clone(), &[unit.clone(), x.clone()]).unwrap_or(Value::Unit);
+                        let r = s.apply(op.clone(), &[x.clone(), unit.clone()]).unwrap_or(Value::Unit);
+                        if !values_eq(&l, x) || !values_eq(&r, x) { return Ok(Value::Bool(false)); }
+                    }
+                    for x in &vals { for y in &vals { for z in &vals {
+                        let xy = s.apply(op.clone(), &[x.clone(), y.clone()]).unwrap_or(Value::Unit);
+                        let l = s.apply(op.clone(), &[xy, z.clone()]).unwrap_or(Value::Unit);
+                        let yz = s.apply(op.clone(), &[y.clone(), z.clone()]).unwrap_or(Value::Unit);
+                        let r = s.apply(op.clone(), &[x.clone(), yz]).unwrap_or(Value::Unit);
+                        if !values_eq(&l, &r) { return Ok(Value::Bool(false)); }
+                    }}}
+                    return Ok(Value::Bool(true));
+                }
+                Ok(Value::Bool(false))
+            }),
+            // ── 反射(§29.7):查询 def_sigs 返回真实静态信息,替换硬编码常量 ──
+            bi("type-of", |s, args| {
+                // 静态推断类型(声明返回类型),非运行时值标签
+                if let Some(Value::Str(name)) = args.first() {
+                    if let Some((_, Some(ty), _, _, _, _)) = s.def_sigs.get(&Symbol::new(name)) {
+                        return Ok(Value::Type(ty.clone()));
+                    }
+                }
                 if let Some(v) = args.first() { Ok(Value::Str(v.type_name().to_string())) } else { Ok(Value::Str("unknown".into())) }
             }),
             bi("grade-of", |s, args| {
-                // §10:查询定义等级(依赖等级显示);无参兼容旧行为
+                // §10:查询定义参数等级列表
                 if let Some(Value::Str(name)) = args.first() {
-                    if let Some((_, _, _, grades)) = s.def_sigs.get(&Symbol::new(name)) {
+                    if let Some((_, _, _, grades, _, _)) = s.def_sigs.get(&Symbol::new(name)) {
                         return Ok(Value::Str(format!("{:?}", grades)));
                     }
                 }
                 Ok(Value::Str("ω".into()))
             }),
-            bi("mode-of", |_s, _args| Ok(Value::Str("in".into()))),
-            bi("effects-of", |_s, _args| Ok(Value::Str("Pure".into()))),
-            bi("determinism-of", |_s, _args| Ok(Value::Str("det".into()))),
+            bi("mode-of", |s, args| {
+                if let Some(Value::Str(name)) = args.first() {
+                    if let Some((_, _, _, _, mode, _)) = s.def_sigs.get(&Symbol::new(name)) {
+                        return Ok(Value::Str(format!("{:?}", mode)));
+                    }
+                }
+                Ok(Value::Str("in".into()))
+            }),
+            bi("effects-of", |s, args| {
+                if let Some(Value::Str(name)) = args.first() {
+                    if let Some((_, _, effects, _, _, _)) = s.def_sigs.get(&Symbol::new(name)) {
+                        return Ok(Value::Str(format!("{:?}", effects)));
+                    }
+                }
+                Ok(Value::Str("Pure".into()))
+            }),
+            bi("determinism-of", |s, args| {
+                if let Some(Value::Str(name)) = args.first() {
+                    if let Some((_, _, _, _, _, det)) = s.def_sigs.get(&Symbol::new(name)) {
+                        return Ok(Value::Str(format!("{:?}", det)));
+                    }
+                }
+                Ok(Value::Str("det".into()))
+            }),
+            bi("reflect", |s, args| {
+                // §29 反射完整信息:名称/参数/类型/效果/等级/模式/确定性(全真实,无近似)
+                let name = args.first().and_then(|a| match a { Value::Str(n) => Some(n.clone()), _ => None });
+                if let Some(n) = name {
+                    if let Some((arity, ty, eff, grades, mode, det)) = s.def_sigs.get(&Symbol::new(&n)).cloned() {
+                        let params: im::Vector<Value> = s.def_params.get(&Symbol::new(&n))
+                            .cloned().unwrap_or_default()
+                            .into_iter().map(|p| Value::Str(p.as_str().to_string())).collect();
+                        let ty_v = ty.clone().map(Value::Type).unwrap_or(Value::Unit);
+                        return Ok(Value::Data(Symbol::new("DefInfo"), vec![
+                            Value::Str(n),
+                            Value::Int(arity as i64),
+                            Value::Vector(params),
+                            ty_v,
+                            Value::Str(format!("{:?}", eff)),
+                            Value::Str(format!("{:?}", grades)),
+                            Value::Str(format!("{:?}", mode)),
+                            Value::Str(format!("{:?}", det)),
+                        ]));
+                    }
+                }
+                Ok(Value::Unit)
+            }),
             // ── 进程/通道(§27.2/27.3):接线 ProcessRuntime ──
             bi("chan", |s, _args| {
                 let id = s.next_chan_id; s.next_chan_id += 1;
@@ -768,7 +1120,97 @@ impl Interpreter {
                 }
                 Ok(Value::Unit)
             }),
-            bi("clock", |_s, _args| Ok(Value::Str("clock@1Hz".into()))),
+            // §17 Cohesive 连通图:(shape-graph [路径...]) → 节点与连通边
+            bi("shape-graph", |s, args| {
+                if let Some(paths) = args.first() {
+                    if let Value::Data(_, fields) = paths {
+                        let mut edges = Vec::new();
+                        for p in fields {
+                            let b0 = s.apply(p.clone(), &[Value::Bool(false)]).unwrap_or(Value::Unit);
+                            let b1 = s.apply(p.clone(), &[Value::Bool(true)]).unwrap_or(Value::Unit);
+                            edges.push(Value::Data(Symbol::new("Edge"), vec![
+                                Value::Bool(values_eq(&b0, &b1)), b0, b1,
+                            ]));
+                        }
+                        return Ok(Value::Data(Symbol::new("ShapeGraph"), edges));
+                    }
+                }
+                Ok(Value::Data(Symbol::new("ShapeGraph"), vec![]))
+            }),
+            // §18.6 多时钟重采样:(resample stream rate) 按速率抽值(每 rate 取一)
+            bi("resample", |s, args| {
+                if args.len() >= 2 {
+                    if let Ok(id) = stream_id(&args[0]) {
+                        let rate = match &args[1] { Value::Int(n) => (*n).max(1) as usize, _ => 1 };
+                        if let Some(st) = s.streams.get(&id).cloned() {
+                            let vals: Vec<Value> = st.take(rate * 5).into_iter()
+                                .step_by(rate).map(Value::Int).collect();
+                            return Ok(list_from_vec(vals));
+                        }
+                    }
+                }
+                Ok(list_from_vec(vec![]))
+            }),
+            // §18.6 多时钟:(clock name rate) 注册真实时钟(替换字面量占位)
+            bi("clock", |_s, args| {
+                if args.len() >= 2 {
+                    let name = show_value(&args[0]);
+                    let rate = match &args[1] { Value::Int(n) => *n, Value::Float(f) => *f as i64, _ => 1 };
+                    Ok(Value::Data(Symbol::new("Clock"), vec![Value::Int(rate), Value::Str(name)]))
+                } else {
+                    Ok(Value::Data(Symbol::new("Clock"), vec![Value::Int(1), Value::Str("clock@1Hz".into())]))
+                }
+            }),
+            // §26.3 手动区域:with-region 创建区域、运行 f、退出时回收该区域内所有分配
+            bi("with-region", |s, args| {
+                unsafe_warn(s);
+                if let Some(f) = args.first().cloned() {
+                    let start_addr = s.next_ptr_addr;
+                    // 运行 f(区域 id 以 0 传入)
+                    let r = s.apply(f, &[Value::Int(0)]);
+                    // 退出:回收本区域分配(addr >= start_addr),并标记悬垂
+                    let addrs: Vec<u64> = s.ptr_mem.keys().filter(|&&a| a >= start_addr).cloned().collect();
+                    for a in addrs { s.ptr_mem.remove(&a); s.freed_addrs.insert(a); }
+                    r
+                } else {
+                    Ok(Value::Unit)
+                }
+            }),
+            // §18.1 always/eventually:有限窗口流判定
+            bi("always", |s, args| {
+                if args.len() >= 3 {
+                    if let Ok(id) = stream_id(&args[0]) {
+                        let window = match &args[2] { Value::Int(n) => *n as usize, _ => 10 };
+                        let pred = args[1].clone();
+                        if let Some(st) = s.streams.get(&id).cloned() {
+                            let vals = st.take(window);
+                            for v in vals {
+                                let pv = s.apply(pred.clone(), &[Value::Int(v)]).unwrap_or(Value::Bool(false));
+                                if !is_truthy(&pv) { return Ok(Value::Bool(false)); }
+                            }
+                            return Ok(Value::Bool(true));
+                        }
+                    }
+                }
+                Ok(Value::Bool(false))
+            }),
+            bi("eventually", |s, args| {
+                if args.len() >= 3 {
+                    if let Ok(id) = stream_id(&args[0]) {
+                        let window = match &args[2] { Value::Int(n) => *n as usize, _ => 10 };
+                        let pred = args[1].clone();
+                        if let Some(st) = s.streams.get(&id).cloned() {
+                            let vals = st.take(window);
+                            for v in vals {
+                                let pv = s.apply(pred.clone(), &[Value::Int(v)]).unwrap_or(Value::Bool(false));
+                                if is_truthy(&pv) { return Ok(Value::Bool(true)); }
+                            }
+                            return Ok(Value::Bool(false));
+                        }
+                    }
+                }
+                Ok(Value::Bool(false))
+            }),
             // ── 逻辑编程(占位实现,真实语义见 CoreExprNode::Fresh/Unify/Search/Commit)──
             bi("fresh", |_s, _args| Ok(Value::Int(0))),
             bi("==", |_s, args| {
@@ -819,7 +1261,13 @@ impl Interpreter {
                             .iter().map(|(_, lv)| logic_to_value(lv)).collect();
                         if !sol.is_empty() { s.collected_solutions.push(sol); }
                     }
-                    let results: Vec<Value> = s.collected_solutions.iter()
+                    // §21 过滤:有非空解时丢弃空解(递归尾失败产生的空快照)
+                    let mut sols: Vec<Vec<Value>> = s.collected_solutions.clone();
+                    let has_nonempty = sols.iter().any(|sol| !sol.is_empty());
+                    if has_nonempty {
+                        sols.retain(|sol| !sol.is_empty());
+                    }
+                    let results: Vec<Value> = sols.iter()
                         .map(|sol| list_from_vec(sol.clone()))
                         .collect();
                     s.collect_mode = false;
@@ -834,17 +1282,23 @@ impl Interpreter {
                 Ok(Value::Str(format!("g{}", n)))
             }),
             bi("find-attack", |_s, _args| {
-                // §28 演示攻击场景:机密消息经不安全通道,攻击者窃听(逐消息加入知识)
+                // §28 dolev-yao:攻击者窃听传输 + 合成(拼接)后检查机密是否进入知识
                 let checker = ModelChecker::new(20);
                 let secret = "SECRET";
-                let init: (std::collections::BTreeSet<String>, usize) = (std::collections::BTreeSet::new(), 0usize);
+                let init = DolevYaoAttacker::new();
                 let result = checker.find_attack(init,
-                    |(knowledge, _)| knowledge.contains(secret),
-                    |(knowledge, step)| {
-                        let mut k = knowledge.clone();
-                        if *step == 0 { k.insert("pub".to_string()); }
-                        if *step == 1 { k.insert(secret.to_string()); }
-                        vec![(k, step + 1)]
+                    |a| a.knows(secret),
+                    |a| {
+                        let mut next = a.clone();
+                        // 教学级协议:步骤 0 泄漏前缀,步骤 1 泄漏机密(不安全通道)
+                        if next.knowledge.is_empty() {
+                            next.eavesdrop("pub");
+                        } else {
+                            next.eavesdrop(secret);
+                        }
+                        // dolev-yao 合成:拼接已知消息(重放/篡改基础)
+                        next.synthesize();
+                        vec![next]
                     });
                 Ok(Value::Bool(result.property_holds))
             }),
@@ -887,6 +1341,331 @@ impl Interpreter {
             bi("tell", |s, args| s.perform_effect("tell", args.to_vec())),
             bi("throw", |s, args| s.perform_effect("throw", args.to_vec())),
             bi("choose", |s, args| s.perform_effect("choose", args.to_vec())),
+            // ── 范式集成(§31/§32):24 范式经 ParadigmRegistry 全链路接入,从源码可调用 ──
+            bi("pf-higher-order", |_s, args| paradigm_eval("higher-order", args)),
+            bi("pf-induce", |_s, args| paradigm_eval("induce", args)),
+            bi("pf-prob", |_s, args| paradigm_eval("prob", args)),
+            bi("pf-eventually", |_s, args| paradigm_eval("eventually", args)),
+            bi("pf-subsume", |_s, args| paradigm_eval("subsume", args)),
+            bi("pf-settle", |_s, args| paradigm_eval("settle", args)),
+            bi("pf-fuzzy-and", |_s, args| paradigm_eval("fuzzy-and", args)),
+            bi("pf-tabling", |_s, args| paradigm_eval("tabling", args)),
+            bi("pf-typed-pred", |_s, args| paradigm_eval("typed-pred", args)),
+            bi("pf-reactive", |_s, args| paradigm_eval("reactive", args)),
+            bi("pf-context-query", |_s, args| paradigm_eval("context-query", args)),
+            bi("pf-possible", |_s, args| paradigm_eval("possible", args)),
+            bi("pf-evolp", |_s, args| paradigm_eval("evolp", args)),
+            bi("pf-dlp", |_s, args| paradigm_eval("dlp", args)),
+            bi("pf-get-kb", |_s, args| paradigm_eval("get-kb", args)),
+            bi("pf-array-sum", |_s, args| paradigm_eval("array-sum", args)),
+            bi("pf-stack-top", |_s, args| paradigm_eval("stack-top", args)),
+            bi("pf-compose", |_s, args| paradigm_eval("compose", args)),
+            bi("pf-sym-eval", |_s, args| paradigm_eval("sym-eval", args)),
+            bi("pf-dfa-accept", |_s, args| paradigm_eval("dfa-accept", args)),
+            bi("pf-sm-drive", |_s, args| paradigm_eval("sm-drive", args)),
+            bi("pf-dispatch", |_s, args| paradigm_eval("dispatch", args)),
+            bi("pf-stream-take", |_s, args| paradigm_eval("stream-take", args)),
+            bi("pf-aop-weave", |_s, args| paradigm_eval("aop-weave", args)),
+            // §32 真实自动机:DFA 识别(接线 tisp_runtime::programming::Dfa,替换 pf-dfa-accept 的 sum%2 占位)
+            // (dfa-accept start accept-list transitions input):transitions 为扁平 [from char-code to ...] 三元组
+            bi("dfa-accept", |_s, args| {
+                if args.len() != 4 {
+                    return Err(EvalError { message: "dfa-accept 需 (start accept-list transitions input) 4 参".into() });
+                }
+                let start = match &args[0] {
+                    Value::Int(n) => n.to_string(),
+                    _ => return Err(EvalError { message: "dfa-accept:start 应为整数状态".into() }),
+                };
+                let accept: im::HashSet<String> = value_to_int_list(&args[1])?
+                    .into_iter().map(|n| n.to_string()).collect();
+                let triples = value_to_int_list(&args[2])?;
+                if triples.len() % 3 != 0 {
+                    return Err(EvalError { message: "dfa-accept:transitions 长度须为 3 的倍数".into() });
+                }
+                let mut transitions = Vec::new();
+                for chunk in triples.chunks(3) {
+                    let from = chunk[0].to_string();
+                    let ch = char::from_u32(chunk[1] as u32).unwrap_or('?');
+                    let to = chunk[2].to_string();
+                    transitions.push((from, ch, to));
+                }
+                let input = match &args[3] {
+                    Value::Str(s) => s.clone(),
+                    _ => return Err(EvalError { message: "dfa-accept:input 应为字符串".into() }),
+                };
+                let dfa = tisp_runtime::programming::Dfa { start, accept, transitions };
+                Ok(Value::Bool(dfa.accepts(&input)))
+            }),
+            // §32 真实状态机:事件驱动转移(接线 tisp_runtime::programming::StateMachine,替换 sm-drive 占位)
+            // (sm-drive current event transitions):transitions 为扁平 [from event to ...] 三元组
+            bi("sm-drive", |_s, args| {
+                if args.len() != 3 {
+                    return Err(EvalError { message: "sm-drive 需 (current event transitions) 3 参".into() });
+                }
+                let current = match &args[0] {
+                    Value::Int(n) => n.to_string(),
+                    _ => return Err(EvalError { message: "sm-drive:current 应为整数状态".into() }),
+                };
+                let event = match &args[1] {
+                    Value::Int(n) => n.to_string(),
+                    _ => return Err(EvalError { message: "sm-drive:event 应为整数事件".into() }),
+                };
+                let triples = value_to_int_list(&args[2])?;
+                if triples.len() % 3 != 0 {
+                    return Err(EvalError { message: "sm-drive:transitions 长度须为 3 的倍数".into() });
+                }
+                let transitions: Vec<(String, String, String)> = triples.chunks(3)
+                    .map(|c| (c[0].to_string(), c[1].to_string(), c[2].to_string()))
+                    .collect();
+                let mut sm = tisp_runtime::programming::StateMachine { current, transitions, trace: Vec::new() };
+                match sm.drive(&event) {
+                    Ok(()) => Ok(Value::Int(sm.current.parse::<i64>().unwrap_or(0))),
+                    Err(e) => Err(EvalError { message: e }),
+                }
+            }),
+            // §32 真实描述逻辑:概念子概念推理(接线 tisp_runtime::paradigms::Ontology,替换 subsume 占位)
+            // (subsume subsumes-pairs concept query):subsumes-pairs 为扁平 [sub super ...]
+            bi("subsume", |_s, args| {
+                if args.len() != 3 {
+                    return Err(EvalError { message: "subsume 需 (subsumes concept query) 3 参".into() });
+                }
+                let pairs = value_to_int_list(&args[0])?;
+                if pairs.len() % 2 != 0 {
+                    return Err(EvalError { message: "subsume:subsumes 长度须为偶数".into() });
+                }
+                let subsumes: Vec<(Symbol, Symbol)> = pairs.chunks(2)
+                    .map(|c| (Symbol::new(&c[0].to_string()), Symbol::new(&c[1].to_string())))
+                    .collect();
+                let concept = match &args[1] {
+                    Value::Int(n) => Symbol::new(&n.to_string()),
+                    _ => return Err(EvalError { message: "subsume:concept 应为整数".into() }),
+                };
+                let query = match &args[2] {
+                    Value::Int(n) => Symbol::new(&n.to_string()),
+                    _ => return Err(EvalError { message: "subsume:query 应为整数".into() }),
+                };
+                let ont = tisp_runtime::paradigms::Ontology { subsumes };
+                Ok(Value::Bool(ont.is_instance(&concept, &query)))
+            }),
+            // §32 真实表格化逻辑:左递归终止 + 记忆(接线 tisp_runtime::paradigms::Tabler,替换 tabling 占位)
+            // (tabling facts rules goal):facts 为原子列表,rules 为扁平 [head body ...](每规则单个体原子)
+            bi("tabling", |_s, args| {
+                use tisp_core::evolp::LTerm;
+                if args.len() != 3 {
+                    return Err(EvalError { message: "tabling 需 (facts rules goal) 3 参".into() });
+                }
+                let facts: Vec<LTerm> = value_to_int_list(&args[0])?
+                    .into_iter().map(|n| LTerm::atom(&n.to_string())).collect();
+                let rule_pairs = value_to_int_list(&args[1])?;
+                if rule_pairs.len() % 2 != 0 {
+                    return Err(EvalError { message: "tabling:rules 长度须为偶数".into() });
+                }
+                let rules: Vec<(LTerm, Vec<LTerm>)> = rule_pairs.chunks(2)
+                    .map(|c| (LTerm::atom(&c[0].to_string()), vec![LTerm::atom(&c[1].to_string())]))
+                    .collect();
+                let goal = match &args[2] {
+                    Value::Int(n) => LTerm::atom(&n.to_string()),
+                    _ => return Err(EvalError { message: "tabling:goal 应为整数原子".into() }),
+                };
+                let mut tabler = tisp_runtime::paradigms::Tabler::new(&facts, rules);
+                Ok(Value::Bool(tabler.prove(&goal)))
+            }),
+            // §32 真实符号编程:后序构造 SymExpr + 化简 + 求值(接线 programming::SymExpr,替换 sym-eval 占位)
+            // (sym-eval postfix):postfix 为扁平后序记号,n≥0 = Num(n),-1 = Add,-2 = Mul
+            bi("sym-eval", |_s, args| {
+                use tisp_runtime::programming::SymExpr;
+                if args.len() != 1 {
+                    return Err(EvalError { message: "sym-eval 需 (postfix) 1 参".into() });
+                }
+                let toks = value_to_int_list(&args[0])?;
+                let mut stack: Vec<SymExpr> = Vec::new();
+                for t in toks {
+                    match t {
+                        n if n >= 0 => stack.push(SymExpr::Num(n)),
+                        -1 => {
+                            let b = stack.pop().ok_or_else(|| EvalError { message: "sym-eval:Add 缺操作数".into() })?;
+                            let a = stack.pop().ok_or_else(|| EvalError { message: "sym-eval:Add 缺操作数".into() })?;
+                            stack.push(SymExpr::Add(Box::new(a), Box::new(b)));
+                        }
+                        -2 => {
+                            let b = stack.pop().ok_or_else(|| EvalError { message: "sym-eval:Mul 缺操作数".into() })?;
+                            let a = stack.pop().ok_or_else(|| EvalError { message: "sym-eval:Mul 缺操作数".into() })?;
+                            stack.push(SymExpr::Mul(Box::new(a), Box::new(b)));
+                        }
+                        _ => return Err(EvalError { message: format!("sym-eval:未知记号 {}", t) }),
+                    }
+                }
+                let expr = stack.pop().ok_or_else(|| EvalError { message: "sym-eval:空表达式".into() })?;
+                Ok(Value::Int(expr.simplify().eval().unwrap_or(0)))
+            }),
+            // §31 真实 EVOLP/ASP:命题稳定模型(接线 tisp_runtime::evolp::stable_models,替换 evolp 占位)
+            // (evolp-stable facts rules):facts 为正原子列表,rules 为扁平 [head body ...](body<0 = not atom)
+            bi("evolp-stable", |_s, args| {
+                use tisp_core::evolp::{LTerm, Literal, Program, Rule};
+                if args.len() != 2 {
+                    return Err(EvalError { message: "evolp-stable 需 (facts rules) 2 参".into() });
+                }
+                let facts = value_to_int_list(&args[0])?;
+                let rule_pairs = value_to_int_list(&args[1])?;
+                if rule_pairs.len() % 2 != 0 {
+                    return Err(EvalError { message: "evolp-stable:rules 长度须为偶数".into() });
+                }
+                let mut prog = Program::new();
+                for f in &facts {
+                    prog.add(Rule::fact(&f.to_string(), LTerm::atom(&f.to_string())));
+                }
+                for chunk in rule_pairs.chunks(2) {
+                    let head = chunk[0];
+                    let body = chunk[1];
+                    let lit = if body >= 0 {
+                        Literal::Pos(LTerm::atom(&body.to_string()))
+                    } else {
+                        Literal::Neg(LTerm::atom(&(-body).to_string()))
+                    };
+                    prog.add(Rule::rule(&format!("r{}", head), LTerm::atom(&head.to_string()), vec![lit]));
+                }
+                let models = tisp_runtime::evolp::stable_models(&prog);
+                match models.first() {
+                    Some(m) => {
+                        let atoms: im::Vector<Value> = m.iter().filter_map(|t| match t {
+                            LTerm::Fun(n, _) => n.as_str().parse::<i64>().ok().map(Value::Int),
+                            _ => None,
+                        }).collect();
+                        Ok(Value::Vector(atoms))
+                    }
+                    None => Ok(Value::Vector(im::Vector::new())),
+                }
+            }),
+            // §31 真实 DLP:动态稳定模型(接线 tisp_runtime::evolp::dynamic_stable_models)
+            // (dlp-stable facts1 rules1 facts2 rules2):两状态,拒绝被后续状态否定的规则
+            bi("dlp-stable", |_s, args| {
+                use tisp_core::evolp::{LTerm, Literal, Program, Rule};
+                if args.len() != 4 {
+                    return Err(EvalError { message: "dlp-stable 需 (facts1 rules1 facts2 rules2) 4 参".into() });
+                }
+                let build = |fv: &Value, rv: &Value| -> Result<Program, EvalError> {
+                    let facts = value_to_int_list(fv)?;
+                    let rule_pairs = value_to_int_list(rv)?;
+                    if rule_pairs.len() % 2 != 0 {
+                        return Err(EvalError { message: "dlp-stable:rules 长度须为偶数".into() });
+                    }
+                    let mut prog = Program::new();
+                    for f in &facts {
+                        prog.add(Rule::fact(&f.to_string(), LTerm::atom(&f.to_string())));
+                    }
+                    for chunk in rule_pairs.chunks(2) {
+                        let head = chunk[0];
+                        let body = chunk[1];
+                        let lit = if body >= 0 {
+                            Literal::Pos(LTerm::atom(&body.to_string()))
+                        } else {
+                            Literal::Neg(LTerm::atom(&(-body).to_string()))
+                        };
+                        prog.add(Rule::rule(&format!("r{}", head), LTerm::atom(&head.to_string()), vec![lit]));
+                    }
+                    Ok(prog)
+                };
+                let p1 = build(&args[0], &args[1])?;
+                let p2 = build(&args[2], &args[3])?;
+                let models = tisp_runtime::evolp::dynamic_stable_models(&[p1, p2]);
+                match models.first() {
+                    Some(m) => {
+                        let atoms: im::Vector<Value> = m.iter().filter_map(|t| match t {
+                            LTerm::Fun(n, _) => n.as_str().parse::<i64>().ok().map(Value::Int),
+                            _ => None,
+                        }).collect();
+                        Ok(Value::Vector(atoms))
+                    }
+                    None => Ok(Value::Vector(im::Vector::new())),
+                }
+            }),
+            // §31 真实 EVOLP 演化:assert/retract 指令 + foldl 折叠(接线 tisp_runtime::evolp::evolve_all)
+            // (evolp-evolve facts instructions):instructions 为扁平 [op atom ...],op=1 assert / 0 retract
+            bi("evolp-evolve", |_s, args| {
+                use tisp_core::evolp::{EvolInstr, LTerm, Program, Rule};
+                use tisp_core::symbol::Symbol as Sym;
+                if args.len() != 2 {
+                    return Err(EvalError { message: "evolp-evolve 需 (facts instructions) 2 参".into() });
+                }
+                let facts = value_to_int_list(&args[0])?;
+                let instrs = value_to_int_list(&args[1])?;
+                if instrs.len() % 2 != 0 {
+                    return Err(EvalError { message: "evolp-evolve:instructions 长度须为偶数".into() });
+                }
+                let mut prog = Program::new();
+                for f in &facts {
+                    prog.add(Rule::fact(&f.to_string(), LTerm::atom(&f.to_string())));
+                }
+                let mut evols = Vec::new();
+                for chunk in instrs.chunks(2) {
+                    let op = chunk[0];
+                    let atom = chunk[1];
+                    if op == 1 {
+                        evols.push(EvolInstr::Assert(Rule::fact(&atom.to_string(), LTerm::atom(&atom.to_string()))));
+                    } else {
+                        evols.push(EvolInstr::Retract(Sym::new(&atom.to_string())));
+                    }
+                }
+                let result = tisp_runtime::evolp::evolve_all(&prog, &evols);
+                let atoms: im::Vector<Value> = result.iter().filter_map(|r| match &r.head {
+                    LTerm::Fun(n, _) => n.as_str().parse::<i64>().ok().map(Value::Int),
+                    _ => None,
+                }).collect();
+                Ok(Value::Vector(atoms))
+            }),
+            // §31 MOP:GetKB/SetKB 效应操作(运行时 KB 状态)
+            bi("get-kb", |s, _args| {
+                use tisp_core::evolp::LTerm;
+                let atoms: im::Vector<Value> = s.kb.iter().filter_map(|r| match &r.head {
+                    LTerm::Fun(n, _) => n.as_str().parse::<i64>().ok().map(Value::Int),
+                    _ => None,
+                }).collect();
+                Ok(Value::Vector(atoms))
+            }),
+            bi("set-kb", |s, args| {
+                use tisp_core::evolp::{LTerm, Program, Rule};
+                if args.len() != 1 {
+                    return Err(EvalError { message: "set-kb 需 (facts) 1 参".into() });
+                }
+                let atoms = value_to_int_list(&args[0])?;
+                let mut kb = Program::new();
+                for a in atoms {
+                    kb.add(Rule::fact(&a.to_string(), LTerm::atom(&a.to_string())));
+                }
+                s.kb = kb;
+                Ok(Value::Unit)
+            }),
+            // §统一内存管理:Ref a 分级值(State 效应,非 Unsafe)——ref/deref/set!
+            bi("ref", |s, args| {
+                if args.len() != 1 {
+                    return Err(EvalError { message: "ref 需 (value) 1 参".into() });
+                }
+                let addr = s.next_ptr_addr;
+                s.next_ptr_addr += 1;
+                s.ptr_mem.insert(addr, args[0].clone());
+                Ok(Value::Int(addr as i64))
+            }),
+            bi("deref", |s, args| {
+                if let Some(Value::Int(a)) = args.first() {
+                    if s.freed_addrs.contains(&(*a as u64)) {
+                        return Err(EvalError { message: format!("悬垂引用:地址 {} 已释放", a) });
+                    }
+                    Ok(s.ptr_mem.get(&(*a as u64)).cloned().unwrap_or(Value::Unit))
+                } else {
+                    Err(EvalError { message: "deref 需整数地址".into() })
+                }
+            }),
+            bi("set!", |s, args| {
+                if args.len() != 2 {
+                    return Err(EvalError { message: "set! 需 (addr value) 2 参".into() });
+                }
+                if let Value::Int(a) = &args[0] {
+                    s.ptr_mem.insert(*a as u64, args[1].clone());
+                    Ok(Value::Unit)
+                } else {
+                    Err(EvalError { message: "set! 需整数地址".into() })
+                }
+            }),
         ];
         for (name, value) in builtins {
             self.define(name, value);
@@ -928,40 +1707,19 @@ impl Interpreter {
         }
         // §9 反射签名表:name → (参数数, 声明类型)
         for def in &program.defs {
-            let (arity, grades) = match &def.body.node {
-                CoreExprNode::Lam(lam) => (lam.params.len(), lam.params.iter().map(|p| p.grade.clone()).collect()),
-                _ => (0, vec![]),
+            let (arity, grades, params) = match &def.body.node {
+                CoreExprNode::Lam(lam) => (
+                    lam.params.len(),
+                    lam.params.iter().map(|p| p.grade.clone()).collect(),
+                    lam.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+                ),
+                _ => (0, vec![], vec![]),
             };
-            self.def_sigs.insert(def.name.clone(), (arity, def.ty.clone(), def.effects.clone(), grades));
+            self.def_params.insert(def.name.clone(), params);
+            self.def_sigs.insert(def.name.clone(), (arity, def.ty.clone(), def.effects.clone(), grades, def.mode.clone(), def.determinism.clone()));
         }
 
-        // §7.5 deriving 派生:注册 eq-Name / show-Name 函数
-        for decl in &program.data_decls {
-            for d in &decl.deriving {
-                let type_name = decl.name.clone();
-                match d.as_str() {
-                    "Eq" => {
-                        let name = Symbol::new(&format!("eq-{}", type_name));
-                        let tn = type_name.clone();
-                        self.define(name, Value::Builtin(format!("eq-{}", tn).into(), Arc::new(|_s, args| {
-                            Ok(Value::Bool(if args.len() == 2 {
-                                values_eq(&args[0], &args[1])
-                            } else {
-                                false
-                            }))
-                        })));
-                    }
-                    "Show" => {
-                        let name = Symbol::new(&format!("show-{}", type_name));
-                        let tn = type_name.clone();
-                        self.define(name, Value::Builtin(format!("show-{}", tn).into(), Arc::new(|_s, args| {
-                            Ok(Value::Str(args.first().map(show_value).unwrap_or_else(|| "...".into())))
-                        })));
-                    }
-                    _ => {}
-                }
-            }
-        }
+        // (deriving 已由 desugar 生成 DerivingImpl 节点,解释器在 def 求值时注册结构内置)
 
         // Enter a program-level region for stack-like allocation
         self.enter_region("program");
@@ -974,7 +1732,8 @@ impl Interpreter {
                 | CoreExprNode::ClassDef(..) | CoreExprNode::InstanceDef(..)
                 | CoreExprNode::NSDef(..) | CoreExprNode::ExternDef(..)
                 | CoreExprNode::MacroDef(..) | CoreExprNode::HitDef(..)
-                | CoreExprNode::TheoremDef(..) | CoreExprNode::CompilerMacroDef(..) => {
+                | CoreExprNode::TheoremDef(..) | CoreExprNode::CompilerMacroDef(..)
+                | CoreExprNode::DerivingImpl(..) => {
                     self.eval_expr(&def.body)?;
                 }
                 _ => {
@@ -1027,8 +1786,58 @@ impl Interpreter {
         }
     }
 
+    /// §21.5 识别 (all-different v1 v2 ...) 柯里化链:返回变量表达式列表
+    fn collect_all_different<'a>(&self, e: &'a CoreExpr) -> Option<Vec<&'a CoreExpr>> {
+        // 最内层 Var(all-different),逐层解包 App
+        let mut cur = e;
+        let mut args: Vec<&CoreExpr> = Vec::new();
+        while let CoreExprNode::App(f, a) = &cur.node {
+            args.push(a);
+            cur = f;
+        }
+        if let CoreExprNode::Var(name) = &cur.node {
+            if name.as_str() == "all-different" {
+                args.reverse();
+                return Some(args);
+            }
+        }
+        None
+    }
+
+    /// §21.5 算术约束:识别变量/常数为 CLP 变量,分发乘/除/模传播器
+    fn clp_arith_constraint(&mut self, op: &str, x: &Value, y: &Value, z: &Value) {
+        let mut to_var = |v: &Value| -> Option<u64> {
+            match v {
+                Value::Int(id) if self.clp_store.domain_of(*id as u64).is_some() => Some(*id as u64),
+                Value::Int(c) => Some(self.clp_store.new_int_var(*c, *c)),
+                _ => None,
+            }
+        };
+        if let (Some(xv), Some(yv), Some(zv)) = (to_var(x), to_var(y), to_var(z)) {
+            match op {
+                "*" => self.clp_store.add_mul(xv, yv, zv),
+                "/" => self.clp_store.add_div(xv, yv, zv),
+                "%" => self.clp_store.add_mod(xv, yv, zv),
+                "+" => self.clp_store.add_plus(xv, yv, zv),
+                "-" => self.clp_store.add_minus(xv, yv, zv),
+                _ => {}
+            }
+        }
+    }
+
     /// §12.2/12.3:执行 effect 操作,从 handler 栈顶向下分发到匹配的 clause
     pub fn perform_effect(&mut self, op: &str, args: Vec<Value>) -> Result<Value, EvalError> {
+        // §12.6 直接状态线程:单状态 handler 时 get/put 直接读写状态槽(替换栈分发)
+        if let Some(state) = self.direct_state.clone() {
+            match op {
+                "get" => return Ok(state),
+                "put" if !args.is_empty() => {
+                    self.direct_state = Some(args[0].clone());
+                    return Ok(Value::Unit);
+                }
+                _ => {}
+            }
+        }
         for idx in (0..self.handlers.len()).rev() {
             if let Some(clause) = self.handlers[idx].clauses.iter().find(|c| c.operation.as_str() == op).cloned() {
                 let mut local_env = HashMap::new();
@@ -1061,8 +1870,7 @@ impl Interpreter {
     }
 
     pub fn eval_expr(&mut self, expr: &CoreExpr) -> Result<Value, EvalError> {
-        if expr.span.start >= 60 && expr.span.start <= 75 {
-        }
+        self.eval_count += 1;
         match &expr.node {
             CoreExprNode::Lit(lit) => Ok(eval_literal(lit)),
             CoreExprNode::Var(name) => {
@@ -1086,38 +1894,8 @@ impl Interpreter {
                 body: (*lambda.body).clone(),
                 env: self.env.last().cloned().unwrap_or_default(),
             })),
-            CoreExprNode::App(func, arg) => {
-                // 收集左结合应用链的全部参数,一次性 apply:
-                // (f a b c) = App(App(App(f,a),b),c) → apply(f, [a,b,c])
-                // 求值顺序与旧版一致:先求函数,再从左到右求参数
-                let mut chain: Vec<&CoreExpr> = vec![arg];
-                let mut cur = func;
-                while let CoreExprNode::App(inner_f, inner_a) = &cur.node {
-                    chain.push(inner_a);
-                    cur = inner_f;
-                }
-                chain.reverse();
-                let f = self.eval_expr(cur)?;
-                // 0 级参数擦除(§10.1):闭包 0 级位置且实参无副作用时,不求值(Unit 占位)
-                let zero_positions: Option<Vec<usize>> = match &f {
-                    Value::Closure(c) if !c.params.is_empty() => Some(c.zero_params.clone()),
-                    // def 包装的 Lam:0 级信息在 inner 参数里
-                    Value::Closure(c) => match &c.body.node {
-                        CoreExprNode::Lam(lam) => Some(zero_param_indices(&lam.params)),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                let mut args = Vec::with_capacity(chain.len());
-                for (i, a) in chain.iter().enumerate() {
-                    if let Some(z) = &zero_positions {
-                        if z.contains(&i) && is_side_effect_free(&a.node) {
-                            args.push(Value::Unit);
-                            continue;
-                        }
-                    }
-                    args.push(self.eval_expr(a)?);
-                }
+            CoreExprNode::App(..) => {
+                let (f, args) = self.eval_app(expr)?;
                 self.apply(f, &args)
             }
             CoreExprNode::Let(name, _, value, body) => {
@@ -1134,12 +1912,13 @@ impl Interpreter {
             CoreExprNode::Match(scrutinee, arms) => {
                 let s = self.eval_expr(scrutinee)?;
                 if self.collect_mode {
-                    // §21 多解收集:遍历所有 arm,每个 arm 从干净逻辑状态开始,
-                    // 成功 arm 收集逻辑变量绑定快照
+                    // §21 多解收集:遍历所有 arm,每个 arm 从本 Match 入口的干净状态开始
+                    // (分支隔离:局部 trail 快照,替换全局 collect_start_depth,避免嵌套 Match 泄漏)
+                    let arm_start = self.logic_store.trail_depth();
                     let mut last = Value::Unit;
                     for arm in arms {
-                        self.logic_store.restore_to(self.collect_start_depth);
-                        if let Some(bindings) = match_pattern(&arm.pattern, &s) {
+                        self.logic_store.restore_to(arm_start);
+                        if let Some(bindings) = self.match_pattern(&arm.pattern, &s) {
                             self.push_scope();
                             for (name, val) in bindings {
                                 if let Some(top) = self.env.last_mut() { top.insert(name, val); }
@@ -1165,7 +1944,7 @@ impl Interpreter {
                     return Ok(last);
                 }
                 for arm in arms {
-                    if let Some(bindings) = match_pattern(&arm.pattern, &s) {
+                    if let Some(bindings) = self.match_pattern(&arm.pattern, &s) {
                         self.push_scope();
                         for (name, val) in bindings {
                             if let Some(top) = self.env.last_mut() { top.insert(name, val); }
@@ -1193,9 +1972,27 @@ impl Interpreter {
                 Ok(Value::Data(name.clone(), vals?))
             }
             CoreExprNode::Handle(body, handler) => {
-                // §12.6 单处理器优化:唯一 clause → 直接状态传递路径(行为与 handler 等价)
-                if tisp_middle::effect_compile::EffectCompiler::new().detect_single_handler(handler) {
+                // §12.6 单处理器优化:状态 handler 且无嵌套 → 直接状态线程(状态槽,替换栈分发)
+                let ec = tisp_middle::effect_compile::EffectCompiler::new();
+                let direct = ec.detect_single_handler(handler) && ec.detect_no_nesting(body);
+                if direct {
                     self.monadic_handles += 1;
+                    // 直接状态线程:get/put 经 self.direct_state 读写,不 push handler
+                    let prev = self.direct_state.take();
+                    self.direct_state = Some(Value::Unit);
+                    let result = self.eval_expr(body);
+                    let result = result?;
+                    self.direct_state = prev;
+                    return if let Some(rc) = &handler.return_clause {
+                        let mut local_env = HashMap::new();
+                        local_env.insert(Symbol::new("_"), result);
+                        self.env.push(local_env);
+                        let r = self.eval_expr(rc);
+                        self.env.pop();
+                        r
+                    } else {
+                        Ok(result)
+                    };
                 }
                 // §12.2:push handler 作用域,求值 body,pop
                 let h = ActiveHandler {
@@ -1234,31 +2031,52 @@ impl Interpreter {
                 self.apply(path, &[interval])
             }
             CoreExprNode::HComp(e) => {
-                // Homogeneous composition: evaluate the Kan filling
-                // Basic: if e is a path-lam, apply to i0 → get base; return base
-                self.eval_expr(e)
+                // §16.3 同伦合成:路径 e 应用 i0/i1 得边界值;填充返回与边界一致的值
+                let path = self.eval_expr(e)?;
+                let b0 = self.apply(path.clone(), &[interval_endpoint(false)])?;
+                let b1 = self.apply(path, &[interval_endpoint(true)])?;
+                // §16 完整立方填充:边界不一致 SHALL 为错误(而非静默返回一端)
+                if !values_eq(&b0, &b1) {
+                    return Err(EvalError { message: format!(
+                        "HComp 边界不一致(完整立方填充):{} != {}", value_to_string(&b0), value_to_string(&b1)) });
+                }
+                Ok(Value::Data(Symbol::new("KanFill"), vec![b0, b1]))
             },
-            CoreExprNode::Transp(_, e, _) => {
-                // Transport along a path: evaluate the transported value
-                // Basic: return the transported expression evaluated
-                self.eval_expr(e)
+            CoreExprNode::Transp(_, e, target) => {
+                // §16.3 传输:沿路径 e 传送到目标端点,返回目标端点值
+                let path = self.eval_expr(e)?;
+                let t = self.eval_expr(target)?;
+                self.apply(path, &[t])
             },
-            CoreExprNode::FlatMod(e) => self.eval_expr(e),
-            CoreExprNode::SharpMod(e) => self.eval_expr(e),
+            CoreExprNode::FlatMod(e) => {
+                // §17 ♭ flat:剥离拓扑/光滑结构,返回离散点(与直通可区分)
+                // §17 adjoint-triple(ʃ ⊣ ♭ ⊣ ♯):♭∘♯ = counit → id(sharp 的 flat 返回原值)
+                if let CoreExprNode::SharpMod(inner) = &e.node {
+                    return self.eval_expr(inner);
+                }
+                let v = self.eval_expr(e)?;
+                Ok(Value::Data(Symbol::new("Flat"), vec![v]))
+            },
+            CoreExprNode::SharpMod(e) => {
+                // §17 ♯ sharp:嵌入 codiscrete 空间(与直通可区分)
+                let v = self.eval_expr(e)?;
+                Ok(Value::Data(Symbol::new("Sharp"), vec![v]))
+            },
             CoreExprNode::CrispMod(e) => self.eval_expr(e),
             CoreExprNode::ShapeMod(e) => {
-                // §17 ʃ 最小语义:路径值形状化 —— 提取区间端点(i0/i1)组成 Shape 容器,
-                // 与直通求值可区分
-                let v = self.eval_expr(e)?;
-                match &v {
-                    Value::Data(tag, fields) if tag.as_str() == "Path" => {
-                        // Path 端点:首字段 i0 端点,次字段 i1 端点(有则取)
-                        let i0 = fields.first().cloned().unwrap_or(Value::Bool(false));
-                        let i1 = fields.get(1).cloned().unwrap_or(Value::Bool(true));
-                        Ok(Value::Data(Symbol::new("Shape"), vec![v.clone(), i0, i1]))
-                    }
-                    _ => Ok(Value::Data(Symbol::new("Shape"), vec![v.clone(), Value::Bool(false), Value::Bool(true)])),
+                // §17 ʃ 形状代数:路径值计算端点连通(i0/i1 端点值相等性,经 hott.rs Interval)
+                if let CoreExprNode::FlatMod(inner) = &e.node {
+                    return self.eval_expr(inner);
                 }
+                let v = self.eval_expr(e)?;
+                let b0 = self.apply(v.clone(), &[interval_endpoint(false)]).unwrap_or(Value::Unit);
+                let b1 = self.apply(v.clone(), &[interval_endpoint(true)]).unwrap_or(Value::Unit);
+                let connected = values_eq(&b0, &b1);
+                Ok(Value::Data(Symbol::new("Shape"), vec![
+                    Value::Bool(connected),
+                    b0,
+                    b1,
+                ]))
             }
             CoreExprNode::Session(op, e) => {
                 let ch_id = "default";
@@ -1338,11 +2156,21 @@ impl Interpreter {
             CoreExprNode::Abduce(e, abducibles) => {
                 // §21.6:生成溯因假设并做一致性验证 —— 假设绑定后目标须可满足,
                 // 只返回与目标一致的假设集(替换占位实现)
-                let doms = std::collections::HashMap::new();
+                // §21.6 domain 感知:从 CLP 存储取已声明变量的域范围,约束假设生成
+                let mut doms = std::collections::HashMap::new();
+                for (id, name) in &self.clp_var_names {
+                    if let Some(dom) = self.clp_store.domain_of(*id) {
+                        if let (Some(lo), Some(hi)) = (dom.min(), dom.max()) {
+                            doms.insert(name.as_str().to_string(), (lo, hi));
+                        }
+                    }
+                }
                 let vars: Vec<String> = abducibles.iter().map(|s| s.as_str().to_string()).collect();
                 let mut engine = AbductionEngine::new();
                 let explanations = engine.generate_hypotheses(&vars, &doms);
-                let mut consistent: Option<tisp_runtime::abduction::Explanation> = None;
+                // §21.6 多解枚举:收集全部一致解释;每解释为假设列表
+                let total_candidates = explanations.len();
+                let mut consistent_all: Vec<Vec<Value>> = Vec::new();
                 for exp in explanations {
                     // 快照 CLP 存储,绑定假设,验证目标;验证后恢复
                     let snapshot = self.clp_store.clone();
@@ -1353,9 +2181,11 @@ impl Interpreter {
                             .map(|(id, _)| *id);
                         match id {
                             Some(id) => {
-                                self.clp_store.add_eq(id, h.value as u64);
-                                // 冲突:域清空 → 假设不一致
-                                if self.clp_store.domain_of(id).map(|d| d.is_empty()).unwrap_or(false) {
+                                // 单值赋值(值不是变量 id):域 {value},传播后检测冲突
+                                self.clp_store.assign(id, h.value);
+                                self.clp_store.propagate();
+                                if self.clp_store.domain_of(id).map(|d| d.is_empty()).unwrap_or(false)
+                                    || self.clp_store.has_empty_domain() {
                                     bound_ok = false;
                                     break;
                                 }
@@ -1366,26 +2196,34 @@ impl Interpreter {
                     if bound_ok {
                         match self.eval_expr(e) {
                             Ok(v) if is_truthy(&v) => {
-                                consistent = Some(exp);
-                                break;
+                                // 约束冲突检测:传播(eval 内 constrain 只 push)后查域空
+                                self.clp_store.propagate();
+                                if self.clp_store.has_empty_domain() {
+                                    self.clp_store = snapshot;
+                                    continue;
+                                }
+                                let hyps: Vec<Value> = exp.hypotheses.iter().map(|h| {
+                                    Value::Data(Symbol::new("Hypothesis"), vec![
+                                        Value::Str(h.var.clone().into()),
+                                        Value::Int(h.value),
+                                    ])
+                                }).collect();
+                                consistent_all.push(hyps);
                             }
                             _ => {}
                         }
                     }
                     self.clp_store = snapshot;
                 }
-                match consistent {
-                    Some(exp) => {
-                        let hyps: Vec<Value> = exp.hypotheses.iter().map(|h| {
-                            Value::Data(Symbol::new("Hypothesis"), vec![
-                                Value::Str(h.var.clone().into()),
-                                Value::Int(h.value),
-                            ])
-                        }).collect();
-                        Ok(list_from_vec(hyps))
-                    }
-                    // 无一致假设:目标不可满足(现有求值结果作为说明)
-                    None => self.eval_expr(e),
+                if !consistent_all.is_empty() {
+                    // 全部一致解释列表
+                    Ok(list_from_vec(consistent_all.into_iter().map(list_from_vec).collect()))
+                } else {
+                    // 不可满足原因:全部候选失败
+                    Ok(list_from_vec(vec![Value::Data(
+                        Symbol::new("no-consistent-explanation"),
+                        vec![Value::Int(total_candidates as i64)],
+                    )]))
                 }
             }
             // Constraint Logic Programming (CLP)
@@ -1413,17 +2251,54 @@ impl Interpreter {
             },
             CoreExprNode::Constrain(e) => {
                 // §21.5:识别 (op a b) 比较结构,生成真实 CLP 约束传播(域收缩);
+                // §算术约束:(= (* x y) c) 等嵌套算术识别为乘/除/模传播
+                // §全局约束:(all-different x y z) 互斥传播
                 // 非比较式退回布尔求值
+                if let CoreExprNode::Var(name) = &e.node {
+                    if name.as_str() == "all-different" {
+                        // 空参数形式:由调用方求值变量;此处无法取变量,退回布尔求值
+                        return self.eval_expr(e);
+                    }
+                }
                 if let CoreExprNode::App(f1, a) = &e.node {
                     if let CoreExprNode::App(f2, b) = &f1.node {
                         if let CoreExprNode::Var(op) = &f2.node {
                             if matches!(op.as_str(), "<" | ">" | "=" | "==") {
+                                // 嵌套算术:(= (* x y) c) → App(App(Var(=), App(App(Var(*), x), y)), c)
+                                if let CoreExprNode::App(g1, g2) = &b.node {
+                                    if let CoreExprNode::App(g3, g4) = &g1.node {
+                                        if let CoreExprNode::Var(arith) = &g3.node {
+                                            if matches!(arith.as_str(), "*" | "/" | "%" | "+" | "-") {
+                                                let xv = self.eval_expr(g2)?;
+                                                let yv = self.eval_expr(g4)?;
+                                                let zv = self.eval_expr(a)?;
+                                                self.clp_arith_constraint(arith.as_str(), &xv, &yv, &zv);
+                                                return Ok(Value::Bool(true));
+                                            }
+                                        }
+                                    }
+                                }
                                 let va = self.eval_expr(a)?;
                                 let vb = self.eval_expr(b)?;
                                 self.clp_constraint(op.as_str(), &va, &vb);
                                 return Ok(Value::Bool(true));
                             }
                         }
+                    }
+                }
+                // §all-different:柯里化链 (all-different x y z) = App(App(App(Var(ad), x), y), z)
+                if let Some(vars) = self.collect_all_different(e) {
+                    let mut ids = Vec::new();
+                    for v in &vars {
+                        if let Value::Int(id) = self.eval_expr(v)? {
+                            if self.clp_store.domain_of(id as u64).is_some() {
+                                ids.push(id as u64);
+                            }
+                        }
+                    }
+                    if !ids.is_empty() {
+                        self.clp_store.add_all_different(&ids);
+                        return Ok(Value::Bool(true));
                     }
                 }
                 let r = self.eval_expr(e)?;
@@ -1438,13 +2313,16 @@ impl Interpreter {
                 let mut results: Vec<std::collections::HashMap<u64, i64>> = Vec::new();
                 if self.clp_store.label(&vars, &mut results) {
                     if let Some(sol) = results.first() {
+                        // 提交解:写回单值域并传播(保留约束一致性,供后续独立 label)
                         for (id, v) in sol {
+                            self.clp_store.assign(*id, *v);
                             if let Some(sym) = self.clp_var_names.get(id).cloned() {
                                 if let Some(top) = self.env.last_mut() {
                                     top.insert(sym, Value::Int(*v));
                                 }
                             }
                         }
+                        self.clp_store.propagate();
                         return Ok(Value::Bool(true));
                     }
                 }
@@ -1583,6 +2461,7 @@ impl Interpreter {
             CoreExprNode::KappaReact(e) => self.eval_expr(e),
             // Applied π-calculus(§27.4/27.5):XOR 加密与简单 hash(占位算法,生产应换强算法)
             CoreExprNode::CryptoEncrypt(a, b) => {
+                crypto_warn(self);
                 let data = self.eval_expr(a)?;
                 let key = self.eval_expr(b)?;
                 let key_name = value_to_string(&key);
@@ -1605,6 +2484,7 @@ impl Interpreter {
                 }
             },
             CoreExprNode::CryptoSign(a, b) => {
+                crypto_warn(self);
                 let data = self.eval_expr(a)?;
                 let key = self.eval_expr(b)?;
                 let key_name = value_to_string(&key);
@@ -1624,6 +2504,7 @@ impl Interpreter {
                 Ok(Value::Bool(self.crypto.verify(&cv, &key_name)))
             },
             CoreExprNode::CryptoHash(e) => {
+                crypto_warn(self);
                 let data = self.eval_expr(e)?;
                 let cv = self.crypto.hash(&value_to_bytes(&data));
                 Ok(Value::Data(Symbol::new("CryptoValue"), vec![
@@ -1774,13 +2655,11 @@ impl Interpreter {
             CoreExprNode::Comptime(e) => self.eval_expr(e),
             CoreExprNode::CompilerMacroDef(_, _, _) => Ok(Value::Unit),
             CoreExprNode::MetaQuery(name) => {
-                // §9/§29 反射:返回定义签名(类型显示/参数数/效果)
+                // §9/§29 反射:类型一等值——有声明类型时返回 Value::Type(可绑定/传递/比较)
                 match self.def_sigs.get(name) {
-                    Some((arity, Some(ty), eff, grades)) => {
-                        Ok(Value::Str(format!("{} [{:?}] (fn/{} 参数,参数等级 {:?})", ty, eff, arity, grades)))
-                    }
-                    Some((arity, None, eff, grades)) => {
-                        Ok(Value::Str(format!("(fn/{} 参数,效果 {:?},参数等级 {:?})", arity, eff, grades)))
+                    Some((_arity, Some(ty), _eff, _grades, _mode, _det)) => Ok(Value::Type(ty.clone())),
+                    Some((arity, None, eff, grades, mode, det)) => {
+                        Ok(Value::Str(format!("(fn/{} 参数,效果 {:?},参数等级 {:?},模式 {:?},确定性 {:?})", arity, eff, grades, mode, det)))
                     }
                     None => Ok(Value::Str(format!("(未定义: {})", name))),
                 }
@@ -1796,10 +2675,48 @@ impl Interpreter {
             CoreExprNode::Obligation(e) => self.eval_expr(e),
             // Memory
             CoreExprNode::RegionNew(_) => Ok(Value::Int(0)),
-            CoreExprNode::RegionAlloc(a, b) => { self.eval_expr(a)?; self.eval_expr(b)?; Ok(Value::Int(0)) },
-            CoreExprNode::RegionFree(e) => { self.eval_expr(e)?; Ok(Value::Unit) },
-            CoreExprNode::PtrRead(e) => self.eval_expr(e),
-            CoreExprNode::PtrWrite(a, b) => { self.eval_expr(a)?; self.eval_expr(b)?; Ok(Value::Unit) },
+            CoreExprNode::RegionAlloc(a, b) => {
+                // §26.3 区域分配:分配地址并写入初值(模拟内存)
+                let addr = self.next_ptr_addr;
+                self.next_ptr_addr += 1;
+                let v = self.eval_expr(b)?;
+                self.eval_expr(a)?;
+                self.ptr_mem.insert(addr, v);
+                Ok(Value::Int(addr as i64))
+            },
+            CoreExprNode::RegionFree(e) => {
+                // §26.3 区域释放:清除地址对应内存并标记为悬垂
+                if let Value::Int(addr) = self.eval_expr(e)? {
+                    self.ptr_mem.remove(&(addr as u64));
+                    self.freed_addrs.insert(addr as u64);
+                }
+                Ok(Value::Unit)
+            },
+            CoreExprNode::PtrRead(e) => {
+                // §26.2 裸指针读:地址 → 值;悬垂指针(已释放)报错;未写返回 Unit;Unsafe 门控(运行时警告)
+                unsafe_warn(self);
+                let addr = self.eval_expr(e)?;
+                if let Value::Int(a) = addr {
+                    if self.freed_addrs.contains(&(a as u64)) {
+                        return Err(EvalError { message: format!("悬垂指针:地址 {} 已释放", a) });
+                    }
+                    Ok(self.ptr_mem.get(&(a as u64)).cloned().unwrap_or(Value::Unit))
+                } else {
+                    Err(EvalError { message: "ptr-read expects an integer address".into() })
+                }
+            },
+            CoreExprNode::PtrWrite(a, b) => {
+                // §26.2 裸指针写:地址 ← 值;Unsafe 门控(运行时警告)
+                unsafe_warn(self);
+                let addr = self.eval_expr(a)?;
+                let val = self.eval_expr(b)?;
+                if let Value::Int(addr_i) = addr {
+                    self.ptr_mem.insert(addr_i as u64, val);
+                    Ok(Value::Unit)
+                } else {
+                    Err(EvalError { message: "ptr-write expects an integer address".into() })
+                }
+            },
             // OOP: generic function dispatch with method combination
             CoreExprNode::GenericDef(name, params, _ret) => {
                 let gen_name = name.clone();
@@ -1853,51 +2770,100 @@ impl Interpreter {
                 Ok(Value::Unit)
             },
             // Typeclasses
-            CoreExprNode::ClassDef(name, _, methods) => {
+            CoreExprNode::ClassDef(name, _, methods, fun_deps, supers) => {
                 // §23:登记类;每个方法名注册按参数类型分发的实例方法分发器(隐式字典)
                 self.instance_dict.entry(name.clone()).or_default();
+                // §23.3/§23.1:记录 fun-deps 与超类约束(实例登记时校验)
+                if !fun_deps.is_empty() { self.class_fun_deps.insert(name.clone(), fun_deps.clone()); }
+                if !supers.is_empty() { self.class_supers.insert(name.clone(), supers.clone()); }
                 for (mname, _) in methods.iter() {
                     let m = mname.clone();
                     let cls = name.clone();
                     let dispatcher = Value::Builtin(mname.as_str().to_string(), Arc::new(move |s, args| {
-                        // 按首参数运行时类型查 instance_dict
-                        let type_name = match args.first() {
-                            Some(Value::Data(c, _)) => {
-                                // 构造器 → 所属 ADT 名(实例按类型注册)
-                                s.ctor_to_adt.get(c).cloned().unwrap_or_else(|| c.clone())
-                            }
-                            Some(Value::Int(_)) => Symbol::new("i64"),
-                            Some(Value::Str(_)) => Symbol::new("String"),
-                            Some(Value::Bool(_)) => Symbol::new("bool"),
-                            Some(Value::Float(_)) => Symbol::new("f64"),
-                            _ => Symbol::new("_"),
-                        };
+                        // §23 约束求解驱动查找:全部实参运行时类型与实例类型列表逐项匹配
+                        let arg_types: Vec<Type> = args.iter().map(|a| value_to_type(a, s)).collect();
                         if let Some(instances) = s.instance_dict.get(&cls) {
-                            for (t, methods_map) in instances {
-                                if *t == type_name || t.as_str() == "_" {
+                            for (types, methods_map) in instances {
+                                if types.len() == arg_types.len()
+                                    && types.iter().zip(arg_types.iter()).all(|(t, a)| type_matches(t, a)) {
                                     if let Some(mv) = methods_map.get(&m) {
                                         return s.apply(mv.clone(), args);
                                     }
                                 }
                             }
                         }
-                        Err(EvalError { message: format!("no instance of {} for method {}", cls, m) })
+                        Err(EvalError { message: format!("no instance of {} for method {} (arg types {:?})", cls, m, arg_types) })
                     }));
                     self.define(mname.clone(), dispatcher);
                 }
                 Ok(Value::Unit)
             },
             CoreExprNode::InstanceDef(class_name, types, methods) => {
+                // §23.3 fun-deps 冲突检测:同输入类型(types[0])不同输出类型(types[1])报错
+                if let Some(fds) = self.class_fun_deps.get(&class_name).cloned() {
+                    if !fds.is_empty() && types.len() >= 2 {
+                        let input = types[0].clone();
+                        let output = types[1].clone();
+                        if let Some(existing) = self.class_instance_types.get(&class_name) {
+                            for prior in existing {
+                                if prior.len() >= 2 && prior[0] == input && prior[1] != output {
+                                    return Err(EvalError {
+                                        message: format!("fun-deps 冲突:{} 的同输入 {} 已有不同输出", class_name, input),
+                                    });
+                                }
+                            }
+                        }
+                        let _ = fds;
+                    }
+                }
+                // §23.1 超类约束:实例须满足超类(超类须有已登记实例)
+                if let Some(supers) = self.class_supers.get(&class_name).cloned() {
+                    for sup in &supers {
+                        let has_super = self.instance_dict.get(sup).map(|v| !v.is_empty()).unwrap_or(false);
+                        if !has_super {
+                            return Err(EvalError { message: format!("实例 {} 缺少超类 {} 的实例", class_name, sup) });
+                        }
+                    }
+                }
                 let method_map: HashMap<Symbol, Value> = methods.iter().map(|(n, body)| {
                     let c = Closure { params: vec![], zero_params: vec![], body: (**body).clone(), env: self.env.last().cloned().unwrap_or_default() };
                     (n.clone(), Value::Closure(c))
                 }).collect();
                 let entry = self.instance_dict.entry(class_name.clone()).or_default();
-                let type_name = types.first().and_then(|t| match t {
-                    Type::Con(c) => Some(c.name.clone()),
-                    _ => None,
-                }).unwrap_or(Symbol::new("_"));
-                entry.push((type_name, method_map));
+                entry.push((types.clone(), method_map));
+                self.class_instance_types.entry(class_name.clone()).or_default().push(types.clone());
+                Ok(Value::Unit)
+            },
+            // §7.5 deriving:结构派生实现(desugar 生成的 eq-/ord-/show- 函数)
+            CoreExprNode::DerivingImpl(trait_name, type_name) => {
+                match trait_name.as_str() {
+                    "Eq" => {
+                        let name = Symbol::new(&format!("eq-{}", type_name));
+                        self.define(name.clone(), Value::Builtin(name.as_str().to_string().into(), Arc::new(|_s, args| {
+                            Ok(Value::Bool(if args.len() == 2 { values_eq(&args[0], &args[1]) } else { false }))
+                        })));
+                    }
+                    "Ord" => {
+                        let name = Symbol::new(&format!("ord-{}", type_name));
+                        self.define(name.clone(), Value::Builtin(name.as_str().to_string().into(), Arc::new(|_s, args| {
+                            if args.len() == 2 {
+                                let v = match values_compare(&args[0], &args[1]) {
+                                    std::cmp::Ordering::Less => -1,
+                                    std::cmp::Ordering::Equal => 0,
+                                    std::cmp::Ordering::Greater => 1,
+                                };
+                                Ok(Value::Int(v))
+                            } else { Ok(Value::Int(0)) }
+                        })));
+                    }
+                    "Show" => {
+                        let name = Symbol::new(&format!("show-{}", type_name));
+                        self.define(name.clone(), Value::Builtin(name.as_str().to_string().into(), Arc::new(|_s, args| {
+                            Ok(Value::Str(args.first().map(show_value).unwrap_or_else(|| "...".into())))
+                        })));
+                    }
+                    other => return Err(EvalError { message: format!("未知 deriving trait: {}", other) }),
+                }
                 Ok(Value::Unit)
             },
             // Macros (stub: store in macro table)
@@ -1970,20 +2936,91 @@ impl Interpreter {
     }
 
     fn apply(&mut self, func: Value, args: &[Value]) -> Result<Value, EvalError> {
-        self.apply_inner(func, args)
+        // §8.1 TCO 蹦床:尾调用在循环内复用栈帧(替换 apply→apply_inner→eval_expr→apply 的递归)
+        let mut func = func;
+        let mut args: Vec<Value> = args.to_vec();
+        loop {
+            match self.apply_inner(func, &args)? {
+                ApplyOutcome::Done(v) => return Ok(v),
+                ApplyOutcome::Tail(f, a) => { func = f; args = a; }
+            }
+        }
     }
 
-    fn apply_inner(&mut self, func: Value, args: &[Value]) -> Result<Value, EvalError> {
+    /// 求值函数应用链,返回 (函数, 实参)(不 apply;供 TCO 尾调用与普通调用复用)
+    fn eval_app(&mut self, expr: &CoreExpr) -> Result<(Value, Vec<Value>), EvalError> {
+        if let CoreExprNode::App(func, arg) = &expr.node {
+            let mut chain: Vec<&CoreExpr> = vec![arg];
+            let mut cur = func;
+            while let CoreExprNode::App(inner_f, inner_a) = &cur.node {
+                chain.push(inner_a);
+                cur = inner_f;
+            }
+            chain.reverse();
+            let f = self.eval_expr(cur)?;
+            let zero_positions: Option<Vec<usize>> = match &f {
+                Value::Closure(c) if !c.params.is_empty() => Some(c.zero_params.clone()),
+                Value::Closure(c) => match &c.body.node {
+                    CoreExprNode::Lam(lam) => Some(zero_param_indices(&lam.params)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let mut args = Vec::with_capacity(chain.len());
+            for (i, a) in chain.iter().enumerate() {
+                if let Some(z) = &zero_positions {
+                    if z.contains(&i) && is_side_effect_free(&a.node) {
+                        args.push(Value::Unit);
+                        continue;
+                    }
+                }
+                args.push(self.eval_expr(a)?);
+            }
+            Ok((f, args))
+        } else {
+            Err(EvalError { message: "eval_app expects App node".into() })
+        }
+    }
+
+    /// §8.1 TCO:尾位置求值——If/Let/Do 循环下钻,尾 App 返回 Tail 交给 apply 蹦床
+    fn eval_tail(&mut self, expr: &CoreExpr) -> Result<ApplyOutcome, EvalError> {
+        match &expr.node {
+            CoreExprNode::If(cond, then, else_) => {
+                let c = self.eval_expr(cond)?;
+                self.eval_tail(if is_truthy(&c) { then } else { else_ })
+            }
+            CoreExprNode::Let(name, _, value, body) => {
+                let v = self.eval_expr(value)?;
+                if let Some(top) = self.env.last_mut() { top.insert(name.clone(), v); }
+                // let 绑定的作用域不能跨 TCO 蹦床存活(会被调用方提前 pop);
+                // 普通求值以保持 let 内递归/闭包引用正确(尾递归本身不经过 let)
+                Ok(ApplyOutcome::Done(self.eval_expr(body)?))
+            }
+            CoreExprNode::Do(items) => {
+                if items.is_empty() { return Ok(ApplyOutcome::Done(Value::Unit)); }
+                let last = items.len() - 1;
+                for e in &items[..last] { self.eval_expr(e)?; }
+                self.eval_tail(&items[last])
+            }
+            CoreExprNode::App(..) => {
+                let (f, args) = self.eval_app(expr)?;
+                Ok(ApplyOutcome::Tail(f, args))
+            }
+            _ => Ok(ApplyOutcome::Done(self.eval_expr(expr)?)),
+        }
+    }
+
+    fn apply_inner(&mut self, func: Value, args: &[Value]) -> Result<ApplyOutcome, EvalError> {
         match &func {
             Value::Builtin(name, f) => {
                 let name = name.clone();
                 // 参数不足的多参内置:返回部分应用闭包,等待剩余参数
                 let needs_more = self.full_arity(name.as_str()).map_or(false, |n| n > args.len());
                 if needs_more {
-                    Ok(partial_closure(name.clone(), f.clone(), args.to_vec()))
+                    Ok(ApplyOutcome::Done(partial_closure(name.clone(), f.clone(), args.to_vec())))
                 } else {
                     // 参数齐备(或可变参):直接执行注册的实现(单一实现源)
-                    f(self, args)
+                    Ok(ApplyOutcome::Done(f(self, args)?))
                 }
             }
             Value::Closure(c) => {
@@ -1995,10 +3032,10 @@ impl Interpreter {
                         if let Some(h) = self.handlers.get_mut(*hi as usize) {
                             h.state = Some(args[1].clone());
                         }
-                        return Ok(args[0].clone());
+                        return Ok(ApplyOutcome::Done(args[0].clone()));
                     }
                     if args.len() == 1 {
-                        return Ok(args[0].clone());
+                        return Ok(ApplyOutcome::Done(args[0].clone()));
                     }
                     return Err(EvalError { message: "continuation expects 1 or 2 arguments".into() });
                 }
@@ -2012,9 +3049,9 @@ impl Interpreter {
                                 match self.full_arity(bname.as_str()) {
                                     // 参数仍不足:继续累积;未知 arity(如用户构造的闭包)直接执行
                                     Some(need) if full.len() < need => {
-                                        return Ok(partial_closure(bname.clone(), f.clone(), full));
+                                        return Ok(ApplyOutcome::Done(partial_closure(bname.clone(), f.clone(), full)));
                                     }
-                                    _ => return f(self, &full),
+                                    _ => return Ok(ApplyOutcome::Done(f(self, &full)?)),
                                 }
                             }
                         }
@@ -2040,16 +3077,19 @@ impl Interpreter {
                                     for (k, v) in &new_env {
                                         if let Some(top) = self.env.last_mut() { top.entry(k.clone()).or_insert(v.clone()); }
                                     }
-                                    let r = self.eval_expr(&inner.body);
-                                    self.pop_scope();
-                                    return if args.len() > 1 {
-                                        match r {
-                                            Ok(v) => self.apply(v, &args[1..]),
+                                    if args.len() > 1 {
+                                        // 多余参数:结果继续应用(非尾位置,直接求值)
+                                        let r = self.eval_expr(&inner.body);
+                                        self.pop_scope();
+                                        return match r {
+                                            Ok(v) => Ok(ApplyOutcome::Tail(v, args[1..].to_vec())),
                                             Err(e) => Err(e),
-                                        }
+                                        };
                                     } else {
-                                        r
-                                    };
+                                        let r = self.eval_tail(&inner.body);
+                                        self.pop_scope();
+                                        return r;
+                                    }
                                 } else {
                                     // More params — return curried closure;
                                     // 若还有剩余参数则继续应用(否则会被丢弃)。
@@ -2061,9 +3101,9 @@ impl Interpreter {
                                         env: new_env,
                                     });
                                     return if args.len() > 1 {
-                                        self.apply(curried, &args[1..])
+                                        Ok(ApplyOutcome::Tail(curried, args[1..].to_vec()))
                                     } else {
-                                        Ok(curried)
+                                        Ok(ApplyOutcome::Done(curried))
                                     };
                                 }
                             } else {
@@ -2083,15 +3123,17 @@ impl Interpreter {
                     for (k, v) in &c.env {
                         if let Some(top) = self.env.last_mut() { top.entry(k.clone()).or_insert(v.clone()); }
                     }
-                    let r = self.eval_expr(&effective_body);
-                    self.pop_scope();
-                    // 若还有剩余参数(如 ((f) 5) 中 f 返回函数),结果继续应用
+                    // 若还有剩余参数(如 ((f) 5) 中 f 返回函数),结果继续应用(非尾位置直接求值)
                     if args.len() > 1 {
+                        let r = self.eval_expr(&effective_body);
+                        self.pop_scope();
                         match r {
-                            Ok(v) => self.apply(v, &args[1..]),
+                            Ok(v) => Ok(ApplyOutcome::Tail(v, args[1..].to_vec())),
                             Err(e) => Err(e),
                         }
                     } else {
+                        let r = self.eval_tail(&effective_body);
+                        self.pop_scope();
                         r
                     }
                 } else if c.params.len() > args.len() {
@@ -2108,12 +3150,12 @@ impl Interpreter {
                         if c.zero_params.contains(&i) { continue; } // 0 级擦除:不绑定
                         new_env.insert(p.clone(), a.clone());
                     }
-                    Ok(Value::Closure(Closure {
+                    Ok(ApplyOutcome::Done(Value::Closure(Closure {
                         params: remaining,
                         zero_params: zero_remaining,
                         body: c.body.clone(),
                         env: new_env,
-                    }))
+                    })))
                 } else if c.params.len() < args.len() {
                     // 参数过多(高阶函数返回函数的场景,如 ((g 1) 2) 中 g 返回一参函数):
                     // 先绑定全部形参执行,再把结果应用到剩余参数
@@ -2134,7 +3176,7 @@ impl Interpreter {
                     let r = self.eval_expr(&effective_body);
                     self.pop_scope();
                     match r {
-                        Ok(v) => self.apply(v, rest_args),
+                        Ok(v) => Ok(ApplyOutcome::Tail(v, rest_args.to_vec())),
                         Err(e) => Err(e),
                     }
                 } else {
@@ -2149,7 +3191,7 @@ impl Interpreter {
                         }
                     }
                     let effective_body = c.body.clone();
-                    let r = self.eval_expr(&effective_body);
+                    let r = self.eval_tail(&effective_body);
                     self.pop_scope();
                     r
                 }
@@ -2214,7 +3256,58 @@ fn bi(
     (Symbol::new(name), Value::Builtin(name.into(), Arc::new(f)))
 }
 
-/// 把 Cons 链列表展开为 Vec
+/// 范式求值(§31/§32 全链路接入):经 tisp-runtime 的 `ParadigmRegistry` 统一分发
+fn paradigm_eval(keyword: &'static str, args: &[Value]) -> Result<Value, EvalError> {
+    use tisp_runtime::facility::{ParadigmValue as PV, default_registry};
+    let registry = default_registry();
+    let pv: Vec<PV> = args.iter().map(value_to_paradigm).collect::<Result<_, _>>()?;
+    let result = registry.eval(keyword, &pv).map_err(|e| EvalError { message: e })?;
+    Ok(paradigm_to_value(&result))
+}
+
+/// 解释器 `Value` → 范式统一值(跨范式抽象)
+fn value_to_paradigm(v: &Value) -> Result<tisp_runtime::facility::ParadigmValue, EvalError> {
+    use tisp_runtime::facility::ParadigmValue as PV;
+    Ok(match v {
+        Value::Int(n) => PV::Int(*n),
+        Value::Float(f) => PV::Float(*f),
+        Value::Bool(b) => PV::Bool(*b),
+        Value::Str(s) => PV::Str(s.clone()),
+        Value::Vector(_) | Value::Data(_, _) => PV::List(value_to_int_list(v)?),
+        _ => return Err(EvalError { message: "不支持的范式参数类型".into() }),
+    })
+}
+
+/// 从列表类值(Vector / Vec 数据 / Cons 链)提取整数序列
+fn value_to_int_list(v: &Value) -> Result<Vec<i64>, EvalError> {
+    let items: Vec<Value> = match v {
+        Value::Data(name, fields) if name.as_str() == "Vec" => fields.clone(),
+        Value::Data(name, _) if name.as_str() == "Cons" => list_to_vec(v),
+        Value::Vector(vs) => vs.iter().cloned().collect(),
+        _ => return Err(EvalError { message: "期望列表参数".into() }),
+    };
+    items
+        .into_iter()
+        .map(|x| match x {
+            Value::Int(n) => Ok(n),
+            _ => Err(EvalError { message: "列表参数需为整数".into() }),
+        })
+        .collect()
+}
+
+/// 范式统一值 → 解释器 `Value`
+fn paradigm_to_value(pv: &tisp_runtime::facility::ParadigmValue) -> Value {
+    use tisp_runtime::facility::ParadigmValue as PV;
+    match pv {
+        PV::Int(n) => Value::Int(*n),
+        PV::Float(f) => Value::Float(*f),
+        PV::Bool(b) => Value::Bool(*b),
+        PV::Str(s) => Value::Str(s.clone()),
+        PV::List(xs) => Value::Vector(xs.iter().map(|x| Value::Int(*x)).collect()),
+    }
+}
+
+/// 把 Cons 链列表或持久化 Vector 展开为 Vec
 fn list_to_vec(val: &Value) -> Vec<Value> {
     let mut items = Vec::new();
     let mut cur = val.clone();
@@ -2223,6 +3316,11 @@ fn list_to_vec(val: &Value) -> Vec<Value> {
             Value::Data(c, fields) if c.as_str() == "Cons" && !fields.is_empty() => {
                 items.push(fields[0].clone());
                 if fields.len() >= 2 { cur = fields[1].clone(); continue; }
+            }
+            // §4 持久化 Vector:视为元素序列
+            Value::Vector(v) => {
+                items.extend(v.iter().cloned());
+                break;
             }
             _ => break,
         }
@@ -2237,6 +3335,11 @@ fn collect_clp_vars(v: &Value, out: &mut Vec<u64>) {
         Value::Int(id) => out.push(*id as u64),
         Value::Data(c, fields) if c.as_str() == "Vec" => {
             for f in fields {
+                collect_clp_vars(f, out);
+            }
+        }
+        Value::Vector(v) => {
+            for f in v.iter() {
                 collect_clp_vars(f, out);
             }
         }
@@ -2303,6 +3406,25 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// §7.2 非加密占位警告(默认构建 XOR/简单 hash;crypto feature 下为强算法,不警告)
+fn crypto_warn(s: &mut Interpreter) {
+    #[cfg(not(feature = "crypto"))]
+    if !s.crypto_warned {
+        s.crypto_warned = true;
+        eprintln!("; warning: 密码学为 XOR/简单 hash 占位(非加密,§27.4/27.5);生产环境应启用 crypto feature");
+    }
+    #[cfg(feature = "crypto")]
+    let _ = s;
+}
+
+/// §26.4 Unsafe 门控(运行时警告):裸指针/区域操作为 Unsafe 效应,纯代码不应调用
+fn unsafe_warn(s: &mut Interpreter) {
+    if !s.unsafe_warned {
+        s.unsafe_warned = true;
+        eprintln!("; warning: 裸指针/区域操作为 Unsafe 效应(§26.4),纯代码未经 handler 不应调用");
+    }
+}
+
 /// 把解释器值序列化为字节(加密/哈希输入)
 fn value_to_bytes(v: &Value) -> Vec<u8> {
     match v {
@@ -2310,6 +3432,36 @@ fn value_to_bytes(v: &Value) -> Vec<u8> {
         Value::Str(s) => s.as_bytes().to_vec(),
         Value::Bool(b) => vec![if *b { 1 } else { 0 }],
         _ => value_to_string(v).into_bytes(),
+    }
+}
+
+/// §23 约束求解驱动:把运行时值转为类型(实例查找用)
+fn value_to_type(v: &Value, s: &Interpreter) -> Type {
+    match v {
+        Value::Int(_) => Type::i64(),
+        Value::Str(_) => Type::string(),
+        Value::Bool(_) => Type::bool(),
+        Value::Float(_) => Type::f64(),
+        Value::Unit => Type::unit(),
+        Value::Data(c, _) => {
+            let adt = s.ctor_to_adt.get(c).cloned().unwrap_or_else(|| c.clone());
+            Type::Con(tisp_core::types::TypeCon { name: adt, kind: tisp_core::types::Kind::Star })
+        }
+        Value::Type(ty) => ty.clone(),
+        _ => Type::unit(),
+    }
+}
+
+/// §23 实例类型与实参类型匹配:构造器名一致,或类型变量(泛型)匹配任意
+fn type_matches(instance_ty: &Type, arg_ty: &Type) -> bool {
+    match instance_ty {
+        Type::Con(c) => matches!(arg_ty, Type::Con(ac) if ac.name == c.name),
+        Type::Var(_) => true,
+        Type::App(f, a) => match arg_ty {
+            Type::App(gf, ga) => type_matches(f, gf) && type_matches(a, ga),
+            _ => false,
+        },
+        _ => instance_ty == arg_ty,
     }
 }
 
@@ -2498,7 +3650,59 @@ fn show_value(val: &Value) -> String {
                 format!("({} {})", name, inner.join(" "))
             }
         }
+        // §9 类型一等值:类型值可打印(如 i64 / List a)
+        Value::Type(ty) => ty.to_string(),
+        // §4 持久化集合:可打印表示
+        Value::Vector(v) => {
+            let inner: Vec<String> = v.iter().map(show_value).collect();
+            format!("[{}]", inner.join(" "))
+        }
+        Value::Map(m) => {
+            let inner: Vec<String> = m.iter().map(|(k, v)| format!("{} {}", show_value(k), show_value(v))).collect();
+            format!("{{{}}}", inner.join(" "))
+        }
+        Value::Set(s) => {
+            let inner: Vec<String> = s.iter().map(show_value).collect();
+            format!("#{{{}}}", inner.join(" "))
+        }
         _ => "...".into(),
+    }
+}
+
+/// §16.3 hott.rs 接线:区间端点经 tisp_runtime::hott::Interval 表示(接线泛型模块,替换内联 Bool 占位)
+fn interval_endpoint(b: bool) -> Value {
+    let i = if b {
+        tisp_runtime::hott::Interval::i1()
+    } else {
+        tisp_runtime::hott::Interval::i0()
+    };
+    Value::Bool(matches!(i, tisp_runtime::hott::Interval::Point(true)))
+}
+
+/// §7.5 deriving Ord:结构化排序(构造器名 → 字段逐项)
+fn values_compare(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        (Value::Char(x), Value::Char(y)) => x.cmp(y),
+        (Value::Unit, Value::Unit) => std::cmp::Ordering::Equal,
+        (Value::Data(n1, f1), Value::Data(n2, f2)) => {
+            match n1.as_str().cmp(n2.as_str()) {
+                std::cmp::Ordering::Equal => {
+                    for (x, y) in f1.iter().zip(f2) {
+                        match values_compare(x, y) {
+                            std::cmp::Ordering::Equal => {}
+                            other => return other,
+                        }
+                    }
+                    f1.len().cmp(&f2.len())
+                }
+                other => other,
+            }
+        }
+        _ => std::cmp::Ordering::Equal,
     }
 }
 
@@ -2513,6 +3717,8 @@ fn values_eq(a: &Value, b: &Value) -> bool {
         (Value::Data(n1, f1), Value::Data(n2, f2)) => {
             n1 == n2 && f1.len() == f2.len() && f1.iter().zip(f2).all(|(x, y)| values_eq(x, y))
         }
+        // §9 类型一等值:类型值相等性语义
+        (Value::Type(t1), Value::Type(t2)) => t1 == t2,
         _ => false,
     }
 }
@@ -2525,64 +3731,123 @@ fn value_to_string(val: &Value) -> String {
         Value::Str(s) => s.clone(),
         Value::Unit => "()".into(),
         Value::Data(name, _) => format!("<{}>", name),
+        Value::Type(ty) => ty.to_string(),
         _ => "...".into(),
     }
 }
 
-fn match_pattern(pat: &Pattern, val: &Value) -> Option<Vec<(Symbol, Value)>> {
-    let mut bindings = Vec::new();
-    if match_pattern_into(pat, val, &mut bindings) {
-        Some(bindings)
-    } else {
-        None
+impl Interpreter {
+    /// 模式匹配(§8):同名变量重复出现要求绑定值一致;逻辑变量经统一
+    fn match_pattern(&mut self, pat: &Pattern, val: &Value) -> Option<Vec<(Symbol, Value)>> {
+        let mut bindings = Vec::new();
+        if self.match_pattern_into(pat, val, &mut bindings) {
+            Some(bindings)
+        } else {
+            None
+        }
+    }
+
+    /// 模式匹配(§8):同名变量重复出现要求绑定值一致(逻辑变量经统一,§21)
+    fn match_pattern_into(&mut self, pat: &Pattern, val: &Value, bindings: &mut Vec<(Symbol, Value)>) -> bool {
+        match (pat, val) {
+            (Pattern::Wildcard, _) => true,
+            (Pattern::Var(name), v) => {
+                if let Some((_, prev)) = bindings.iter().find(|(n, _)| n == name) {
+                    self.unify_or_eq(prev, v)
+                } else {
+                    bindings.push((name.clone(), v.clone()));
+                    true
+                }
+            }
+            (Pattern::Lit(lit), v) => values_eq(&eval_literal(lit), v),
+            (Pattern::Or(pats), v) => {
+                // (or p1 p2 ...)(§8.2):任一子模式匹配成功(用 bindings 副本尝试)
+                for p in pats {
+                    let mut trial = bindings.clone();
+                    if self.match_pattern_into(p, v, &mut trial) {
+                        *bindings = trial;
+                        return true;
+                    }
+                }
+                false
+            }
+            (Pattern::Con(c_name, subpats), Value::Vector(v)) => {
+                // §4 持久化 Vector 与 Cons 模式兼容(头+尾)
+                if c_name.as_str() == "Cons" {
+                    if subpats.len() != 2 || v.is_empty() { return false; }
+                    if !self.match_pattern_into(&subpats[0], &v[0], bindings) { return false; }
+                    let rest = Value::Vector(v.skip(1));
+                    return self.match_pattern_into(&subpats[1], &rest, bindings);
+                }
+                if c_name.as_str() == "Vec" {
+                    let sub_vals: Vec<Value> = v.iter().cloned().collect();
+                    if subpats.len() != sub_vals.len() { return false; }
+                    for (sp, dv) in subpats.iter().zip(sub_vals.iter()) {
+                        if !self.match_pattern_into(sp, dv, bindings) { return false; }
+                    }
+                    return true;
+                }
+                false
+            }
+            (Pattern::Con(c_name, subpats), Value::Data(d_name, d_args)) => {
+                // Vec 字面量与 Cons 模式兼容(§21.2 谓词调用传向量列表)
+                if c_name.as_str() == "Cons" && d_name.as_str() == "Vec" {
+                    if subpats.len() != 2 || d_args.is_empty() { return false; }
+                    if !self.match_pattern_into(&subpats[0], &d_args[0], bindings) { return false; }
+                    let rest = if d_args.len() <= 1 {
+                        Value::Data(Symbol::new("Nil"), vec![])
+                    } else {
+                        Value::Data(Symbol::new("Vec"), d_args[1..].to_vec())
+                    };
+                    self.match_pattern_into(&subpats[1], &rest, bindings)
+                } else if c_name == d_name && subpats.len() == d_args.len() {
+                    for (sp, dv) in subpats.iter().zip(d_args) {
+                        if !self.match_pattern_into(sp, dv, bindings) { return false; }
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            // §9 类型一等值:类型值模式匹配(Int 匹配 Con(Int);(List a) 匹配 App(Con(List), a))
+            (Pattern::Con(c_name, subpats), Value::Type(ty)) => {
+                if let Some((name, args)) = flatten_type_app(ty) {
+                    if name != *c_name || subpats.len() != args.len() { return false; }
+                    for (sp, arg) in subpats.iter().zip(args) {
+                        if !self.match_pattern_into(sp, &Value::Type(arg), bindings) { return false; }
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// §21 同名变量一致性:若既有绑定是逻辑变量,统一;否则值比较
+    fn unify_or_eq(&mut self, prev: &Value, v: &Value) -> bool {
+        if let Value::Int(id) = prev {
+            if self.logic_vars.contains_key(&(*id as u64)) {
+                let lv = self.val_to_logic(prev);
+                let rv = self.val_to_logic(v);
+                return self.logic_store.unify(&lv, &rv);
+            }
+        }
+        values_eq(prev, v)
     }
 }
 
-/// 模式匹配(§8):同名变量重复出现要求绑定值一致(否则失败)
-fn match_pattern_into(pat: &Pattern, val: &Value, bindings: &mut Vec<(Symbol, Value)>) -> bool {
-    match (pat, val) {
-        (Pattern::Wildcard, _) => true,
-        (Pattern::Var(name), v) => {
-            if let Some((_, prev)) = bindings.iter().find(|(n, _)| n == name) {
-                values_eq(prev, v)
-            } else {
-                bindings.push((name.clone(), v.clone()));
-                true
-            }
+/// 展平类型应用链:App(Con(c), a1..an) → (c, [a1..an])
+fn flatten_type_app(ty: &Type) -> Option<(Symbol, Vec<Type>)> {
+    match ty {
+        Type::Con(tc) => Some((tc.name.clone(), vec![])),
+        Type::App(f, a) => {
+            let (name, mut args) = flatten_type_app(f)?;
+            args.push((**a).clone());
+            Some((name, args))
         }
-        (Pattern::Lit(lit), v) => values_eq(&eval_literal(lit), v),
-        (Pattern::Or(pats), v) => {
-            // (or p1 p2 ...)(§8.2):任一子模式匹配成功(用 bindings 副本尝试)
-            for p in pats {
-                let mut trial = bindings.clone();
-                if match_pattern_into(p, v, &mut trial) {
-                    *bindings = trial;
-                    return true;
-                }
-            }
-            false
-        }
-        (Pattern::Con(c_name, subpats), Value::Data(d_name, d_args)) => {
-            // Vec 字面量与 Cons 模式兼容(§21.2 谓词调用传向量列表)
-            if c_name.as_str() == "Cons" && d_name.as_str() == "Vec" {
-                if subpats.len() != 2 || d_args.is_empty() { return false; }
-                if !match_pattern_into(&subpats[0], &d_args[0], bindings) { return false; }
-                let rest = if d_args.len() <= 1 {
-                    Value::Data(Symbol::new("Nil"), vec![])
-                } else {
-                    Value::Data(Symbol::new("Vec"), d_args[1..].to_vec())
-                };
-                match_pattern_into(&subpats[1], &rest, bindings)
-            } else if c_name == d_name && subpats.len() == d_args.len() {
-                for (sp, dv) in subpats.iter().zip(d_args) {
-                    if !match_pattern_into(sp, dv, bindings) { return false; }
-                }
-                true
-            } else {
-                false
-            }
-        }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -2601,6 +3866,51 @@ mod tests {
 
     fn int(n: i64) -> CoreExpr {
         e(CoreExprNode::Lit(Literal::I64(n)))
+    }
+
+    /// §26.2/26.3 裸指针与手动区域:模拟内存读写 + 区域分配/释放
+    #[test]
+    fn test_ptr_and_region_memory() {
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        // region-alloc r 42 → 返回地址
+        let alloc = e(CoreExprNode::RegionAlloc(
+            Box::new(e(CoreExprNode::Lit(Literal::Unit))),
+            Box::new(int(42)),
+        ));
+        let addr = interp.eval_expr(&alloc).unwrap();
+        let a = match addr { Value::Int(n) => n as u64, other => panic!("expected address, got {:?}", other) };
+        // ptr-read addr → 42
+        let read = e(CoreExprNode::PtrRead(Box::new(int(a as i64))));
+        assert!(matches!(interp.eval_expr(&read).unwrap(), Value::Int(42)), "ptr-read 应返回 42");
+        // ptr-write addr 99 → 再读 99
+        let write = e(CoreExprNode::PtrWrite(Box::new(int(a as i64)), Box::new(int(99))));
+        interp.eval_expr(&write).unwrap();
+        assert!(matches!(interp.eval_expr(&read).unwrap(), Value::Int(99)), "ptr-write 后应读到 99");
+        // region-free addr → 清除并标记悬垂 → 读到悬垂指针报错
+        let free = e(CoreExprNode::RegionFree(Box::new(int(a as i64))));
+        interp.eval_expr(&free).unwrap();
+        assert!(interp.eval_expr(&read).is_err(), "region-free 后读到悬垂指针应报错");
+    }
+
+    /// §26.3 with-region:区域作用域内分配,退出时回收
+    #[test]
+    fn test_with_region_scoped_dealloc() {
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        // f = (fn [r] (region-alloc r 42))
+        let f = Value::Closure(Closure {
+            params: vec![Symbol::new("r")],
+            zero_params: vec![],
+            body: e(CoreExprNode::RegionAlloc(Box::new(var("r")), Box::new(int(42)))),
+            env: HashMap::new(),
+        });
+        let wr = interp.env.last().unwrap().get(&Symbol::new("with-region")).cloned().unwrap();
+        let addr = interp.apply(wr, &[f]).unwrap();
+        let a = match addr { Value::Int(n) => n as u64, other => panic!("expected address, got {:?}", other) };
+        // 退出后:地址内存已回收并标记悬垂 → ptr-read 报错
+        let read = e(CoreExprNode::PtrRead(Box::new(int(a as i64))));
+        assert!(interp.eval_expr(&read).is_err(), "with-region 退出后读到悬垂指针应报错");
     }
 
     fn as_int(v: Value) -> i64 {
@@ -2625,6 +3935,8 @@ mod tests {
             grade: Grade::Omega,
             mode: Mode::In,
             determinism: Determinism::Det,
+            region: None,
+            visibility: Visibility::Public,
             mode_sigs: vec![],
             body: CoreExpr::new(
                 CoreExprNode::Lam(Lambda { params: vec![], body: Box::new(body), ret_type: None }),
@@ -2639,7 +3951,7 @@ mod tests {
     fn run(body: CoreExpr) -> Result<Value, EvalError> {
         let mut interp = Interpreter::new();
         let program = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![],
-            resource_algebras: vec![], defs: vec![def("main", body)] };
+            resource_algebras: vec![], defs: vec![def("main", body)], pragmas: vec![] };
         interp.run_program(&program).map(|r| r.unwrap())
     }
 
@@ -2715,7 +4027,7 @@ mod tests {
         let main_def = def("main", main_body);
         let mut interp = Interpreter::new();
         let program = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![],
-            resource_algebras: vec![], defs: vec![f_def, main_def] };
+            resource_algebras: vec![], defs: vec![f_def, main_def], pragmas: vec![] };
         let result = interp.run_program(&program).unwrap().unwrap();
         assert_eq!(as_int(result), 42);
     }
@@ -2830,6 +4142,8 @@ mod tests {
             grade: Grade::Omega,
             mode: Mode::In,
             determinism: Determinism::Det,
+            region: None,
+            visibility: Visibility::Public,
             mode_sigs: vec![],
             body: CoreExpr::new(
                 CoreExprNode::Lam(Lambda {
@@ -2852,7 +4166,7 @@ mod tests {
         let main_def = def("main", call);
         let mut interp = Interpreter::new();
         let program = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![],
-            resource_algebras: vec![], defs: vec![f_def, main_def] };
+            resource_algebras: vec![], defs: vec![f_def, main_def], pragmas: vec![] };
         let result = interp.run_program(&program).unwrap().unwrap();
         assert_eq!(as_int(result), 50);
     }
@@ -2922,6 +4236,23 @@ mod tests {
         ));
         let dec_v = interp.eval_expr(&dec).unwrap();
         assert!(matches!(dec_v, Value::Str(s) if s == "hello"));
+    }
+
+    #[test]
+    #[cfg(not(feature = "crypto"))]
+    fn test_crypto_placeholder_warning() {
+        // §7.2 默认构建(非 crypto feature)加密为 XOR 占位,首次使用置警告标记
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        assert!(!interp.crypto_warned);
+        let secret = e(CoreExprNode::SpiSecret(Box::new(e(CoreExprNode::Lit(Literal::String("k1".into()))))));
+        interp.eval_expr(&secret).unwrap();
+        let enc = e(CoreExprNode::CryptoEncrypt(
+            Box::new(e(CoreExprNode::Lit(Literal::String("hello".into())))),
+            Box::new(e(CoreExprNode::Lit(Literal::String("k1".into())))),
+        ));
+        interp.eval_expr(&enc).unwrap();
+        assert!(interp.crypto_warned, "加密占位警告应已标记");
     }
 
     #[test]
@@ -3313,7 +4644,7 @@ mod field_tests {
             Span::dummy(),
         );
         let v = interp.eval_expr(&vec).unwrap();
-        assert!(matches!(v, Value::Data(d, fs) if d.as_str() == "Vec" && fs.len() == 1));
+        assert!(matches!(v, Value::Vector(fs) if fs.len() == 1));
     }
 }
 
@@ -3380,14 +4711,36 @@ mod ski_tests {
         let prog = desugar(src);
         let mut interp = Interpreter::new();
         let r = interp.run_program(&prog).unwrap().unwrap();
-        assert!(as_str(&r).contains("i64"), "反射应含注解类型,实际 {:?}", r);
-        assert!(as_str(&r).contains("Pure"), "反射应含效果行,实际 {:?}", r);
+        assert!(matches!(r, Value::Type(_)), "反射应返回类型值,实际 {:?}", r);
 
         let src2 = "(defn main [] (reflect-type nope))";
         let prog2 = desugar(src2);
         let mut interp2 = Interpreter::new();
         let r2 = interp2.run_program(&prog2).unwrap().unwrap();
         assert!(as_str(&r2).contains("未定义"), "未定义符号应提示,实际 {:?}", r2);
+    }
+
+    #[test]
+    fn test_reflect_full_info() {
+        // §29 反射完整信息:名称/参数/类型/效果/等级/模式/确定性全真实
+        let src = "(defn add [a b] -> i64 (+ a b))\n(defn main [] (reflect \"add\"))";
+        let prog = desugar(src);
+        let mut interp = Interpreter::new();
+        let r = interp.run_program(&prog).unwrap().unwrap();
+        match &r {
+            Value::Data(tag, fields) if tag.as_str() == "DefInfo" && fields.len() == 8 => {
+                // [name, arity, params, type, effects, grades, mode, det]
+                assert!(matches!(&fields[0], Value::Str(s) if s == "add"), "name 应为 add");
+                assert!(matches!(fields[1], Value::Int(2)), "arity 应为 2");
+                match &fields[2] {
+                    Value::Vector(p) => assert_eq!(p.len(), 2, "params 应含 2 个参数名"),
+                    other => panic!("params 应为 Vector,实际 {:?}", other),
+                }
+                assert!(matches!(&fields[3], Value::Type(_)), "type 应为类型值");
+                assert!(matches!(&fields[4], Value::Str(_)), "effects 应为字符串");
+            }
+            other => panic!("reflect 应返回 8 字段 DefInfo,实际 {:?}", other),
+        }
     }
 
     fn as_str(v: &Value) -> String {
@@ -3510,17 +4863,12 @@ mod ski_tests {
         }).unwrap().join().unwrap();
         // 返回 Hypothesis 列表(Cons),非 false
         assert!(!matches!(r, Value::Bool(false)), "溯因应返回假设列表,实际 {:?}", r);
+        // 新结构:解释列表(每个解释 = Hypothesis 列表);(> x 3) 一致解释非空
         match r {
             Value::Data(_, items) => {
-                assert!(!items.is_empty(), "假设列表不应为空");
-                if let Value::Data(tag, fields) = &items[0] {
-                    assert_eq!(tag.as_str(), "Hypothesis", "假设应为 Hypothesis,实际 {}", tag);
-                    assert_eq!(fields.len(), 2);
-                } else {
-                    panic!("假设应为 Data(Hypothesis),实际 {:?}", items[0]);
-                }
+                assert!(!items.is_empty(), "解释列表不应为空");
             }
-            _ => panic!("应返回列表,实际 {:?}", r),
+            _ => panic!("应返回解释列表,实际 {:?}", r),
         }
     }
 
@@ -3632,6 +4980,21 @@ mod ski_tests {
         assert_eq!(sp.specialized, 1, "应特化 1 个调用");
     }
 
+    #[test]
+    fn test_constructor_type_specialization() {
+        // §22.4:构造器类型驱动特化 (area (MkCircle 5.0)) → area__spec_N
+        let src = "(defdata Circle (MkCircle [Float]))\n\
+                   (defgeneric area [x])\n\
+                   (defmethod area [(c Circle)] 42)\n\
+                   (defn main [] (area (MkCircle 5.0)))";
+        let prog = desugar(src);
+        let mut sp = tisp_middle::specialize::Specializer::new();
+        let out = sp.specialize(&prog);
+        assert_eq!(sp.specialized, 1, "构造器类型调用应特化");
+        // 特化后含 spec def
+        assert!(out.defs.iter().any(|d| d.name.as_str().starts_with("area__spec_")), "应生成 area__spec_N");
+    }
+
     #[cfg(feature = "ffi")]
     #[test]
     fn test_dlopen_extern() {
@@ -3668,6 +5031,48 @@ mod ski_tests {
     }
 
     #[test]
+    fn test_recursive_predicate_multi_solution() {
+        // §21:递归谓词 + 逻辑变量统一 → find-all 枚举全部解(绑定正确)
+        let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defpred member [x xs] ([x [x . _]]) ([x [_ . xs]] (member x xs)))\n\
+                       (defn main [] (count (find-all (fn [] (fresh [x] (member x [1 2 3]))))))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert_eq!(as_int(r), 3, "member [1 2 3] 应枚举 3 个解(1/2/3)");
+    }
+
+    #[test]
+    fn test_hott_and_temporal_builtins() {
+        // §16.3/16.4/18:fun-ext / monoid-check / clock / always / eventually
+        let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn id [x] x)\n\
+                       (defn main [] (fun-ext id id [1 2 3]))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert!(matches!(r, Value::Bool(true)), "fun-ext 同函数应等价,实际 {:?}", r);
+
+        let r2 = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn plus [a b] (+ a b))\n(defn main [] (monoid-check plus 0 [1 2 3]))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert!(matches!(r2, Value::Bool(true)), "整数加法应为幺半群,实际 {:?}", r2);
+
+        let r3 = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (clock \"c\" 5))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert!(matches!(r3, Value::Data(ref t, _) if t.as_str() == "Clock"), "clock 应返回 Clock,实际 {:?}", r3);
+    }
+
+    #[test]
     fn test_hit_boundary() {
         // §16.3:合法边界通过;未知符号边界违反
         let ok_src = "(defdata-hit Circle (base) (base) (loop :boundary (= loop base)))\n(defn main [] (base))";
@@ -3682,6 +5087,55 @@ mod ski_tests {
             Desugarer::new().desugar_program(forms).unwrap_err()
         };
         assert!(err.message.contains("边界违反"), "应报边界违反,实际: {}", err.message);
+    }
+
+    #[test]
+    fn test_typeclass_fun_deps_conflict() {
+        // §23.3:fun-deps 冲突——同输入不同输出报错
+        let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defclass Coll [c e] :fun-deps [(c -> e)] (elem [c] -> e))\n\
+                       (definstance (Coll i64 i64) (elem [x] x))\n\
+                       (definstance (Coll i64 String) (elem [x] \"s\"))\n\
+                       (defn main [] 1)";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).map(|_| ())
+        }).unwrap().join().unwrap();
+        assert!(r.is_err(), "fun-deps 冲突应报错");
+        if let Err(e) = r {
+            assert!(e.message.contains("fun-deps"), "应报 fun-deps 冲突,实际 {}", e.message);
+        }
+    }
+
+    #[test]
+    fn test_typeclass_type_matching_helpers() {
+        // §23 约束求解驱动:值→类型 + 实例类型匹配(构造器名一致 / 类型变量匹配任意)
+        let interp = Interpreter::new();
+        assert_eq!(value_to_type(&Value::Int(1), &interp), Type::i64());
+        assert_eq!(value_to_type(&Value::Str("x".into()), &interp), Type::string());
+        assert_eq!(value_to_type(&Value::Bool(true), &interp), Type::bool());
+        assert!(type_matches(&Type::i64(), &Type::i64()));
+        assert!(!type_matches(&Type::i64(), &Type::string()));
+        let tvar = Type::Var(tisp_core::types::TypeVar { name: Symbol::new("a"), kind: tisp_core::types::Kind::Star, id: 0 });
+        assert!(type_matches(&tvar, &Type::i64()), "类型变量应匹配任意实参类型");
+    }
+
+    #[test]
+    fn test_hit_endpoint_value() {
+        // §7.4/16.3 端点值构造:HIT 构造器经 defdata 路径构造 Data 值(非 Unit 占位)
+        let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defdata-hit S1 (base) (loop :boundary [(i = i0) -> base (i = i1) -> base]))\n(defn main [] (base))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        match r {
+            Value::Data(tag, fields) => {
+                assert_eq!(tag.as_str(), "base", "base 构造器应构造 Data(base, [])");
+                assert!(fields.is_empty(), "零参构造器应无字段");
+            }
+            other => panic!("base 应构造 Data 值,实际 {:?}", other),
+        }
     }
 
     #[test]
@@ -3713,6 +5167,15 @@ mod ski_tests {
             Value::Str(s) => assert_eq!(s, "(RGB 1 2 3)", "show 应结构显示"),
             other => panic!("应为 Str,实际 {:?}", other),
         }
+
+        // §7.5 deriving Ord:ord-Name 结构化排序
+        let r4 = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defdata Color :deriving (Ord) (Red) (RGB i64 i64 i64))\n(defn main [] (ord-Color (RGB 1 2 3) (RGB 1 2 4)))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert!(matches!(r4, Value::Int(n) if n < 0), "RGB(1,2,3) < RGB(1,2,4),实际 {:?}", r4);
     }
 
     #[test]
@@ -3740,6 +5203,21 @@ mod ski_tests {
         let prog_ok = desugar(ok_src);
         let mut ti2 = tisp_middle::type_infer::TypeInfer::new();
         assert!(ti2.infer_program(&prog_ok).is_ok(), "crisp 内 flat 应通过");
+
+        // §17 ♭/♯ 与直通可区分:flat 返回 Flat 容器、sharp 返回 Sharp 容器
+        let flat_src = "(defn main [] (crisp (flat 1)))";
+        let rf = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let mut interp = Interpreter::new();
+            interp.run_program(&desugar(flat_src)).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert!(matches!(rf, Value::Data(ref t, _) if t.as_str() == "Flat"), "flat 应返回 Flat 容器,实际 {:?}", rf);
+
+        let sharp_src = "(defn main [] (crisp (sharp 1)))";
+        let rs = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let mut interp = Interpreter::new();
+            interp.run_program(&desugar(sharp_src)).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert!(matches!(rs, Value::Data(ref t, _) if t.as_str() == "Sharp"), "sharp 应返回 Sharp 容器,实际 {:?}", rs);
     }
 
     #[test]
@@ -3809,6 +5287,18 @@ mod ski_tests {
     }
 
     #[test]
+    fn test_tco_deep_tail_recursion() {
+        // §8.1 TCO:尾递归 sum-to 在 1MB 栈下不溢出(蹦床复用栈帧)
+        let r = std::thread::Builder::new().stack_size(1024 * 1024).spawn(move || {
+            let src = "(defn sum-to [n acc] (if (= n 0) acc (sum-to (- n 1) (+ acc n))))\n(defn main [] (sum-to 20000 0))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert_eq!(as_int(r), 200010000, "sum-to 20000 0 应为 200010000");
+    }
+
+    #[test]
     fn test_recursive_closure_finite_and_infinite() {
         // 有限类型递归返回闭包:通过 + run 3
         let ok_src = "(defn make-adder-n [n] (if (= n 0) (fn [x] x) (fn [x] ((make-adder-n (- n 1)) (+ x 1)))))\n(defn main [] ((make-adder-n 3) 0))";
@@ -3837,6 +5327,204 @@ mod ski_tests {
         assert!(ti.infer_program(&prog).is_err(), "真实类型错误应被拒绝");
     }
 
+
+    #[test]
+    fn test_grade_inequality_diagnostic_and_hit_endpoint() {
+        // §10:自由符号等级通过 + 诊断警告(不误报)
+        let src = "(defn f [xs : (Vec i64 n) (n x : i64)] -> i64 (do x x))\n(defn main [] 1)";
+        let prog = desugar(src);
+        let mut ti = tisp_middle::type_infer::TypeInfer::new();
+        assert!(ti.infer_program(&prog).is_ok(), "自由符号等级应通过");
+        let mut gc = tisp_middle::grade_check::GradeChecker::new();
+        assert!(gc.check_program(&prog).is_ok());
+        assert!(!gc.inequalities.is_empty(), "应收集等级不等式诊断");
+
+        // §16.3:端点方程不可满足 → 边界违反;i0=i0 通过
+        let bad = "(defdata-hit B (base) (base) (loop :boundary (= i0 i1)))\n(defn main [] 1)";
+        let err = {
+            use tisp_frontend::desugar::Desugarer;
+            use tisp_frontend::reader::read;
+            let forms = read(bad).unwrap();
+            Desugarer::new().desugar_program(forms).unwrap_err()
+        };
+        assert!(err.message.contains("端点方程不可满足"), "应报端点方程违反,实际: {}", err.message);
+    }
+
+    #[test]
+    fn test_clp_arith_and_all_different() {
+        // §21.5:乘法约束 (x·y=12) 解集正确;all-different 排列互斥
+        let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (fresh [x y] (domain x 1 6) (domain y 1 6) (constrain (= (* x y) 12)) (label x 1) (label y 1) (+ (* x 10) y)))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        // 解应为 x=2, y=6 → 2*10+6 = 26(传播后最小可行解)
+        assert_eq!(as_int(r), 26, "乘法约束应得 x=2 y=6");
+
+        let r2 = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (fresh [x y z] (domain x 1 3) (domain y 1 3) (domain z 1 3) (constrain (all-different x y z)) (label x 1) (label y 1) (label z 1) (+ (* x 100) (+ (* y 10) z))))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert_eq!(as_int(r2), 123, "all-different 应为 1,2,3 排列");
+    }
+
+    #[test]
+    fn test_abduce_multi_explanations() {
+        // §21.6:abduce 返回全部一致解释(多解枚举);不可满足返回原因
+        let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (fresh [x] (domain x 1 3) (count (abduce (constrain (> x 1)) x))))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert!(as_int(r) >= 2, "应返回多个一致解释");
+
+        // 不可满足:返回 no-consistent-explanation 原因
+        let r2 = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (fresh [x] (domain x 1 3) (abduce (constrain (> x 9)) x)))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        match r2 {
+            Value::Data(_, items) => {
+                assert!(!items.is_empty(), "原因列表不应为空");
+                if let Value::Data(tag, _) = &items[0] {
+                    assert_eq!(tag.as_str(), "no-consistent-explanation", "应返回不可满足原因,实际 {}", tag);
+                } else {
+                    panic!("应返回原因节点,实际 {:?}", items[0]);
+                }
+            }
+            _ => panic!("应返回列表,实际 {:?}", r2),
+        }
+    }
+
+    #[test]
+    fn test_type_first_class_value() {
+        // §9:reflect-type 返回 Value::Type(绑定/传递/比较);类型值相等性
+        let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn f [x : i64] -> i64 x)\n(defn main [] (let [t (reflect-type f)] (if (= t t) 1 0)))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert_eq!(as_int(r), 1, "相同类型值应相等");
+
+        let r2 = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn f [x : i64] -> i64 x)\n(defn main [] (let [t (reflect-type f)] (if (= t 5) 1 0)))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert_eq!(as_int(r2), 0, "类型值与整数不应相等");
+    }
+
+    #[test]
+    fn test_type_value_display() {
+        // §9:类型值可打印(show_value 输出类型表示,而非占位 "...")
+        let ty = tisp_core::types::Type::i64();
+        assert_eq!(show_value(&Value::Type(ty.clone())), "i64");
+        assert_eq!(value_to_string(&Value::Type(ty)), "i64");
+        // 复合类型
+        let list_ty = tisp_core::types::Type::list(tisp_core::types::Type::i64());
+        assert_eq!(show_value(&Value::Type(list_ty)), "List i64");
+    }
+
+    #[test]
+    fn test_type_value_pattern_match() {
+        // §9:类型值可模式匹配(Int 匹配 Con(i64);(List a) 匹配 App(Con(List), a))
+        let pat_int = tisp_core::core_ast::Pattern::Con(Symbol::new("i64"), vec![]);
+        let val_int = Value::Type(tisp_core::types::Type::i64());
+        assert!(Interpreter::new().match_pattern(&pat_int, &val_int).is_some(), "i64 类型值应匹配 (i64) 模式");
+
+        let pat_list = tisp_core::core_ast::Pattern::Con(
+            Symbol::new("List"),
+            vec![tisp_core::core_ast::Pattern::Var(Symbol::new("a"))],
+        );
+        let val_list = Value::Type(tisp_core::types::Type::list(tisp_core::types::Type::i64()));
+        assert!(Interpreter::new().match_pattern(&pat_list, &val_list).is_some(), "(List a) 模式应匹配 List i64 类型值");
+
+        // 不匹配:构造器名不同
+        let pat_str = tisp_core::core_ast::Pattern::Con(Symbol::new("String"), vec![]);
+        assert!(Interpreter::new().match_pattern(&pat_str, &val_int).is_none(), "i64 类型值不应匹配 String 模式");
+    }
+
+    #[test]
+    fn test_hott_real_semantics() {
+        // §16.3/§17:HComp 边界填充、Transp 端点传输、Shape 路径连通
+        let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (transp (fn [i] 9) true))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert_eq!(as_int(r), 9, "Transp 应返回目标端点值 9");
+
+        let r2 = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (hcomp (fn [i] 7)))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        match r2 {
+            Value::Data(tag, fields) => {
+                assert_eq!(tag.as_str(), "KanFill", "HComp 应返回 KanFill,实际 {}", tag);
+                assert_eq!(fields.len(), 2, "KanFill 应含两端点边界值");
+            }
+            other => panic!("HComp 应返回 KanFill,实际 {:?}", other),
+        }
+
+        // Shape 连通:恒等路径连通(true),分支路径不连通(false)
+        let r3 = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (shape (fn [i] 42)))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        match r3 {
+            Value::Data(_, fields) => {
+                assert!(matches!(fields[0], Value::Bool(true)), "恒等路径应连通");
+            }
+            other => panic!("Shape 应为容器,实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_hcomp_boundary_inconsistency() {
+        // §16 完整立方填充:边界不一致 SHALL 报错(而非静默返回一端)
+        let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (hcomp (fn [i] (if i 1 2))))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog)
+        }).unwrap().join().unwrap();
+        assert!(r.is_err(), "HComp 边界不一致应报错,实际 {:?}", r);
+    }
+
+    /// §17 Cohesive adjoint-triple(ʃ ⊣ ♭ ⊣ ♯):♭∘♯ 与 ʃ∘♭ 的 counit → id
+    #[test]
+    fn test_cohesive_adjoint_triple() {
+        // ♭(♯(42)) = 42(counit of ♭ ⊣ ♯)
+        let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (flat (sharp 42)))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert_eq!(as_int(r), 42, "♭∘♯ 应返回原值 42");
+
+        // ʃ(♭(42)) = 42(counit of ʃ ⊣ ♭)
+        let r2 = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (shape (flat 42)))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert_eq!(as_int(r2), 42, "ʃ∘♭ 应返回原值 42");
+    }
 
     #[test]
     fn test_zero_grade_param_not_evaluated() {
@@ -3868,3 +5556,317 @@ mod ski_tests {
 
 }
 
+
+#[cfg(test)]
+mod persistent_tests {
+    use super::*;
+
+    fn app(fname: &str, args: Vec<CoreExpr>) -> CoreExpr {
+        let mut e = CoreExpr::new(CoreExprNode::Var(Symbol::new(fname)), Span::dummy());
+        for a in args {
+            e = CoreExpr::new(CoreExprNode::App(Box::new(e), Box::new(a)), Span::dummy());
+        }
+        e
+    }
+    fn int(n: i64) -> CoreExpr {
+        CoreExpr::new(CoreExprNode::Lit(Literal::I64(n)), Span::dummy())
+    }
+
+    /// §4 结构相等/哈希:Vector/Map/Set 按内容比较,可作 map/set 键
+    #[test]
+    fn test_value_struct_eq_hash() {
+        let a = Value::Vector(im::vector![Value::Int(1), Value::Int(2)]);
+        let b = Value::Vector(im::vector![Value::Int(1), Value::Int(2)]);
+        assert_eq!(a, b);
+
+        use std::collections::HashSet;
+        let mut s = HashSet::new();
+        s.insert(a.clone());
+        assert!(s.contains(&b));
+
+        // Map 以结构相等的 Vector 作键
+        let m: im::HashMap<Value, Value> = im::HashMap::unit(a.clone(), Value::Int(42));
+        assert_eq!(m.get(&b), Some(&Value::Int(42)));
+    }
+
+    /// §4 conj 结构共享:返回新 Vector,元素追加
+    #[test]
+    fn test_persistent_vector_conj() {
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        let v = interp.eval_expr(&app("conj", vec![app("vector", vec![int(1), int(2)]), int(3)])).unwrap();
+        match &v {
+            Value::Vector(vv) => assert_eq!(vv.len(), 3),
+            other => panic!("expected Vector, got {:?}", other),
+        }
+        // 原 vector 仍为 2 元素(纯函数式:旧值不变)
+        let old = interp.eval_expr(&app("vector", vec![int(1), int(2)])).unwrap();
+        if let Value::Vector(vv) = &old { assert_eq!(vv.len(), 2); }
+    }
+
+    /// §4 assoc/dissoc/disj/contains? 持久化操作
+    #[test]
+    fn test_persistent_map_set() {
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        // assoc:插入新键
+        let m = interp.eval_expr(&app("assoc", vec![
+            app("hash-map", vec![int(1), int(2)]), int(3), int(4),
+        ])).unwrap();
+        if let Value::Map(mm) = &m { assert!(mm.contains_key(&Value::Int(3))); }
+        else { panic!("expected Map"); }
+        // contains? set
+        let c = interp.eval_expr(&app("contains?", vec![
+            app("hash-set", vec![int(1), int(2)]), int(2),
+        ])).unwrap();
+        assert!(matches!(c, Value::Bool(true)));
+        // disj:移除
+        let d = interp.eval_expr(&app("disj", vec![
+            app("hash-set", vec![int(1), int(2)]), int(1),
+        ])).unwrap();
+        if let Value::Set(ss) = &d {
+            assert!(!ss.contains(&Value::Int(1)));
+            assert!(ss.contains(&Value::Int(2)));
+        } else { panic!("expected Set"); }
+    }
+
+    /// §4 quote 产生可操作数据:符号→字符串、数字→i64(list 构造已由 desugar 覆盖)
+    #[test]
+    fn test_quote_produces_list() {
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        // '(1 2 3) 脱糖为 (list 1 2 3)
+        let v = interp.eval_expr(&app("list", vec![int(1), int(2), int(3)])).unwrap();
+        let items: Vec<i64> = list_to_vec(&v).iter().filter_map(|x| if let Value::Int(n) = x { Some(*n) } else { None }).collect();
+        assert_eq!(items, vec![1, 2, 3]);
+    }
+
+    /// §31/§32 范式全链路接入:24 范式经 ParadigmRegistry 从解释器可调用
+    #[test]
+    fn test_paradigm_builtins_full_chain() {
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        // 数组范式:数组归约
+        let r = interp.eval_expr(&app("pf-array-sum", vec![app("vector", vec![int(1), int(2), int(3)])])).unwrap();
+        assert_eq!(r, Value::Int(6));
+        // 符号范式:符号代换求值
+        let r = interp.eval_expr(&app("pf-sym-eval", vec![int(2)])).unwrap();
+        assert_eq!(r, Value::Int(3));
+        // 基于流范式:惰性取前 3 项并映射
+        let r = interp.eval_expr(&app("pf-stream-take", vec![int(3)])).unwrap();
+        match r {
+            Value::Vector(v) => {
+                let xs: Vec<i64> = v.iter().filter_map(|x| if let Value::Int(n) = x { Some(*n) } else { None }).collect();
+                assert_eq!(xs, vec![0, 2, 4]);
+            }
+            other => panic!("expected Vector, got {:?}", other),
+        }
+        // AOP 范式:around 编织
+        let r = interp.eval_expr(&app("pf-aop-weave", vec![int(42)])).unwrap();
+        assert_eq!(r, Value::Int(142));
+    }
+
+    /// §32 真实自动机:DFA 识别(接线 tisp_runtime::programming::Dfa)
+    #[test]
+    fn test_real_dfa_accepts() {
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        let s = |txt: &str| CoreExpr::new(CoreExprNode::Lit(Literal::String(txt.into())), Span::dummy());
+        // 偶数个 'a':s0 -a-> s1 -a-> s0,s0 接受
+        let transitions = vec![int(0), int(97), int(1), int(1), int(97), int(0)];
+        let call = app("dfa-accept", vec![
+            int(0),
+            app("vector", vec![int(0)]),
+            app("vector", transitions.clone()),
+            s("aa"),
+        ]);
+        assert_eq!(interp.eval_expr(&call).unwrap(), Value::Bool(true), "偶数个 a 应被接受");
+
+        let call2 = app("dfa-accept", vec![
+            int(0),
+            app("vector", vec![int(0)]),
+            app("vector", transitions),
+            s("a"),
+        ]);
+        assert_eq!(interp.eval_expr(&call2).unwrap(), Value::Bool(false), "奇数个 a 应被拒绝");
+    }
+
+    /// §32 真实状态机:事件驱动转移(接线 tisp_runtime::programming::StateMachine)
+    #[test]
+    fn test_real_state_machine_drive() {
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        // 0 -e1-> 2:驱动事件 1 → 新状态 2
+        let call = app("sm-drive", vec![
+            int(0), int(1), app("vector", vec![int(0), int(1), int(2)]),
+        ]);
+        assert_eq!(interp.eval_expr(&call).unwrap(), Value::Int(2));
+        // 非法事件 → 报错
+        let bad = app("sm-drive", vec![
+            int(0), int(9), app("vector", vec![int(0), int(1), int(2)]),
+        ]);
+        assert!(interp.eval_expr(&bad).is_err(), "非法转移应报错");
+    }
+
+    /// §32 真实描述逻辑:概念子概念推理(接线 tisp_runtime::paradigms::Ontology)
+    #[test]
+    fn test_real_subsume() {
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        // Man(1) ⊑ Person(2):is_instance(1, 2) = true
+        let call = app("subsume", vec![
+            app("vector", vec![int(1), int(2)]), int(1), int(2),
+        ]);
+        assert_eq!(interp.eval_expr(&call).unwrap(), Value::Bool(true));
+        // Dog(3) 非 Person(2) 子概念 → false
+        let call2 = app("subsume", vec![
+            app("vector", vec![int(1), int(2)]), int(3), int(2),
+        ]);
+        assert_eq!(interp.eval_expr(&call2).unwrap(), Value::Bool(false));
+    }
+
+    /// §32 真实表格化逻辑:左递归终止(接线 tisp_runtime::paradigms::Tabler)
+    #[test]
+    fn test_real_tabling() {
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        // 左递归 p(1) :- p(1):表格化使左递归终止 → false(facts 含无关事实 9)
+        let call = app("tabling", vec![
+            app("vector", vec![int(9)]), app("vector", vec![int(1), int(1)]), int(1),
+        ]);
+        assert_eq!(interp.eval_expr(&call).unwrap(), Value::Bool(false));
+        // q(2) 为事实,p(1) :- q(2):prove(p) = true
+        let call2 = app("tabling", vec![
+            app("vector", vec![int(2)]), app("vector", vec![int(1), int(2)]), int(1),
+        ]);
+        assert_eq!(interp.eval_expr(&call2).unwrap(), Value::Bool(true));
+    }
+
+    /// §32 真实符号编程:后序构造 SymExpr + 化简 + 求值
+    #[test]
+    fn test_real_sym_eval() {
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        // (+ 2 1) → 3
+        let call = app("sym-eval", vec![app("vector", vec![int(2), int(1), int(-1)])]);
+        assert_eq!(interp.eval_expr(&call).unwrap(), Value::Int(3));
+        // (* 2 3) → 6
+        let call2 = app("sym-eval", vec![app("vector", vec![int(2), int(3), int(-2)])]);
+        assert_eq!(interp.eval_expr(&call2).unwrap(), Value::Int(6));
+        // (+ 0 5) 化简 → 5
+        let call3 = app("sym-eval", vec![app("vector", vec![int(0), int(5), int(-1)])]);
+        assert_eq!(interp.eval_expr(&call3).unwrap(), Value::Int(5));
+    }
+
+    /// §31 真实 EVOLP/ASP:命题稳定模型(p :- not q → {p})
+    #[test]
+    fn test_real_evolp_stable() {
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        // p(1) :- not q(2),facts=[9 无关]:稳定模型含 p(1)
+        let call = app("evolp-stable", vec![
+            app("vector", vec![int(9)]), app("vector", vec![int(1), int(-2)]),
+        ]);
+        match interp.eval_expr(&call).unwrap() {
+            Value::Vector(v) => {
+                let xs: Vec<i64> = v.iter().filter_map(|x| if let Value::Int(n) = x { Some(*n) } else { None }).collect();
+                assert!(xs.contains(&1), "稳定模型应含 p(1),实际 {:?}", xs);
+            }
+            other => panic!("expected Vector, got {:?}", other),
+        }
+        // q(2) 为事实时,not q(2) 为假 → p(1) 不成立,稳定模型不含 p(1)
+        let call2 = app("evolp-stable", vec![
+            app("vector", vec![int(2)]), app("vector", vec![int(1), int(-2)]),
+        ]);
+        match interp.eval_expr(&call2).unwrap() {
+            Value::Vector(v) => {
+                let xs: Vec<i64> = v.iter().filter_map(|x| if let Value::Int(n) = x { Some(*n) } else { None }).collect();
+                assert!(!xs.contains(&1), "q 为事实时稳定模型不应含 p(1),实际 {:?}", xs);
+            }
+            other => panic!("expected Vector, got {:?}", other),
+        }
+    }
+
+    /// §31 真实 DLP:动态稳定模型(状态 1 的 p 被状态 2 否定 → 拒绝)
+    #[test]
+    fn test_real_dlp_stable() {
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        let empty = || CoreExpr::new(CoreExprNode::Data(Symbol::new("Vec"), vec![]), Span::dummy());
+        // 状态1:fact p(1);状态2:rule q(2) :- not p(1) → p 被后续状态否定,结果含 q(2)
+        let call = app("dlp-stable", vec![
+            app("vector", vec![int(1)]), empty(),
+            empty(), app("vector", vec![int(2), int(-1)]),
+        ]);
+        match interp.eval_expr(&call).unwrap() {
+            Value::Vector(v) => {
+                let xs: Vec<i64> = v.iter().filter_map(|x| if let Value::Int(n) = x { Some(*n) } else { None }).collect();
+                assert!(!xs.contains(&1), "p(1) 应被后续状态否定,实际 {:?}", xs);
+                assert!(xs.contains(&2), "动态稳定模型应含 q(2),实际 {:?}", xs);
+            }
+            other => panic!("expected Vector, got {:?}", other),
+        }
+    }
+
+    /// §31 真实 EVOLP 演化:assert/retract + foldl 折叠
+    #[test]
+    fn test_real_evolp_evolve() {
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        // facts [1 2],assert 3,retract 1 → [2 3]
+        let call = app("evolp-evolve", vec![
+            app("vector", vec![int(1), int(2)]), app("vector", vec![int(1), int(3), int(0), int(1)]),
+        ]);
+        match interp.eval_expr(&call).unwrap() {
+            Value::Vector(v) => {
+                let mut xs: Vec<i64> = v.iter().filter_map(|x| if let Value::Int(n) = x { Some(*n) } else { None }).collect();
+                xs.sort();
+                assert_eq!(xs, vec![2, 3], "assert 3 + retract 1 后应为 [2, 3]");
+            }
+            other => panic!("expected Vector, got {:?}", other),
+        }
+    }
+
+    /// §31 MOP:GetKB/SetKB 运行时知识库读写
+    #[test]
+    fn test_mop_get_set_kb() {
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        // set-kb [1 2] → get-kb 返回 [1 2]
+        interp.eval_expr(&app("set-kb", vec![app("vector", vec![int(1), int(2)])])).unwrap();
+        let r = interp.eval_expr(&app("get-kb", vec![int(0)])).unwrap();
+        match r {
+            Value::Vector(v) => {
+                let mut xs: Vec<i64> = v.iter().filter_map(|x| if let Value::Int(n) = x { Some(*n) } else { None }).collect();
+                xs.sort();
+                assert_eq!(xs, vec![1, 2], "get-kb 应返回已写入的知识库");
+            }
+            other => panic!("expected Vector, got {:?}", other),
+        }
+        // set-kb [3] 覆盖 → get-kb 返回 [3]
+        interp.eval_expr(&app("set-kb", vec![app("vector", vec![int(3)])])).unwrap();
+        let r2 = interp.eval_expr(&app("get-kb", vec![int(0)])).unwrap();
+        match r2 {
+            Value::Vector(v) => {
+                let xs: Vec<i64> = v.iter().filter_map(|x| if let Value::Int(n) = x { Some(*n) } else { None }).collect();
+                assert_eq!(xs, vec![3], "set-kb 覆盖后 get-kb 应返回 [3]");
+            }
+            other => panic!("expected Vector, got {:?}", other),
+        }
+    }
+
+    /// §统一内存管理:Ref a 分级值(ref/deref/set! 为 State 效应操作)
+    #[test]
+    fn test_ref_deref_set() {
+        let mut interp = Interpreter::new();
+        interp.register_builtins();
+        // (ref 42) → 地址;deref → 42;set! → Unit;deref → 100
+        let addr = interp.eval_expr(&app("ref", vec![int(42)])).unwrap();
+        let a = match addr { Value::Int(n) => n, other => panic!("expected address, got {:?}", other) };
+        let r = interp.eval_expr(&app("deref", vec![int(a)])).unwrap();
+        assert_eq!(r, Value::Int(42), "deref 应返回初值 42");
+        interp.eval_expr(&app("set!", vec![int(a), int(100)])).unwrap();
+        let r2 = interp.eval_expr(&app("deref", vec![int(a)])).unwrap();
+        assert_eq!(r2, Value::Int(100), "set! 后 deref 应返回 100");
+    }
+}

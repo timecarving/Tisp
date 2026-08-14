@@ -38,3 +38,5 @@ inkwell = { version = "0.5", features = ["llvm17-0"] }
 # 因缺少 libPolly.a 等静态库而构建失败)
 llvm-sys = { version = "170", features = ["force-dynamic"] }
 libloading = "0.8"
+chacha20 = "0.9"
+sha2 = "0.10"

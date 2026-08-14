@@ -9,3 +9,4 @@ pub mod modes;
 pub mod determinism;
 pub mod regions;
 pub mod data;
+pub mod evolp;

@@ -1,6 +1,6 @@
 use crate::span::Span;
 use crate::symbol::Symbol;
-use crate::types::{Type, EffectRow, Grade, Mode, Determinism, Predicate, EffectLabel};
+use crate::types::{Type, EffectRow, Grade, Mode, Determinism, Predicate, EffectLabel, RegionVar};
 use crate::data::DataDecl;
 use crate::effects::EffectDecl;
 
@@ -171,8 +171,11 @@ pub enum CoreExprNode {
     MethodDef(Symbol, MethodCategory, Vec<Pattern>, Box<CoreExpr>),
 
     // ── Typeclasses ──
-    ClassDef(Symbol, Vec<Symbol>, Vec<(Symbol, Type)>),
+    /// (name, 类型变量, 方法, fun-deps(输入→输出), 超类名列表)
+    ClassDef(Symbol, Vec<Symbol>, Vec<(Symbol, Type)>, Vec<(Symbol, Symbol)>, Vec<Symbol>),
     InstanceDef(Symbol, Vec<Type>, Vec<(Symbol, Box<CoreExpr>)>),
+    /// §7.5 deriving:结构派生实现(trait 名, 类型名)——desugar 生成,解释器注册内置
+    DerivingImpl(Symbol, Symbol),
 
     // ── Macros ──
     MacroDef(Symbol, usize, Box<CoreExpr>),
@@ -182,6 +185,13 @@ pub enum CoreExprNode {
 
     // ── FFI ──
     ExternDef(Symbol, String, Vec<Type>, Option<Type>, Vec<EffectLabel>),
+}
+
+/// 定义可见性(§6.5):`defn-`/`def-` 私有,`defn`/`def` 公开
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Visibility {
+    Public,
+    Private,
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +280,8 @@ pub struct CoreProgram {
     /// 资源代数声明(§11.1)
     pub resource_algebras: Vec<crate::types::ResourceAlgebra>,
     pub defs: Vec<CoreDef>,
+    /// 编译指示(§30):(指示名, 目标/参数)
+    pub pragmas: Vec<(Symbol, Vec<Symbol>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -279,6 +291,10 @@ pub struct CoreDef {
     pub effects: EffectRow,
     pub grade: Grade,
     pub mode: Mode,
+    /// 六维注解中的区域维(§6.6/§26.3):未标注为 None
+    pub region: Option<RegionVar>,
+    /// 定义可见性(§6.5):defn-/def- 私有,defn/def 公开
+    pub visibility: Visibility,
     /// 多模式谓词签名(§13):每个元素是一个模式的参数 Mode 列表(如 [In, Out])
     pub mode_sigs: Vec<Vec<Mode>>,
     pub determinism: Determinism,

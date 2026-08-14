@@ -19,9 +19,27 @@ impl RegionInfer {
     fn infer_def(&mut self, def: &CoreDef) -> Result<Vec<Region>, RegionError> {
         self.allocation_regions.clear();
         self.walk(&def.body)?;
+        // §26.3 编译期区域逃逸检查:分配的地址作为返回值逃出作用域 → 报错
+        if self.check_escape(&def.body) {
+            return Err(RegionError {
+                message: format!("区域逃逸:定义 '{}' 的分配地址作为返回值逃出区域作用域", def.name),
+                span: def.span,
+            });
+        }
         let mut regions = Vec::new();
         for r in self.allocation_regions.values() { if !regions.contains(r) { regions.push(r.clone()); } }
         Ok(regions)
+    }
+    /// 判断表达式是否把 `RegionAlloc` 的分配地址作为最终值(逃逸)。
+    /// Do/Let 追尾;if 两分支均逃逸才算逃逸。
+    fn check_escape(&self, expr: &CoreExpr) -> bool {
+        match &expr.node {
+            CoreExprNode::RegionAlloc(_, _) => true,
+            CoreExprNode::Do(es) => es.last().map_or(false, |e| self.check_escape(e)),
+            CoreExprNode::Let(_, _, _, body) => self.check_escape(body),
+            CoreExprNode::If(_, t, e) => self.check_escape(t) && self.check_escape(e),
+            _ => false,
+        }
     }
     fn walk(&mut self, expr: &CoreExpr) -> Result<(), RegionError> {
         match &expr.node {
@@ -63,3 +81,52 @@ impl RegionInfer {
     }
 }
 fn hash_expr(expr: &CoreExpr) -> usize { std::ptr::from_ref(expr) as usize }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tisp_core::types::{EffectRow, Grade, Mode, Determinism};
+
+    fn e(node: CoreExprNode) -> CoreExpr {
+        CoreExpr::new(node, Span::dummy())
+    }
+
+    fn def_with_body(body: CoreExpr) -> CoreDef {
+        CoreDef {
+            name: Symbol::new("f"),
+            ty: None,
+            effects: EffectRow::Pure,
+            grade: Grade::Omega,
+            mode: Mode::In,
+            region: None,
+            visibility: Visibility::Public,
+            mode_sigs: vec![],
+            determinism: Determinism::Det,
+            body,
+            requires: None,
+            ensures: None,
+            span: Span::dummy(),
+        }
+    }
+
+    #[test]
+    fn test_region_escape_detected() {
+        // 分配地址作为函数返回值 → 逃逸
+        let body = e(CoreExprNode::RegionAlloc(
+            Box::new(e(CoreExprNode::Lit(Literal::Unit))),
+            Box::new(e(CoreExprNode::Lit(Literal::I64(42)))),
+        ));
+        let mut inf = RegionInfer::new();
+        let r = inf.infer_def(&def_with_body(body));
+        assert!(r.is_err(), "分配地址逃逸应报错");
+        assert!(r.unwrap_err().message.contains("区域逃逸"));
+    }
+
+    #[test]
+    fn test_no_escape_for_literal() {
+        // 普通字面量返回 → 不逃逸
+        let body = e(CoreExprNode::Lit(Literal::I64(42)));
+        let mut inf = RegionInfer::new();
+        assert!(inf.infer_def(&def_with_body(body)).is_ok());
+    }
+}

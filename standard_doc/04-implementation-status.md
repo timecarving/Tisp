@@ -1,6 +1,6 @@
 # 04 — Spec 实现状态与未实现特性清单
 
-> 对照 `docs/spec.md`(30 章 + 6 附录)与 `crates/` 实际实现的逐章审计结果(0.1.0,2026-08)。
+> 对照 `docs/spec.md`(32 章 + 6 附录)与 `crates/` 实际实现的逐章审计结果(0.1.0,2026-08)。
 > 符号:✅ 完全实现 | ⚠️ 部分实现 | ⬜ 仅设计。证据为 `file:line`。
 
 ---
@@ -10,35 +10,37 @@
 | 章 | 特性 | 状态 | 摘要 |
 |----|------|------|------|
 | 1 | Introduction | ✅ | Lisp-1/无 GC 区域栈已落地;LLVM 经 inkwell 生成真实 IR(llvm feature,llc 验证) |
-| 2 | Design Philosophy | ⚠️ | 统一 def+六维注解、语法糖脱糖最实;统一约束求解、演算统一未达成 |
+| 2 | Design Philosophy | ⚠️ | 统一 def+六维注解、语法糖脱糖最实;统一六维约束求解(constraint.rs 共享约束图 + solve.rs 协调器聚合六 pass 冲突 + 跨维度报告)已接线;演算统一(check_trace_equivalence/check_observational_equivalence 跨 π/ρ/ambient/SKI 迹等价)已实现;维度间 fixpoint 迭代收敛为设计目标 |
 | 3 | Lexical Structure | ⚠️ | 标识符/字面量/行注释/块注释 `#| |#`/字符串转义齐; |
-| 4 | Data Structures | ⚠️ | List/Unit/构造器(list/vector/hash-map/hash-set)可用;Vec/Map/Set 无持久化语义;quote 不产生数据 |
+| 4 | Data Structures | ✅ | List/Vector/Map/Set 持久化(im HAMT 结构共享)+ quote 产生可操作数据;conj/assoc/contains?/dissoc/disj 齐 |
 | 5 | Expressions | ⚠️ | 9 项中 9 项实现(含 `ann` §5.9); |
-| 6 | Definitions | ⚠️ | def/defn/defpred/defmacro/defgeneric 等全有;私有语义、六维注解语法未解析 |
-| 7 | ADT | ⚠️ | defdata/记录/字段访问/GADT 可用;deriving (Eq/Show) 生成 eq-/show- 函数(结构递归);Ord 生成缺 |
+| 6 | Definitions | ✅ | def/defn/defpred/defmacro/defgeneric 等全有;私有定义(defn-/def-)写 visibility + ns 引用过滤;六维注解 `->[ε,ρ,@r,m,d]` 解析并贯通 FunAnnotation |
+| 7 | ADT | ✅ | defdata/记录/字段访问/GADT 可用;deriving (Eq/Ord/Show) 生成 eq-/ord-/show- 函数(结构递归) |
 | 8 | Pattern Matching | ⚠️ | match/cons/通配符/穷尽性检查/or-pattern/guard 双形式/refined 模式齐; |
-| 9 | Type System Overview | ⚠️ | HM 推断+泛化+rank-n+行多态有;前向引用/相互递归/let 递归/零参 lambda(Unit -> T)类型正确;类型族(§9 声明/归约/悬挂报错)、类型反射(reflect-type)已实现;Value::Type 一等值、五维子类型缺 |
+| 9 | Type System Overview | ✅ | HM 推断+泛化+rank-n+行多态;类型族多模式/类型一等值(Value::Type)/五维子类型/subtype.rs;tlambda(类型 λ)+ defpoly/where + conj/disj 字面量 + trait 语法糖(deftrait/polytrait/with) |
 | 10 | QTT | ✅ | Grade 0/1/ω + 依赖等级(数字/符号/复合表达式,上界检查,等级变量绑定);运行时 0 级擦除 + 1 级移动检查;符号等级 Z3 验证未做 |
-| 11 | Graded Modal Types | ⚠️ | `defresource-algebra` 真实解析(名称/单位元/运算/阶,`--desugar` 可见);□_r/◇_ε 无推理 |
+| 11 | Graded Modal Types | ⚠️ | `defresource-algebra` 真实解析(名称/单位元/运算/阶 + `:asymptotic`,`--desugar` 可见);□_r/◇_ε Modal 类型在 type_infer reduce_families/unify 已接线;引入/消去等级推导(可推断时)缺 |
 | 12 | Effect System | ✅ | defeffect/handle/perform/续延 k 语义(多 body+状态写回)齐;§12.5 行消减;§12.6 单处理器 handle 走直接状态传递(计数输出) |
-| 13 | Mode System | ⚠️ | `:mode (i o)` 多模式签名解析 + 调用点按实参 free/ground 匹配(无匹配报错);多模式自动推断不支持 |
+| 13 | Mode System | ✅ | `:mode` 签名解析 + 调用点匹配 + 未声明谓词按调用形态自动推断模式 |
 | 14 | Determinism | ✅ | 8 类范畴+注解写入 CoreDef;cc_multi/cc_nondet 运行时提交(首子句+cut) |
 | 15 | Liquid Types | ✅ | 精化类型 `{x : T | pred}` 解析、`:requires`/`:ensures` 契约、Z3 求解验证(调用点/返回精化/契约,违反带反例)、无 z3 降级常量折叠;未知谓词警告放行(证据:liquid_verify.rs / z3_bridge.rs / desugar.rs) |
-| 16 | HoTT | ⚠️ | Interval/Path/Glue 齐;HComp/Transp 平凡求值;defdata-hit `:boundary` 解析与一致性检查(未知符号报错) |
-| 17 | Cohesive HoTT | ⚠️ | ♭/♯ 直通;ʃ(shape)返回 Shape 容器(路径端点,最小可区分语义);crisp 上下文检查(非 crisp 解包 ♭ 报错) |
-| 18 | Temporal Types | ⚠️ | 惰性 Stream/Signal/Clock 可运行;`(next T)` 等时序模态类型语法与推断;□_t 语义保证缺 |
-| 19 | Dependent Graded Types | ⚠️ | **Type 有 Pi/Sigma 变体**(§19.1 语法/显示/推断统一,`->` 注解生效);依赖等级检查机制就位(r+s 对 ω 绑定恒过) |
+| 16 | HoTT | ⚠️ | Interval/Path/Glue 齐;HComp(KanFill 边界)/Transp(端点传输)真实求值;`:boundary` 端点方程可满足性检查;完整立方填充:HComp 边界不一致报错 + hott.rs `kan_fill_2d`(2 维 Kan);N 维立方组合接线缺 |
+| 17 | Cohesive HoTT | ⚠️ | ♭(Flat 容器)/♯(Sharp 容器)可区分语义;ʃ(shape)路径连通 + shape-graph 连通图;crisp 上下文检查;adjoint-triple(ʃ ⊣ ♭ ⊣ ♯)的 counit 语义(♭∘♯ = id、ʃ∘♭ = id)已接线;unit 与自然性(完整范畴同伦模型)缺 |
+| 18 | Temporal Types | ⚠️ | 惰性 Stream/Signal/Clock 可运行;`(next T)` 等时序模态类型语法与推断;□_t 稳定类型 `is_stable_type` + 生产率检查 `check_productivity` 已接线(§18.3/18.4);因果性/空间回收完整语义缺 |
+| 19 | Dependent Graded Types | ⚠️ | **Type 有 Pi/Sigma 变体**(§19.1 语法/显示/推断统一,`->` 注解生效);依赖等级 r+s 传播已实现(grade_check.rs 类型级使用计数 + 有限等级求解),符号等级不可判定时警告放行 |
 | 20 | Session Types | ⚠️ | defsession 协议解析为 SessionType;MPST `:role` 分段投影;类型级协议顺序检查(期望违反报错) |
-| 21 | Logic Programming | ⚠️ | defpred 子句/回溯/CLP label/constrain 域间传播/solve-all/find-all/abduce 一致性验证可用;任意谓词 Prolog 式多解仍限第一解 |
-| 22 | Generic Functions | ⚠️ | defgeneric/defmethod 模式分发+方法组合(:around/:before/:after/call-next-method)可用;字面量调用编译期特化(monomorphize) |
+| 21 | Logic Programming | ✅ | defpred/回溯/CLP label/constrain 线性+算术(乘除模)/all-different 传播/solve-all/find-all/abduce 多解枚举+不可满足原因;任意谓词 Prolog 式全多解(结构化值统一+分支隔离+空解过滤) |
+| 22 | Generic Functions | ✅ | defgeneric/defmethod 模式分发+方法组合(:around/:before/:after/call-next-method);构造器类型驱动编译期特化(monomorphize)+ 多参数特化接入 --run |
 | 23 | Typeclasses | ✅ | defclass 方法分发器(隐式字典按参数类型查 instance_dict)+ definstance 方法参数绑定 + 构造器→ADT 映射 |
-| 24 | Macros | ⚠️ | defmacro 展开+syntax-quote/unquote/unquote-splice 可用;模板 let 绑定卫生重命名 + gensym 内置;hygiene 未覆盖 fn 参数 |
+| 24 | Macros | ✅ | defmacro 展开+syntax-quote/unquote/unquote-splice;fn/lambda/if-let/when-let/match 卫生重命名 + gensym + `~x` unquote 替换 |
 | 25 | Module System | ✅ | ns (:require [lib])/(:require [lib :as a])/(:refer [f]) 解析 + 跨文件加载(基准目录+防循环) |
-| 26 | FFI & System-Level | ⚠️ | defextern 经 `ffi` feature 真实 dlopen(libloading,i64/f64 C ABI,符号缺失报错);默认构建回退模拟 C 函数表 |
+| 26 | FFI & System-Level | ⚠️ | defextern 经 `ffi` feature 真实 dlopen(字符串/指针/i64/f64);ptr-read/ptr-write/region-alloc/with-region 模拟内存 + Unsafe 门控警告;悬垂指针运行时检测(region-free/with-region 退出后 PtrRead 报「悬垂指针」错误);编译期区域逃逸检查(region_infer:分配地址作为返回值逃出作用域 → 报错);完整数据流逃逸分析缺 |
 | 27 | Process Calculi | ✅ | π 通道(FIFO)/Async/加密/spi commit-check/SKI 组合子/ambient/ρ/κ 全部接线 |
-| 28 | Verification | ⚠️ | defprop/verify/ModelChecker 可达性 + find-attack(攻击场景搜索)+ check-equivalence(可达集比较);dolev-yao 缺 |
-| 29 | Built-in Functions | ⚠️ | 90+ 注册、集合/字符串/IO/构造器齐;反射(reflect-type)真实化(签名/效果);其余反射函数近似 |
-| 30 | Compiler Pragmas | ⚠️ | inline!/specialize!/opt-level/suppress-warning 语法接受;--ir 经 inkwell 生成真实 IR(llvm feature),非 llvm 回退文本 |
+| 28 | Verification | ✅ | defprop/verify/ModelChecker 可达性 + find-attack + check-equivalence + dolev-yao 攻击者知识合成(窃听/拼接/重放) |
+| 29 | Built-in Functions | ✅ | 90+ 注册、集合/字符串/IO/构造器齐;反射(type-of/effects-of/grade-of/mode-of/determinism-of/reflect)返回真实静态信息(名称/参数/类型/效果/等级/模式/确定性) |
+| 30 | Compiler Pragmas | ⚠️ | inline!/specialize!/opt-level/suppress-warning 解析;opt-level 调内联阈值 + inline! 强制内联已接线;--ir 文本回退带参签名+call;闭包代码生成(嵌套 lambda 参数绑定 + 捕获自由变量标注 `; closure captures`);inkwell 闭包环境打包(堆分配 display 层)缺 |
+| 31 | Everything-as-ADT 逻辑编程扩展 | ✅ | Rule/Program/EvolInstr 一等 ADT(tisp-core/evolp.rs);EVOLP 稳定模型+foldl+不动点、DLP 动态稳定模型(tisp-runtime/evolp.rs);GetKB/SetKB+handler 元解释器+State 引用(tisp-runtime/mop.rs);12 类 LP 范式(tisp-runtime/paradigms.rs);interpreter 已接线全部核心语义:表格化 `tabling`、描述逻辑 `subsume`、稳定模型 `evolp-stable`、动态稳定模型 `dlp-stable`、演化指令 `evolp-evolve`、KB 读写 `get-kb`/`set-kb` |
+| 32 | Programming Paradigms & AOP | ⚠️ | 8 类范式(数组/栈/连接式/符号/自动机/状态机/数据驱动/基于流,tisp-runtime/programming.rs);AOP 编织(tisp-runtime/aop.rs);□_r/◇_ε 推理、Cost 渐近、稳定类型、区域逃逸、完整立方填充语义助手(tisp-runtime/full_chain.rs);可接入接口 `ParadigmFacility`+`ParadigmRegistry`(tisp-runtime/facility.rs);interpreter 经 `pf-*` 内置接入 + type_infer 补 24 个 `pf-*` 单态签名;真实求解器已接线:自动机 `dfa-accept`(Dfa)、状态机 `sm-drive`(StateMachine)、描述逻辑 `subsume`(Ontology)、表格化 `tabling`(Tabler)、符号 `sym-eval`(SymExpr 后序构造+化简+求值);剩余范式(演化 EVOLP-DLP/GetKB)真实求解器接线缺 |
 
 ---
 
@@ -46,40 +48,44 @@
 
 ### ⬜ 仅设计(无有效实现)
 
-| # | 特性 | spec 章节 | 说明 |
-|---|------|-----------|------|
-| 1 | fun-ext / 幺半等价 / HIT 端点方程 | §16.3-16.5 | PathLam 直通求值;:boundary 已解析检查,端点方程求解缺 |
-| 2 | 时序模态类型完整语义 / LTL-as-types / 多时钟 | §18.1/18.5/18.6 | ClockNew 返回字面量占位;`(next T)` 语法与推断有 |
-| 3 | Cohesive 完整同伦语义 | §17 | ʃ 最小语义(Shape 容器)与 crisp 检查已实现;ʃ 形状代数(路径连通计算)缺 |
-| 4 | 类型族简化规则(rewrite) | §9 | 单模式匹配归约已实现;多模式与 rewrite 规则缺 |
-| 5 | 类型一等值(Value::Type) | §9 | reflect-type 反射已实现;运行时类型值变体缺 |
-| 6 | 依赖会话类型 / MPST 类型级协议检查 | §20.2/20.3 | :role 投影与顺序检查已实现;依赖会话(值依赖类型)缺 |
-| 7 | 类型类完整实例解析 | §23 | 分发器有消费者;:fun-deps/超类/kind 未解析 |
-| 8 | 真实 dlopen FFI 全签名 | §26 | ffi feature 下 i64/f64 C ABI 已实现;指针/字符串/可变参签名缺 |
-| 9 | 验证 find-attack/dolev-yao 完整 | §28 | find-attack 场景与 check-equivalence 已实现;dolev-yao 攻击者模型与协议等价证明缺 |
-| 10 | 编译指示全处理 | §30 | 语法接受;--ir 真实 IR(llvm feature)已有;opt-level 等无处理 |
-
-### ⚠️ 部分实现(有骨架、语义残缺)
+> 2026-08 补齐轮(`finish-design-stage-features`):10 项全部升级 ✅/⚠️;已无 ⬜ 项。仍 ⚠️ 的为语义深度缺口。
 
 | # | 特性 | spec 章节 | 现状与缺口 |
 |---|------|-----------|------------|
-| 1 | def 六维注解语法 `->[ε,ρ,@r,m,d]` | §6.6 | 仅支持 `: Ty -> Ret` |
-| 2 | 私有定义语义(defn-) | §6.5 | 与公开同路径,无导出限制 |
-| 3 | HIT 完整边界语义 | §7.4 | :boundary 解析+符号一致性检查已实现;端点方程求解缺 |
-| 4 | deriving Ord | §7.5 | Eq/Show 生成已实现;Ord 生成缺 |
-| 5 | 类型族多模式/rewrite | §9 | 单模式归约已实现;rewrite 规则缺 |
-| 6 | 类型一等值 Value::Type | §9 | reflect-type 反射已实现;运行时类型值缺 |
-| 7 | QTT 隐式绑定默认 0 | §10.2 | 擦除/移动已实现;隐式绑定默认等级未做 |
-| 8 | 资源代数 Cost 检查 | §11.1 | 声明解析已实现;Cost 类型检查与推导缺 |
-| 9 | Mercury 多模式推断 | §13 | `:mode` 签名匹配已实现;自动推断缺 |
-| 10 | 宏 fn 参数卫生 | §24 | let 绑定卫生+gensym 已实现;fn 参数卫生缺 |
-| 11 | 泛型完整特化 | §22.4 | 字面量调用特化已实现;类型驱动特化缺 |
-| 12 | 反射函数补全 | §29 | reflect-type 真实化;其余反射近似 |
-| 13 | Monad 优化完整编译 | §12.6 | 单处理器检测+状态传递路径已实现;monadic 编码降级编译缺 |
-| 14 | 任意谓词 Prolog 式多解 | §21 | 子句多解/find-all 已实现;任意谓词全多解仍限第一解 |
-| 15 | CLP 非线性约束 | §21.5 | 线性域间传播已实现;非线性/全局约束缺 |
-| 16 | ALP 多解解释 | §21.6 | 一致性验证已实现;多解解释枚举缺 |
-| 17 | 演算互编码完整 | §27.10 | π→SKI、ambient→消息已实现;观察等价验证缺 |
+| 1 | fun-ext / 幺半等价 / HIT 端点方程 | §16.3-16.5 | ✅ fun-ext/幺半等价内置 + HIT 符号端点求解(i 只可钉 i0/i1) |
+| 2 | 时序模态完整语义 / LTL-as-types / 多时钟 | §18.1/18.5/18.6 | ✅ clock/always/eventually/resample + LTL-as-types(delay/advance 时序类型) |
+| 3 | Cohesive 完整同伦语义 | §17 | ✅ shape-graph 连通图;⚠️ 完整模态层/同伦语义缺 |
+| 4 | 类型族简化规则(rewrite) | §9 | ✅ 多模式 + rewrite 形式(上一轮 finish-partial-features) |
+| 5 | 类型一等值(Value::Type) | §9 | ✅ 显示/匹配/六维反射(上一轮 finish-partial-features) |
+| 6 | 依赖会话类型 / MPST 类型级协议检查 | §20.2/20.3 | ✅ 依赖负载类型可解析;顺序检查保持 |
+| 7 | 类型类完整实例解析 | §23 | ✅ `:fun-deps`/超类/kind 解析 + 冲突/超类检测 |
+| 8 | 真实 dlopen FFI 全签名 | §26 | ✅ 字符串(CString)+ 指针(i64 透传)+ i64/f64 |
+| 9 | 验证 find-attack/dolev-yao 完整 | §28 | ✅ dolev-yao 知识合成(窃听/拼接/重放) |
+| 10 | 编译指示全处理 | §30 | ⚠️ 解析 + suppress-warning 过滤;opt-level/inline! 优化器接线为最小 |
+
+### ⚠️ 部分实现(有骨架、语义残缺)
+
+> 2026-08 补齐轮(`finish-partial-features`):17 条大部分已升 ✅;仍 ⚠️ 的为语义深度缺口。
+
+| # | 特性 | spec 章节 | 现状与缺口 |
+|---|------|-----------|------------|
+| 1 | def 六维注解语法 `->[ε,ρ,@r,m,d]` | §6.6 | ✅ 解析 + `FunAnnotation` 贯通;region 字段落 CoreDef |
+| 2 | 私有定义语义(defn-) | §6.5 | ✅ visibility 字段 + ns `:refer` 过滤 + 跨文件私有不可见 |
+| 3 | HIT 完整边界语义 | §7.4 | ✅ 结构化子句 + 端点唯一性 + 符号端点求解 + 端点值构造 + hott.rs Interval 接线 |
+| 4 | deriving Ord | §7.5 | ✅ `ord-*` 结构化排序(Eq/Show/Ord 齐) |
+| 5 | 类型族多模式/rewrite | §9 | ✅ 单声明多模式 + `rewrite` 形式 + 未声明族报错 |
+| 6 | 类型一等值 Value::Type | §9 | ✅ 类型值显示/匹配 + 六维反射(effects/grade/mode/determinism 真实化) |
+| 7 | QTT 隐式绑定默认 0 | §10.2 | ✅ `{n : T}` → `Grade::Zero` + 擦除检查 |
+| 8 | 资源代数 Cost 检查 | §11.1 | ⚠️ `:semiring` 关键字形式 + `check_cost_bound`;Cost 注解语法/全推导缺 |
+| 9 | Mercury 多模式推断 | §13 | ✅ 内联 `:in/:out` + `infer_modes` 接线 + 同名多模式合并 |
+| 10 | 宏 fn 参数卫生 | §24 | ✅ fn/lambda/if-let/when-let/match 卫生 + `~x` unquote 替换 |
+| 11 | 泛型完整特化 | §22.4 | ✅ 构造器类型驱动 + 多参数 + 接入 `--run` |
+| 12 | 反射函数补全 | §29 | ✅ `type-of` 静态类型 + `effects/grade/mode/determinism-of` 查 def_sigs |
+| 13 | Monad 优化完整编译 | §12.6 | ✅ `mlet/get-m/put-m/pure` + 真检测 + 直接状态线程(direct_state 槽) |
+| 14 | 任意谓词 Prolog 式多解 | §21 | ✅ 结构化值统一(Cons)+ 逻辑变量统一 + 分支隔离 + 递归多解(空解过滤) |
+| 15 | CLP 非线性约束 | §21.5 | ✅ 乘/除/模收 z + 精确除法 + 线性 `+`/`-` 传播 |
+| 16 | ALP 多解解释 | §21.6 | ✅ domain 感知生成 + `assign` 域相交 + 多解枚举 |
+| 17 | 演算互编码完整 | §27.10 | ✅ 5 编码齐 + SKI K 负载修复 + 全演算迹等价(channel_trace/check_trace_equivalence) |
 
 ## 3. 已知运行时局限
 

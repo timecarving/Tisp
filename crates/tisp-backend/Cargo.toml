@@ -7,6 +7,7 @@ edition.workspace = true
 tisp-core.workspace = true
 tisp-middle.workspace = true
 tisp-runtime.workspace = true
+im.workspace = true
 miette.workspace = true
 thiserror.workspace = true
 
@@ -14,6 +15,7 @@ thiserror.workspace = true
 default = []
 llvm = ["dep:inkwell", "dep:llvm-sys"]
 ffi = ["dep:libloading"]
+crypto = ["tisp-runtime/crypto"]
 
 [dependencies.inkwell]
 workspace = true

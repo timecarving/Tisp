@@ -45,7 +45,7 @@ crates/
 
 ```bash
 cargo build --release            # 构建
-cargo test --workspace           # 177 个测试
+cargo test --workspace           # 319 个测试
 ```
 
 ### 运行
@@ -89,4 +89,4 @@ CLI flags:`--eval` `--print-ast` `--print-tokens` `--desugar` `--typecheck` `--r
 
 ### 示例程序
 
-`examples/` 下 17 个示例;11 个可运行输出正确(hello/fibonacci/adt/advanced/run/type-infer/state-effect/logic-test/liquid-types-test/remaining-gaps-demo/dependent-linear-test),4 个为定义型(无入口,用 `--typecheck` 检查),1 个部分支持(logic-search),1 个预期报错(液态类型负面用例,`--typecheck` 演示违反与反例)。
+`examples/` 下 18 个示例;12 个可运行输出正确(hello/fibonacci/adt/advanced/run/type-infer/state-effect/logic-test/liquid-types-test/remaining-gaps-demo/dependent-linear-test/partial-completion-demo),4 个为定义型(无入口,用 `--typecheck` 检查),1 个部分支持(logic-search),1 个预期报错(液态类型负面用例,`--typecheck` 演示违反与反例)。

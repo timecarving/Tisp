@@ -1,0 +1,56 @@
+Tuple Type Literal:
+() => Unit
+(TypeA TypeB TypeC TypeD) 元组就是List的包装
+
+Function Type Literal:
+TypeA -> TypeB literal就是lammbda
+TypeA => TypeB ;;;输入类型A 产出类型B  literal 对应tlambda
+=> TypeB ;;;无输入 直接产出类型B  literal 直接对应 => Type
+
+BasicTypeLiteral
+Unit 对应值 () 或者 Unit
+Void 没有对应值
+
+Misc
+这两个的签名 都接受一个类型然后产出 => ConjType
+(conj
+(disj
+
+Basic Type
+type的签名 type接收一个 => Trait或者是已知的类型 进行名字的绑定
+(type A B) ;;;define type alias A
+(type A
+  (conj B C)) ;;;define Tuple Type (B C)
+(type A
+  (disj B C)) ;;;define A can be B or C
+(type Boolean
+  (disj Unit Void))
+Trait
+(trait
+  (fn members [...] ()...)
+  (type ...))
+(polytrait
+  ['a 'b 'c ...]
+  (type ...)) ;;;和trait同理 使用的时候需要用[]括号 polytrait默认是polytype的trait会自带这个特性 polytrait可以被普通type with
+(type Demo01
+  (conj I32 F32)
+  (with Traits
+    (fn member01)
+    (fn member02))
+  (with Traits02)
+  (with (fn member01)...)
+  (with-static (fn static-member01) ...)
+  (with-cons (fn ...)))
+  
+//暂时不做 mixin 在外部给type混入trait
+
+
+
+Polymorphic Type
+(deftype (poly ['a 'b 'c ...] poly-body))
+poly-body可以是任一产出类型的
+
+type-lambda
+(type-lambda)
+
+constraints

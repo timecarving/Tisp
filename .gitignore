@@ -8,3 +8,6 @@ reasonix.toml
 # 构建产物打包(备份用,不提交)
 target.tar
 target.tar.zst
+
+# crypto feature 依赖缓存(沙箱只读 ~/.cargo 的替代 CARGO_HOME)
+.cargo-home/

@@ -26,6 +26,8 @@ pub enum Token {
     #[token("|")] Pipe,
     // ⃝ (U+20DD) 时态算子:⃝ A = 下一时刻可用的值(§18.1)
     #[token("⃝")] Next,
+    // □ (U+25A1) 分级必然模态算子(§11.2):(□_level a) 中 □ 后随等级下标
+    #[token("□")] Necessity,
 
     #[regex(r"-?[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?", priority = 3, callback = |lex| lex.slice().parse::<f64>().ok())]
     Float(f64),
@@ -190,5 +192,19 @@ mod tests {
         assert_eq!(tokens.len(), 2);
         assert!(matches!(tokens[0].token, Token::Arrow));
         assert!(matches!(tokens[1].token, Token::Ident(_)));
+    }
+
+    #[test] fn test_necessity() {
+        let tokens = tokenize("□_level").unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert!(matches!(tokens[0].token, Token::Necessity));
+        assert!(matches!(tokens[1].token, Token::Ident(ref s) if s == "_level"));
+    }
+
+    #[test] fn test_at() {
+        let tokens = tokenize("@1").unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert!(matches!(tokens[0].token, Token::At));
+        assert!(matches!(tokens[1].token, Token::Int(1)));
     }
 }

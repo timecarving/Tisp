@@ -39,6 +39,8 @@
 28. [Verification](#28-verification)
 29. [Built-in Functions](#29-built-in-functions)
 30. [Compiler Pragmas](#30-compiler-pragmas)
+31. [Everything-as-ADT Logic Extensions (EVOLP/DLP/MOP)](#31-everything-as-adt-logic-extensions-evolpdlpmop)
+32. [Programming Paradigms & AOP](#32-programming-paradigms--aop)
 
 ---
 
@@ -683,7 +685,7 @@ The compiler detects single-handler, no-nesting patterns and automatically compi
 
 ---
 
-## 13. Mode System ⚠️
+## 13. Mode System ✅
 
 Mercury-style instantiation tracking.
 
@@ -861,7 +863,7 @@ Enabled with `--cubical` compiler flag.
 
 ## 17. Cohesive HoTT ⚠️
 
-> 实现注(2026-08):ʃ(shape)以最小可区分语义落地(返回 Shape 容器,路径端点);`crisp` 上下文检查已实现;完整同伦语义(ʃ 形状代数、路径连通计算)未实现。
+> 实现注(2026-08):ʃ(shape)返回 Shape 容器(路径端点连通);`shape-graph` 连通图、`crisp` 上下文检查、`♭`(Flat 容器)/`♯`(Sharp 容器)可区分语义已实现;完整 category-theoretic 同伦模型仍为设计目标。
 
 Enabled with `--cohesion` compiler flag.
 
@@ -1024,7 +1026,7 @@ If `f : (Π [x : A]_r -> B x)` and `x` appears in `B x` with grade `s`, then tot
 
 ---
 
-## 21. Logic Programming ⚠️
+## 21. Logic Programming ✅
 
 ### 21.1 Predicate Definition
 
@@ -1112,7 +1114,7 @@ Abduction generates hypotheses that explain observations. Given a goal and abduc
 
 ---
 
-## 22. Generic Functions ⚠️
+## 22. Generic Functions ✅
 
 ### 22.1 Declaration
 
@@ -1194,7 +1196,7 @@ Abduction generates hypotheses that explain observations. Given a goal and abduc
 
 ---
 
-## 24. Macros ⚠️
+## 24. Macros ✅
 
 ### 24.1 defmacro
 
@@ -1377,7 +1379,7 @@ Encoded via OOP (generic functions + method combination).
 
 ---
 
-## 28. Verification ⚠️
+## 28. Verification ✅
 
 **Verification and execution are the same code with different effect handlers.**
 
@@ -1490,6 +1492,88 @@ Encoded via OOP (generic functions + method combination).
 ```clojure
 (suppress-warning :unused-variable)
 ```
+
+---
+
+## 31. Everything-as-ADT Logic Extensions (EVOLP/DLP/MOP) ⚠️
+
+最终核心思想「一切皆 ADT」:把逻辑程序的规则、约束、项传播与 OOP 对象建模为一等不可变数据,
+在纯声明式约束下实现演化逻辑编程(EVOLP)、动态逻辑编程(DLP)、元对象协议(MOP)与 State Effect 引用管理。
+
+### 31.1 规则/程序/演化指令即数据
+
+规则、程序、演化指令是 ADT 值(可绑定/传递/匹配/增删查):
+
+```clojure
+;; 一等数据模型(见 tisp-core/src/evolp.rs)
+;; Rule{ id, head, body, evol }   Program = 不可变规则集
+;; EvolInstr = Assert(Rule) | Retract(RuleId)
+```
+
+程序当前状态为不可变值 `Program`;演化操作是纯函数(`Program -> Program`),整个演化过程可用 `foldl` 折叠。
+
+### 31.2 EVOLP(演化逻辑编程)
+
+规则可携带演化指令(`assert`/`retract`);求值在每个时间点迭代计算稳定模型,直到程序达到不动点:
+
+```clojure
+;; 稳定模型 = Gelfond-Lifschitz 约化 + 最小模型(T_P 不动点)
+;; 演化不动点 = 反复触发成立规则的演化指令,直至 Program 不再变化
+```
+
+求解器实现于 `tisp-runtime/src/evolp.rs`(`ground_rules`/`reduct`/`minimal_model`/`stable_models`/`evolve_fixpoint`)。
+
+### 31.3 DLP(动态逻辑编程)
+
+知识库为状态序列 `P1,…,Pn`,更新 = 追加新状态;动态稳定模型按「拒绝/接受」语义定义:
+
+> 对每个状态 Pi 拒绝所有被后续状态否定的规则;对剩余规则应用约化,取所得程序的最小模型。
+
+实现于 `dynamic_stable_models`(`tisp-runtime/src/evolp.rs`)。
+
+### 31.4 MOP 与 State Effect
+
+`GetKB`/`SetKB` 建模为效应操作,Handler 充当元解释器(捕获并解释 KB 操作);元编程能力在编译期即可满足
+(纯函数静态折叠),运行时 handler 为回退路径。State Effect 引用管理:`ref` 创建、`deref` 读取、`set!` 写入,
+以线性/分级等级约束所有权。实现于 `tisp-runtime/src/mop.rs`。
+
+### 31.5 12 类逻辑编程范式(组合优先)
+
+在纯声明式、静态类型、函数-并发-内存管理约束下,按「可用既有特性组合则组合、否则少量新增」原则覆盖:
+高阶、归纳(ILP)、概率(PLP)、时序、描述、可废止、模糊、表格化(Tabled)、
+静态类型-函数-OOP-并发一体化基底、代数效应 FRP 响应式、情境、模态共 12 类逻辑编程能力。
+实现于 `tisp-runtime/src/paradigms.rs`。
+
+---
+
+## 32. Programming Paradigms & AOP ⚠️
+
+以纯声明式副作用管理(代数效应 + 单子)落地 8 类编程范式,并基于编译器纯声明式 MOP 实现 AOP 辅助 OOP。
+
+### 32.1 8 类编程范式(组合优先)
+
+| 范式 | 组合/新增 | 关键既有特性 |
+|------|-----------|--------------|
+| 数组编程 | 新增多维数组类型 + 归约组合子 | im 集合 + 高阶函数 |
+| 栈编程 | 组合(State effect 持有栈) | `State s` get/put + 纯函数 |
+| 连接式编程 | 组合(点自由 = 函数复合) | 函数一等值 + `compose` |
+| 符号编程 | 组合(quote 惰性 ADT + 代换) | quote/模式匹配 |
+| 自动机编程 | 组合(表驱动 + Search 回溯) | 表 + Search effect |
+| 状态机编程 | 组合(State + 转移表) | State effect + 数据驱动 |
+| 数据驱动编程 | 组合(查表/策略/解释器) | 一等表/闭包 + 模式匹配 |
+| 基于流编程 | 组合(数据流网络 = 节点图) | FRP Signal + 时序流 |
+
+实现于 `tisp-runtime/src/programming.rs`。
+
+### 32.2 AOP(面向切面编程)
+
+`aspect`/`pointcut`/`advice`(before/after/around)在编译期经 MOP 反射解析并编织为 OOP 方法组合(§22.3),
+纯函数变换、无运行时反射。实现于 `tisp-runtime/src/aop.rs`。
+
+### 32.3 全链路补齐语义助手
+
+分级模态推理(□_r/◇_ε)、Cost 渐近代价、时序稳定类型、区域逃逸检查、HoTT 完整立方填充等
+⚠️ 特性的运行时语义助手实现于 `tisp-runtime/src/full_chain.rs`。
 
 ---
 

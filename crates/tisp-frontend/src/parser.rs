@@ -78,6 +78,21 @@ impl Parser {
                     span,
                 ))
             }
+            Token::At => {
+                // @ 分级标注(@r / @[n],§11.2):前缀解析为 (at X) 标记形式,desugar 阶段解释
+                let start = self.advance().span;
+                let inner = self.parse_expr()?;
+                let span = start.merge(inner.span);
+                Ok(Spanned::new(Expr::List(vec![
+                    Spanned::new(Expr::Sym(Symbol::new("@")), start),
+                    inner,
+                ]), span))
+            }
+            Token::Necessity => {
+                // □ 分级必然(§11.2):作为类型构造头,如 (□_level a);后随等级下标(_level 按 Ident 词法)
+                let span = self.advance().span;
+                Ok(Spanned::new(Expr::Sym(Symbol::new("□")), span))
+            }
             Token::Keyword(k) => { let k = Symbol::new(k); let span = self.advance().span; Ok(Spanned::new(Expr::Keyword(k), span)) }
             Token::Ident(name) => { let name = Symbol::new(name); let span = self.advance().span; Ok(Spanned::new(Expr::Sym(name), span)) }
             _ => Err(ParseError {
@@ -289,6 +304,18 @@ mod tests {
     #[test] fn test_defn_with_types() {
         let forms = parse("(defn add [x : i64 y : i64] -> i64 (+ x y))").unwrap();
         assert_eq!(forms.len(), 1);
+    }
+
+    #[test] fn test_at_annotation() {
+        let forms = parse("@[n]").unwrap();
+        assert_eq!(forms.len(), 1);
+        assert!(matches!(&forms[0].node, Expr::List(items) if items.len() == 2 && matches!(&items[0].node, Expr::Sym(s) if s.as_str() == "@")));
+    }
+
+    #[test] fn test_necessity_head() {
+        let forms = parse("(□_level a)").unwrap();
+        assert_eq!(forms.len(), 1);
+        assert!(matches!(&forms[0].node, Expr::List(items) if items.len() == 3 && matches!(&items[0].node, Expr::Sym(s) if s.as_str() == "□")));
     }
 }
 

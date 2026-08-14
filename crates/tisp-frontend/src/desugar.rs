@@ -2,7 +2,7 @@ use tisp_core::ast::{Expr, SExpr};
 use tisp_core::core_ast::*;
 use tisp_core::span::{Span, Spanned};
 use tisp_core::symbol::Symbol;
-use tisp_core::types::{Grade, Mode, EffectRow, EffectLabel, Determinism, Predicate, CmpOp, BinOp, Lit, Type};
+use tisp_core::types::{Grade, Mode, EffectRow, EffectLabel, Determinism, Predicate, CmpOp, BinOp, Lit, Type, RegionVar};
 use tisp_core::data::{DataDecl, Constructor, Field};
 
 #[derive(Debug, Clone)]
@@ -23,13 +23,34 @@ impl std::error::Error for DesugarError {}
 enum TopLevel {
     DataDecl(DataDecl),
     Def(CoreDef),
-    TypeFamily(tisp_core::types::TypeFamilyInstance),
+    TypeFamily(Vec<tisp_core::types::TypeFamilyInstance>),
     ResourceAlgebra(tisp_core::types::ResourceAlgebra),
     EffectDecl(tisp_core::effects::EffectDecl),
     Namespace(Symbol, Vec<(Symbol, Symbol)>, Vec<Symbol>),
     FFIDecl(Symbol, String, Vec<tisp_core::types::Type>, Option<tisp_core::types::Type>, Vec<tisp_core::types::EffectLabel>),
     /// 声明类形式(defmacro 等):已处理,不产生 def 也不作为顶层表达式
     Ignored,
+    /// 编译指示(§30):(指示名, 目标/参数符号列表)
+    Pragma(Symbol, Vec<Symbol>),
+}
+
+/// §草稿 多态别名应用:替换类型中的类型变量(Subst)
+fn substitute_type_vars(ty: &tisp_core::types::Type, subst: &std::collections::HashMap<Symbol, tisp_core::types::Type>) -> tisp_core::types::Type {
+    use tisp_core::types::Type;
+    match ty {
+        Type::Var(v) => subst.get(&v.name).cloned().unwrap_or_else(|| Type::Var(v.clone())),
+        Type::App(f, a) => Type::App(Box::new(substitute_type_vars(f, subst)), Box::new(substitute_type_vars(a, subst))),
+        Type::Fun(p, ann, r) => Type::Fun(Box::new(substitute_type_vars(p, subst)), ann.clone(), Box::new(substitute_type_vars(r, subst))),
+        Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| substitute_type_vars(t, subst)).collect()),
+        Type::TLambda(p, b) => Type::TLambda(Box::new(substitute_type_vars(p, subst)), Box::new(substitute_type_vars(b, subst))),
+        Type::Temporal(op, t) => Type::Temporal(op.clone(), Box::new(substitute_type_vars(t, subst))),
+        Type::Modal(op, t) => Type::Modal(op.clone(), Box::new(substitute_type_vars(t, subst))),
+        Type::Cohesive(op, t) => Type::Cohesive(op.clone(), Box::new(substitute_type_vars(t, subst))),
+        Type::Refined(base, pred) => Type::Refined(Box::new(substitute_type_vars(base, subst)), pred.clone()),
+        Type::Pi(n, d, c) => Type::Pi(n.clone(), Box::new(substitute_type_vars(d, subst)), Box::new(substitute_type_vars(c, subst))),
+        Type::Sigma(n, d, c) => Type::Sigma(n.clone(), Box::new(substitute_type_vars(d, subst)), Box::new(substitute_type_vars(c, subst))),
+        other => other.clone(),
+    }
 }
 
 pub struct Desugarer {
@@ -41,6 +62,10 @@ pub struct Desugarer {
     base_dir: std::cell::RefCell<Option<String>>,
     /// §24 宏卫生计数器(gensym 后缀)
     gensym_counter: std::cell::RefCell<usize>,
+    /// §草稿 type/deftype/defpoly 类型别名:名称 → (类型参数, where 约束, 体类型)
+    type_aliases: std::cell::RefCell<std::collections::HashMap<Symbol, (Vec<Symbol>, Vec<Symbol>, tisp_core::types::Type)>>,
+    /// §草稿 (with ...) 子句产生的 definstance(在 desugar_program 末尾汇入 defs)
+    pending_instances: std::cell::RefCell<Vec<CoreDef>>,
 }
 
 impl Desugarer {
@@ -57,6 +82,8 @@ impl Desugarer {
             loaded_files: std::cell::RefCell::new(std::collections::HashSet::new()),
             base_dir: std::cell::RefCell::new(None),
             gensym_counter: std::cell::RefCell::new(0),
+            type_aliases: std::cell::RefCell::new(std::collections::HashMap::new()),
+            pending_instances: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -66,16 +93,18 @@ impl Desugarer {
         let mut type_families = Vec::new();
         let mut resource_algebras = Vec::new();
         let mut defs = Vec::new();
+        let mut pragmas: Vec<(Symbol, Vec<Symbol>)> = Vec::new();
         let mut top_exprs = Vec::new();
         for form in forms {
             match self.desugar_top_level(&form)? {
                 Some(TopLevel::DataDecl(decl)) => data_decls.push(decl),
                 Some(TopLevel::EffectDecl(decl)) => effect_decls.push(decl),
-                Some(TopLevel::TypeFamily(inst)) => type_families.push(inst),
+                Some(TopLevel::TypeFamily(insts)) => type_families.extend(insts),
                 Some(TopLevel::ResourceAlgebra(alg)) => resource_algebras.push(alg),
                 Some(TopLevel::Def(def)) => defs.push(def),
-                Some(TopLevel::Namespace(name, requires, _)) => {
+                Some(TopLevel::Namespace(name, requires, refers)) => {
                     // §25 跨文件加载:require 的模块 {mod}.tisp 合并进当前程序(防循环)
+                    // §25.2/:refer 过滤 + §6.5 私有定义不可见
                     for (mod_name, _alias) in &requires {
                         let path = match &*self.base_dir.borrow() {
                             Some(dir) => format!("{}/{}.tisp", dir, mod_name),
@@ -90,13 +119,20 @@ impl Desugarer {
                                 if let Ok(loaded) = self.desugar_program(forms) {
                                     data_decls.extend(loaded.data_decls);
                                     effect_decls.extend(loaded.effect_decls);
-                                    defs.extend(loaded.defs);
+                                    // 私有定义(defn-/def-)不可跨文件引用;:refer 非空时仅导入列出的公开符号
+                                    let filtered: Vec<CoreDef> = loaded.defs.into_iter()
+                                        .filter(|d| d.visibility != Visibility::Private)
+                                        .filter(|d| refers.is_empty() || refers.contains(&d.name))
+                                        .collect();
+                                    defs.extend(filtered);
                                 }
                             }
                         }
                     }
                     defs.push(CoreDef { name: name.clone(), ty: None, effects: EffectRow::Pure, grade: Grade::Omega,
                         mode: Mode::In, determinism: Determinism::Det,
+            region: None,
+            visibility: Visibility::Public,
             mode_sigs: vec![],
                         body: CoreExpr::new(CoreExprNode::NSDef(name, vec![], vec![]), Span::dummy()),
                         requires: None, ensures: None, span: Span::dummy() });
@@ -104,11 +140,14 @@ impl Desugarer {
                 Some(TopLevel::FFIDecl(name, c_name, params, ret, effects)) => {
                     defs.push(CoreDef { name: name.clone(), ty: None, effects: EffectRow::Closed(effects), grade: Grade::Omega,
                         mode: Mode::In, determinism: Determinism::Det,
+            region: None,
+            visibility: Visibility::Public,
             mode_sigs: vec![],
                         body: CoreExpr::new(CoreExprNode::ExternDef(name, c_name, params, ret, vec![]), Span::dummy()),
                         requires: None, ensures: None, span: Span::dummy() });
                 }
                 Some(TopLevel::Ignored) => {}
+                Some(TopLevel::Pragma(name, targets)) => pragmas.push((name, targets)),
                 None => {
                     // 顶层表达式:收集为隐式入口 __top__(§6.3 顶层求值)
                     top_exprs.push(self.desugar_expr(&form)?);
@@ -129,6 +168,8 @@ impl Desugarer {
                 grade: Grade::Omega,
                 mode: Mode::In,
                 determinism: Determinism::Det,
+                region: None,
+                visibility: Visibility::Public,
             mode_sigs: vec![],
                 body: CoreExpr::new(
                     CoreExprNode::Lam(Lambda { params: vec![], body: Box::new(body), ret_type: None }),
@@ -139,7 +180,34 @@ impl Desugarer {
                 span: Span::dummy(),
             });
         }
-        Ok(CoreProgram { data_decls, effect_decls, type_families, resource_algebras, defs })
+        // §7.5 deriving:desugar 生成 eq-*/ord-*/show-* 函数定义(--desugar 可见;解释器求值为结构内置)
+        let mut deriving_defs = Vec::new();
+        for decl in &data_decls {
+            for d in &decl.deriving {
+                let trait_name = d.clone();
+                let type_name = decl.name.clone();
+                let fname = Symbol::new(&format!("{}-{}", trait_name.as_str().to_lowercase(), type_name));
+                deriving_defs.push(CoreDef {
+                    name: fname,
+                    ty: None,
+                    effects: EffectRow::Pure,
+                    grade: Grade::Omega,
+                    mode: Mode::In,
+                    determinism: Determinism::Det,
+                    region: None,
+                    visibility: Visibility::Public,
+                    mode_sigs: vec![],
+                    body: CoreExpr::new(CoreExprNode::DerivingImpl(trait_name.clone(), type_name.clone()), Span::dummy()),
+                    requires: None,
+                    ensures: None,
+                    span: Span::dummy(),
+                });
+            }
+        }
+        defs.extend(deriving_defs);
+        // §草稿 (with ...) 子句产生的 definstance 汇入 defs
+        defs.extend(self.pending_instances.borrow_mut().drain(..));
+        Ok(CoreProgram { data_decls, effect_decls, type_families, resource_algebras, defs, pragmas })
     }
 
     fn desugar_top_level(&self, expr: &SExpr) -> Result<Option<TopLevel>, DesugarError> {
@@ -147,17 +215,21 @@ impl Desugarer {
             Expr::List(items) if !items.is_empty() => {
                 if let Expr::Sym(name) = &items[0].node {
                     match name.as_str() {
-                        "def" => return Ok(Some(TopLevel::Def(self.desugar_def_form(items, expr.span)?))),
-                        "defn" => return Ok(Some(TopLevel::Def(self.desugar_defn_form(items, expr.span)?))),
-                        "defn-" => return Ok(Some(TopLevel::Def(self.desugar_defn_form(items, expr.span)?))),
-                        "def-" => return Ok(Some(TopLevel::Def(self.desugar_def_form(items, expr.span)?))),
+                        "def" => return Ok(Some(TopLevel::Def(self.desugar_def_form(items, expr.span, Visibility::Public)?))),
+                        "defn" => return Ok(Some(TopLevel::Def(self.desugar_defn_form(items, expr.span, Visibility::Public)?))),
+                        "defn-" => return Ok(Some(TopLevel::Def(self.desugar_defn_form(items, expr.span, Visibility::Private)?))),
+                        "def-" => return Ok(Some(TopLevel::Def(self.desugar_def_form(items, expr.span, Visibility::Private)?))),
                         "defdata" => return Ok(Some(TopLevel::DataDecl(self.desugar_defdata_form(items, expr.span)?))),
                         "defdata-hit" => return Ok(Some(TopLevel::DataDecl(self.desugar_defdata_hit_form(items, expr.span)?))),
+                        // §草稿 type/deftype/defpoly:类型定义(别名/conj 元组/disj 和类型 ADT/多态)
+                        "type" | "deftype" | "defpoly" => return self.desugar_type_def_form(items, expr.span),
                         "defeffect" => {
                             return Ok(Some(TopLevel::EffectDecl(self.desugar_defeffect_form(items, expr.span)?)));
                         }
                         "defpred" => return Ok(Some(TopLevel::Def(self.desugar_defpred_form(items, expr.span)?))),
                         "defclass" => return self.desugar_defclass_form(items, expr.span),
+                        // §草稿 trait 语法糖:deftrait / polytrait → defclass
+                        "deftrait" | "polytrait" => return self.desugar_deftrait_form(items, expr.span),
                         "defprop" => return self.desugar_defprop_form(items, expr.span),
                         "definstance" => return self.desugar_definstance_form(items, expr.span),
                         "defgeneric" => return self.desugar_defgeneric_form(items, expr.span),
@@ -168,11 +240,20 @@ impl Desugarer {
                             return Ok(Some(TopLevel::ResourceAlgebra(self.desugar_resource_algebra_form(items, expr.span)?)));
                         }
                         "typefamily" => return Ok(Some(TopLevel::TypeFamily(self.desugar_typefamily_form(items, expr.span)?))),
+                        // §9 rewrite 规则:(rewrite 名称 模式 结果) → 等价于类型族实例(实例间简化重写)
+                        "rewrite" => return Ok(Some(TopLevel::TypeFamily(self.desugar_typefamily_form(items, expr.span)?))),
                         "defsession" => return self.desugar_defsession_form(items, expr.span),
                         "ns" => return self.desugar_ns_form(items, expr.span),
                         // §30 编译指示:接受并忽略(语法兼容;真实优化器接入见 §7)
                         "inline!" | "specialize!" | "opt-level" | "suppress-warning" | "noinline!" => {
-                            return Ok(Some(TopLevel::Ignored));
+                            // §30 编译指示:解析目标/参数符号(含数值参数,如 opt-level 2)
+                            let targets: Vec<Symbol> = items[1..].iter().filter_map(|i| match &i.node {
+                                Expr::Sym(s) => Some(s.clone()),
+                                Expr::Str(s) => Some(Symbol::new(s)),
+                                Expr::Int(n) => Some(Symbol::new(&n.to_string())),
+                                _ => None,
+                            }).collect();
+                            return Ok(Some(TopLevel::Pragma(name.clone(), targets)));
                         }
                         _ => return Ok(None),
                     }
@@ -183,17 +264,22 @@ impl Desugarer {
         }
     }
 
-    /// §11.1:解析 (defresource-algebra 名称 单位元 二元运算 [阶])
-    /// 例:(defresource-algebra Cost 0 + <=)
+    /// §11.1:解析资源代数声明,支持两种形式:
+    /// 位置式:(defresource-algebra 名称 单位元 二元运算 [阶]) 例 (defresource-algebra Cost 0 + <=)
+    /// 关键字式:(defresource-algebra 名称 :semiring (+ 0 * 1) :order <= :asymptotic true)
     fn desugar_resource_algebra_form(&self, items: &[SExpr], span: Span) -> Result<tisp_core::types::ResourceAlgebra, DesugarError> {
         if items.len() < 4 {
-            return Err(DesugarError { message: "defresource-algebra requires name, unit, and binary op".into(), span });
+            return Err(DesugarError { message: "defresource-algebra requires name and algebra spec".into(), span });
         }
         let name = match &items[1].node {
             Expr::Sym(s) => s.clone(),
             _ => return Err(DesugarError { message: "defresource-algebra name must be a symbol".into(), span: items[1].span }),
         };
-        // 单位元:数字或符号,存显示文本
+        // 关键字形式检测:items[2] 为 :semiring / :lattice 关键字
+        if matches!(&items[2].node, Expr::Keyword(_)) {
+            return self.desugar_resource_algebra_keyword(name, &items[2..], span);
+        }
+        // 位置式:单位元/二元运算/阶
         let unit = match &items[2].node {
             Expr::Int(n) => n.to_string(),
             Expr::Sym(s) => s.as_str().to_string(),
@@ -208,7 +294,72 @@ impl Desugarer {
             Some(Expr::Keyword(k)) => Some(Symbol::new(k.as_str())),
             _ => None,
         };
-        Ok(tisp_core::types::ResourceAlgebra { name, unit, op, order })
+        Ok(tisp_core::types::ResourceAlgebra { name, unit, op, order, asymptotic: false })
+    }
+
+    /// 关键字形式:遍历 :semiring/:lattice/:order/:asymptotic 键值对
+    fn desugar_resource_algebra_keyword(&self, name: Symbol, kv: &[SExpr], span: Span) -> Result<tisp_core::types::ResourceAlgebra, DesugarError> {
+        let mut unit = String::new();
+        let mut op = Symbol::new("+");
+        let mut order: Option<Symbol> = None;
+        let mut asymptotic = false;
+        let mut i = 0;
+        while i < kv.len() {
+            if let Expr::Keyword(k) = &kv[i].node {
+                match k.as_str() {
+                    "semiring" | ":semiring" => {
+                        // :semiring (+ 0 * 1) → op=+, unit=0(加幺元);乘幺元忽略(单半环近似)
+                        if i + 1 >= kv.len() { return Err(DesugarError { message: ":semiring needs (op zero mul one)".into(), span }); }
+                        if let Expr::List(parts) = &kv[i + 1].node {
+                            if parts.len() >= 3 {
+                                if let Expr::Sym(o) = &parts[0].node { op = o.clone(); }
+                                unit = match &parts[1].node {
+                                    Expr::Int(n) => n.to_string(),
+                                    Expr::Sym(s) => s.as_str().to_string(),
+                                    _ => return Err(DesugarError { message: "semiring zero must be a literal".into(), span: parts[1].span }),
+                                };
+                            }
+                        }
+                        i += 2;
+                    }
+                    "lattice" | ":lattice" => {
+                        // :lattice (join Public Private) → op=join,unit=Public
+                        if i + 1 >= kv.len() { return Err(DesugarError { message: ":lattice needs (op a b)".into(), span }); }
+                        if let Expr::List(parts) = &kv[i + 1].node {
+                            if parts.len() >= 3 {
+                                if let Expr::Sym(o) = &parts[0].node { op = o.clone(); }
+                                unit = match &parts[1].node {
+                                    Expr::Sym(s) => s.as_str().to_string(),
+                                    _ => return Err(DesugarError { message: "lattice element must be a symbol".into(), span: parts[1].span }),
+                                };
+                            }
+                        }
+                        i += 2;
+                    }
+                    "order" | ":order" => {
+                        if i + 1 >= kv.len() { return Err(DesugarError { message: ":order needs a symbol".into(), span }); }
+                        order = match &kv[i + 1].node {
+                            Expr::Sym(s) => Some(s.clone()),
+                            Expr::Keyword(kk) => Some(Symbol::new(kk.as_str())),
+                            _ => None,
+                        };
+                        i += 2;
+                    }
+                    "asymptotic" | ":asymptotic" => {
+                        if i + 1 >= kv.len() { return Err(DesugarError { message: ":asymptotic needs a bool".into(), span }); }
+                        asymptotic = matches!(&kv[i + 1].node, Expr::Bool(true));
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if unit.is_empty() {
+            return Err(DesugarError { message: "defresource-algebra keyword form requires :semiring or :lattice".into(), span });
+        }
+        Ok(tisp_core::types::ResourceAlgebra { name, unit, op, order, asymptotic })
     }
 
     /// §22.1:(defgeneric name [params] -> Ret)
@@ -224,6 +375,8 @@ impl Desugarer {
         let def = CoreDef {
             name: name.clone(), ty: None, effects: EffectRow::Pure, grade: Grade::Omega,
             mode: Mode::In, determinism: Determinism::Det,
+            region: None,
+            visibility: Visibility::Public,
             mode_sigs: vec![],
             body: CoreExpr::new(CoreExprNode::GenericDef(name, params, None), span),
             requires: None, ensures: None, span,
@@ -264,6 +417,8 @@ impl Desugarer {
         let def = CoreDef {
             name: Symbol::new(&format!("__method_{}", gen.as_str())), ty: None,
             effects: EffectRow::Pure, grade: Grade::Omega, mode: Mode::In, determinism: Determinism::Det,
+            region: None,
+            visibility: Visibility::Public,
             mode_sigs: vec![],
             body: CoreExpr::new(CoreExprNode::MethodDef(gen, category, patterns, Box::new(body)), span),
             requires: None, ensures: None, span,
@@ -297,42 +452,223 @@ impl Desugarer {
             Some(s) => s,
             None => return Err(DesugarError { message: "defclass requires a name".into(), span }),
         };
-        let tvars: Vec<Symbol> = items.get(2).and_then(|i| match &i.node { Expr::Sym(s) => Some(vec![s.clone()]), _ => None }).unwrap_or_default();
+        let tvars: Vec<Symbol> = match items.get(2).map(|i| &i.node) {
+            Some(Expr::Sym(s)) => vec![s.clone()],
+            Some(Expr::Vec(vs)) => vs.iter().filter_map(|v| match &v.node {
+                Expr::Sym(s) => Some(s.clone()),
+                _ => None,
+            }).collect(),
+            _ => Vec::new(),
+        };
         let mut methods = Vec::new();
-        for m in &items[3..] {
-            if let Expr::List(parts) = &m.node {
+        let mut fun_deps: Vec<(Symbol, Symbol)> = Vec::new();
+        let mut supers: Vec<Symbol> = Vec::new();
+        let mut i = 3;
+        while i < items.len() {
+            // §23.3 :fun-deps [(a -> b)] / §23.1 :super [Eq](超类约束)
+            if let Expr::Keyword(kw) = &items[i].node {
+                if (kw.as_str() == "fun-deps" || kw.as_str() == ":fun-deps") && i + 1 < items.len() {
+                    if let Expr::Vec(entries) = &items[i + 1].node {
+                        for e in entries {
+                            if let Expr::List(parts) = &e.node {
+                                if parts.len() == 3 {
+                                    if let (Expr::Sym(a), Expr::Keyword(arr), Expr::Sym(b)) = (&parts[0].node, &parts[1].node, &parts[2].node) {
+                                        if arr.as_str() == "->" { fun_deps.push((a.clone(), b.clone())); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    i += 2;
+                    continue;
+                }
+                if (kw.as_str() == "super" || kw.as_str() == ":super") && i + 1 < items.len() {
+                    if let Expr::Vec(entries) = &items[i + 1].node {
+                        for e in entries {
+                            if let Expr::Sym(s) = &e.node { supers.push(s.clone()); }
+                        }
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
+            if let Expr::List(parts) = &items[i].node {
                 if let Some(Expr::Sym(mname)) = parts.first().map(|p| &p.node) {
-                    // 方法签名 (method [params] -> Ret):解析返回类型,缺省 Unit
                     let ret = if parts.len() >= 4 {
                         if let Some(Expr::Keyword(kw)) = parts.get(2).map(|p| &p.node) {
-                            if kw.as_str() == "->" {
-                                self.desugar_type_with_params(&parts[3], &[])?
-                            } else { Type::unit() }
+                            if kw.as_str() == "->" { self.desugar_type_with_params(&parts[3], &[])? } else { Type::unit() }
                         } else { Type::unit() }
                     } else { Type::unit() };
                     methods.push((mname.clone(), ret));
+                }
+            }
+            i += 1;
+        }
+        let def = CoreDef {
+            name: name.clone(), ty: None, effects: EffectRow::Pure, grade: Grade::Omega,
+            mode: Mode::In, determinism: Determinism::Det,
+            region: None,
+            visibility: Visibility::Public,
+            mode_sigs: vec![],
+            body: CoreExpr::new(CoreExprNode::ClassDef(name, tvars, methods, fun_deps, supers), span),
+            requires: None, ensures: None, span,
+        };
+        Ok(Some(TopLevel::Def(def)))
+    }
+
+    /// §草稿 trait 语法糖:(deftrait Name (defabsmember m)...) / (polytrait [tvars] (defabsmember m)...)
+    /// 等价 defclass:defabsmember/defmember → 抽象方法(Unit 返回)。
+    fn desugar_deftrait_form(&self, items: &[SExpr], span: Span) -> Result<Option<TopLevel>, DesugarError> {
+        let name = match items.get(1).and_then(|i| match &i.node { Expr::Sym(s) => Some(s.clone()), _ => None }) {
+            Some(s) => s,
+            None => return Err(DesugarError { message: "deftrait requires a name".into(), span }),
+        };
+        // polytrait 第一个参数为 ['a 'b ...] 类型参数列表
+        let mut tvars: Vec<Symbol> = Vec::new();
+        let mut start = 2;
+        if let Some(Expr::Vec(vs)) = items.get(2).map(|i| &i.node) {
+            tvars = vs.iter().filter_map(|v| match &v.node { Expr::Sym(s) => Some(s.clone()), _ => None }).collect();
+            start = 3;
+        }
+        let mut methods = Vec::new();
+        for item in &items[start..] {
+            if let Expr::List(parts) = &item.node {
+                if let Some(Expr::Sym(head)) = parts.first().map(|p| &p.node) {
+                    if matches!(head.as_str(), "defabsmember" | "defmember") {
+                        if let Some(Expr::Sym(mname)) = parts.get(1).map(|p| &p.node) {
+                            methods.push((mname.clone(), Type::unit()));
+                        }
+                    }
                 }
             }
         }
         let def = CoreDef {
             name: name.clone(), ty: None, effects: EffectRow::Pure, grade: Grade::Omega,
             mode: Mode::In, determinism: Determinism::Det,
+            region: None,
+            visibility: Visibility::Public,
             mode_sigs: vec![],
-            body: CoreExpr::new(CoreExprNode::ClassDef(name, tvars, methods), span),
+            body: CoreExpr::new(CoreExprNode::ClassDef(name, tvars, methods, vec![], vec![]), span),
             requires: None, ensures: None, span,
         };
         Ok(Some(TopLevel::Def(def)))
     }
 
-    /// §23.2:(definstance Class Type (method [params] body) ...)
-    fn desugar_definstance_form(&self, items: &[SExpr], span: Span) -> Result<Option<TopLevel>, DesugarError> {
-        let class = match items.get(1).and_then(|i| match &i.node { Expr::Sym(s) => Some(s.clone()), _ => None }) {
+    /// §草稿 type/deftype/defpoly 类型定义:
+    /// - (type Name (disj A B ...)) → defdata(和类型 ADT,构造器 A/B/...)
+    /// - (type Name body) → 类型别名;-(defpoly Name [tvars] body) → 多态别名
+    /// - 后缀 (with Trait (fn m)...) 子句 → definstance(汇入 pending_instances)
+    fn desugar_type_def_form(&self, items: &[SExpr], span: Span) -> Result<Option<TopLevel>, DesugarError> {
+        let name = match items.get(1).and_then(|i| match &i.node { Expr::Sym(s) => Some(s.clone()), _ => None }) {
             Some(s) => s,
-            None => return Err(DesugarError { message: "definstance requires a class name".into(), span }),
+            None => return Err(DesugarError { message: "type definition requires a name".into(), span }),
         };
-        let types: Vec<Type> = items.get(2).map(|t| self.desugar_type_with_params(t, &[])).transpose()?.into_iter().collect();
+        let is_poly = matches!(items.first().and_then(|i| match &i.node { Expr::Sym(s) => Some(s.as_str()), _ => None }), Some("defpoly"));
+        // defpoly:items[2] 是 [tvars where 约束...],body 在 items[3];type/deftype:body 在 items[2]
+        let (tvars, constraints, body_expr, body_idx) = if is_poly {
+            let (tvars, constraints) = match items.get(2).map(|i| &i.node) {
+                Some(Expr::Vec(vs)) => {
+                    let mut tvars = Vec::new();
+                    let mut constraints = Vec::new();
+                    let mut in_where = false;
+                    for v in vs {
+                        if let Expr::Sym(s) = &v.node {
+                            if s.as_str() == "where" { in_where = true; continue; }
+                            if in_where { constraints.push(s.clone()); } else { tvars.push(s.clone()); }
+                        }
+                    }
+                    (tvars, constraints)
+                }
+                _ => (Vec::new(), Vec::new()),
+            };
+            (tvars, constraints, items.get(3), 3)
+        } else {
+            (Vec::new(), Vec::new(), items.get(2), 2)
+        };
+        let body_expr = body_expr.ok_or_else(|| DesugarError { message: "type definition requires a body".into(), span })?;
+        // 非 disj 时登记类型别名;返回 Ignored 表示「已处理,无额外顶层结构」
+        let mut result = Some(TopLevel::Ignored);
+        // (disj A B ...) → defdata(和类型 ADT)
+        if let Expr::List(body_items) = &body_expr.node {
+            if let Some(Expr::Sym(dhead)) = body_items.first().map(|p| &p.node) {
+                if dhead.as_str() == "disj" && body_items.len() >= 3 {
+                    let mut ctors = Vec::new();
+                    for b in &body_items[1..] {
+                        if let Expr::Sym(cname) = &b.node {
+                            ctors.push(tisp_core::data::Constructor {
+                                name: cname.clone(), fields: vec![], gadt_return_type: None, span: b.span,
+                            });
+                        }
+                    }
+                    let decl = tisp_core::data::DataDecl {
+                        name: name.clone(), type_params: tvars.clone(), constructors: ctors,
+                        deriving: vec![], is_hit: false, boundary: None, span,
+                    };
+                    result = Some(TopLevel::DataDecl(decl));
+                }
+            }
+        }
+        if matches!(&result, Some(TopLevel::Ignored)) {
+            // 类型别名(conj/类型引用),登记进 type_aliases,供类型引用替换
+            let body_ty = self.desugar_type_with_params(body_expr, &tvars)?;
+            self.type_aliases.borrow_mut().insert(name.clone(), (tvars.clone(), constraints, body_ty));
+        }
+        // (with Trait (fn m)...) 子句 → definstance
+        for item in &items[body_idx + 1..] {
+            if let Expr::List(wparts) = &item.node {
+                if let Some(Expr::Sym(whead)) = wparts.first().map(|p| &p.node) {
+                    if whead.as_str() == "with" {
+                        if let Some(Expr::Sym(trait_name)) = wparts.get(1).map(|p| &p.node) {
+                            let mut methods = Vec::new();
+                            for m in &wparts[2..] {
+                                if let Expr::List(mparts) = &m.node {
+                                    if let Some(Expr::Sym(fhead)) = mparts.first().map(|p| &p.node) {
+                                        if fhead.as_str() == "fn" {
+                                            if let Some(Expr::Sym(mname)) = mparts.get(1).map(|p| &p.node) {
+                                                let unit_body = CoreExpr::new(CoreExprNode::Lit(Literal::Unit), m.span);
+                                                methods.push((mname.clone(), Box::new(unit_body)));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let inst = CoreDef {
+                                name: trait_name.clone(), ty: None, effects: EffectRow::Pure, grade: Grade::Omega,
+                                mode: Mode::In, determinism: Determinism::Det,
+                                region: None, visibility: Visibility::Public, mode_sigs: vec![],
+                                body: CoreExpr::new(CoreExprNode::InstanceDef(trait_name.clone(), vec![Type::Con(tisp_core::types::TypeCon { name: name.clone(), kind: tisp_core::types::Kind::Star })], methods), item.span),
+                                requires: None, ensures: None, span: item.span,
+                            };
+                            self.pending_instances.borrow_mut().push(inst);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// §23.2:(definstance (Class T1 T2) (method [params] body) ...) 或 (definstance Class T1 (method ...))
+    fn desugar_definstance_form(&self, items: &[SExpr], span: Span) -> Result<Option<TopLevel>, DesugarError> {
+        // (Class T1 T2) 形式:items[1] 为 List;否则 Class 为 Sym、类型在 items[2]
+        let (class, types, method_start): (Symbol, Vec<Type>, usize) = match items.get(1).map(|i| &i.node) {
+            Some(Expr::List(parts)) if !parts.is_empty() => {
+                let class = match &parts[0].node {
+                    Expr::Sym(s) => s.clone(),
+                    _ => return Err(DesugarError { message: "definstance class name must be a symbol".into(), span: parts[0].span }),
+                };
+                let mut ts = Vec::new();
+                for t in &parts[1..] { ts.push(self.desugar_type_with_params(t, &[])?); }
+                (class, ts, 2)
+            }
+            Some(Expr::Sym(s)) => {
+                let types = items.get(2).map(|t| self.desugar_type_with_params(t, &[])).transpose()?.into_iter().collect();
+                (s.clone(), types, 3)
+            }
+            _ => return Err(DesugarError { message: "definstance requires a class name".into(), span }),
+        };
         let mut methods = Vec::new();
-        for m in &items[3..] {
+        for m in &items[method_start..] {
             if let Expr::List(parts) = &m.node {
                 if let Some(Expr::Sym(mname)) = parts.first().map(|p| &p.node) {
                     // 方法参数(§23.2):(method [x y] body...)
@@ -358,6 +694,8 @@ impl Desugarer {
         let def = CoreDef {
             name: Symbol::new(&format!("__instance_{}", class.as_str())), ty: None,
             effects: EffectRow::Pure, grade: Grade::Omega, mode: Mode::In, determinism: Determinism::Det,
+            region: None,
+            visibility: Visibility::Public,
             mode_sigs: vec![],
             body: CoreExpr::new(CoreExprNode::InstanceDef(class, types, methods), span),
             requires: None, ensures: None, span,
@@ -378,6 +716,8 @@ impl Desugarer {
         let def = CoreDef {
             name: Symbol::new(&format!("__prop_{}", name.as_str())), ty: None,
             effects: EffectRow::Pure, grade: Grade::Omega, mode: Mode::In, determinism: Determinism::Det,
+            region: None,
+            visibility: Visibility::Public,
             mode_sigs: vec![],
             body: CoreExpr::new(CoreExprNode::TheoremDef(name, Box::new(prop)), span),
             requires: None, ensures: None, span,
@@ -475,7 +815,8 @@ impl Desugarer {
     fn check_hit_boundary(&self, decl: &DataDecl, boundary: &SExpr, span: Span) -> Result<(), DesugarError> {
         let known: Vec<String> = decl.constructors.iter()
             .map(|c| c.name.as_str().to_string())
-            .chain(vec!["i0".to_string(), "i1".to_string()])
+            // i = 区间变量(§7.4 `[i : I]`),I = 区间类型;i0/i1 = 端点
+            .chain(vec!["i0".to_string(), "i1".to_string(), "i".to_string(), "I".to_string()])
             .collect();
         // 边界表达式中的运算符(如 = != < >)与关键字不参与符号检查
         let operators = ["=", "!=", "<", ">", "<=", ">=", "and", "or", "not", "end"];
@@ -504,8 +845,84 @@ impl Desugarer {
             }
             Ok(())
         }
-        walk(boundary, &check)
+        walk(boundary, &check)?;
+        // §7.4/16.3 结构化边界子句:[guard -> target ...] 端点唯一一致性:
+        // 同一端点(i0/i1)钉到不同 target 为边界违反。flat 形式:guard(列表) -> target(符号)
+        if let Expr::Vec(items) = &boundary.node {
+            let mut i0_target: Option<Symbol> = None;
+            let mut i1_target: Option<Symbol> = None;
+            let mut idx = 0;
+            while idx + 2 < items.len() {
+                if let Expr::List(guard) = &items[idx].node {
+                    if guard.len() == 3 {
+                        if let (Expr::Sym(op), Expr::Keyword(arrow), Expr::Sym(target)) = (&guard[1].node, &items[idx + 1].node, &items[idx + 2].node) {
+                            if (op.as_str() == "=" || op.as_str() == "==") && arrow.as_str() == "->" {
+                                let (l, r) = (&guard[0], &guard[2]);
+                                // §16.3 符号端点求解:区间变量 i 只可等于端点 i0/i1;
+                                // 若 guard (i = ctor) 把 i 钉到构造器(非端点),方程不可满足
+                                let l_is_i = matches!(&l.node, Expr::Sym(s) if s.as_str() == "i");
+                                let r_is_i = matches!(&r.node, Expr::Sym(s) if s.as_str() == "i");
+                                let is_ctor = |e: &SExpr| -> bool {
+                                    matches!(&e.node, Expr::Sym(s) if decl.constructors.iter().any(|c| c.name == *s))
+                                };
+                                if (l_is_i && is_ctor(r)) || (r_is_i && is_ctor(l)) {
+                                    let ctor = if l_is_i { r } else { l };
+                                    let ctor_name = match &ctor.node { Expr::Sym(s) => s.as_str().to_string(), _ => "?".to_string() };
+                                    return Err(DesugarError {
+                                        message: format!("HIT 边界违反:符号端点方程不可满足 (i = {}),区间只可为 i0/i1", ctor_name),
+                                        span,
+                                    });
+                                }
+                                let endpoint = if is_interval_endpoint(l, "i0") || is_interval_endpoint(r, "i0") {
+                                    Some("i0")
+                                } else if is_interval_endpoint(l, "i1") || is_interval_endpoint(r, "i1") {
+                                    Some("i1")
+                                } else { None };
+                                if let Some(ep) = endpoint {
+                                    let slot = if ep == "i0" { &mut i0_target } else { &mut i1_target };
+                                    match slot {
+                                        Some(prev) if prev != target => {
+                                            return Err(DesugarError {
+                                                message: format!("HIT 边界违反:端点 {} 钉到不同目标 {} 与 {}", ep, prev, target),
+                                                span,
+                                            });
+                                        }
+                                        None => { *slot = Some(target.clone()); }
+                                        _ => {}
+                                    }
+                                }
+                                idx += 3;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                idx += 1;
+            }
+        }
+        // §16.3 端点方程可满足性:边界等式(= a b)中 a/b 为端点常量(i0/i1)时直接求值判定,
+        // 矛盾(如 (= i0 i1))为边界违反
+        if let Expr::List(items) = &boundary.node {
+            if items.len() == 3 {
+                if let Expr::Sym(op) = &items[0].node {
+                    if op.as_str() == "=" || op.as_str() == "==" {
+                        let l = endpoint_value_free(&items[1]);
+                        let r = endpoint_value_free(&items[2]);
+                        if let (Some(a), Some(b)) = (l, r) {
+                            if a != b {
+                                return Err(DesugarError {
+                                    message: format!("HIT 边界违反:端点方程不可满足 ({} != {})", a, b),
+                                    span,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
+
 
     /// §20.1:(defsession name 协议体) — 解析会话协议为 SessionType
     /// 协议语法:(send T rest)/(recv T rest)/(choice (label T)...)/(offer (label T)...)/(end)
@@ -569,6 +986,8 @@ impl Desugarer {
         let def = CoreDef { name, ty: Some(tisp_core::types::Type::Session(Box::new(proto))),
             effects: EffectRow::Closed(vec![EffectLabel::Session]),
             grade: Grade::Omega, mode: Mode::In, determinism: Determinism::Det,
+            region: None,
+            visibility: Visibility::Public,
             mode_sigs: vec![],
             body, requires: None, ensures: None, span };
         Ok(Some(TopLevel::Def(def)))
@@ -870,6 +1289,9 @@ impl Desugarer {
                         kind: tisp_core::types::Kind::Star,
                         id: 0,
                     }))
+                } else if let Some((_, _, body)) = self.type_aliases.borrow().get(name) {
+                    // §草稿 类型别名:命中登记别名则返回别名体
+                    Ok(body.clone())
                 } else {
                     match name.as_str() {
                         "i8" => Ok(tisp_core::types::Type::i8()),
@@ -901,7 +1323,22 @@ impl Desugarer {
             Expr::Map(pairs) if !pairs.is_empty() => {
                 self.desugar_refined_type(expr, pairs, type_params)
             }
+            // 空列表 () → Unit(草稿 type-system2:() => Unit)
+            Expr::List(items) if items.is_empty() => {
+                Ok(tisp_core::types::Type::unit())
+            }
             Expr::List(items) if !items.is_empty() => {
+                // §conj/disj 类型字面量(草稿 type-system2):(conj A B) → Tuple;(disj A B) → Tuple(和类型糖)
+                if let Expr::Sym(head) = &items[0].node {
+                    if matches!(head.as_str(), "conj" | "disj") && items.len() >= 3 {
+                        let mut tys = Vec::new();
+                        for it in &items[1..] {
+                            tys.push(self.desugar_type_with_params(it, type_params)?);
+                        }
+                        // conj = 乘积;disj = 和类型(ADT 糖,当前以 Tuple 承载,构造器名见 desugar)
+                        return Ok(tisp_core::types::Type::Tuple(tys));
+                    }
+                }
                 // §18 时序模态类型:(next T)/(always T)/(eventually T)
                 if let Expr::Sym(head) = &items[0].node {
                     if matches!(head.as_str(), "next" | "always" | "eventually") && items.len() == 2 {
@@ -937,6 +1374,76 @@ impl Desugarer {
                             message: format!("{} requires binder (x : T)", head),
                             span: expr.span,
                         });
+                    }
+                }
+                // §11.2 分级必然:(□_r A) → Modal(Necessity(r), A)
+                if let Expr::Sym(head) = &items[0].node {
+                    if head.as_str() == "□" && items.len() == 3 {
+                        let grade = self.desugar_grade_subscript(&items[1])?;
+                        let inner = self.desugar_type_with_params(&items[2], type_params)?;
+                        return Ok(tisp_core::types::Type::Modal(
+                            tisp_core::types::ModalOp::Necessity(grade),
+                            Box::new(inner),
+                        ));
+                    }
+                }
+                // 类型 λ(tlambda,草稿 type-system):(=> B) → TLambda(Unit, B);(A => B) → TLambda(A, B)
+                if let Expr::Sym(head) = &items[0].node {
+                    if head.as_str() == "=>" && items.len() == 2 {
+                        let body = self.desugar_type_with_params(&items[1], type_params)?;
+                        return Ok(tisp_core::types::Type::TLambda(
+                            Box::new(tisp_core::types::Type::unit()),
+                            Box::new(body),
+                        ));
+                    }
+                }
+                if items.len() >= 3 {
+                    if let Expr::Sym(mid) = &items[1].node {
+                        if mid.as_str() == "=>" {
+                            let param = self.desugar_type_with_params(&items[0], type_params)?;
+                            let body = self.desugar_type_with_params(&items[2], type_params)?;
+                            return Ok(tisp_core::types::Type::TLambda(Box::new(param), Box::new(body)));
+                        }
+                    }
+                }
+                // 函数类型箭头 (§9 统一注解语法):(T1 -> T2) / (T1 ->[ε,ρ,@r,m,d] T2)
+                if items.len() >= 3 {
+                    let is_arrow = |it: &SExpr| match &it.node {
+                        Expr::Keyword(k) => k.as_str() == "->",
+                        Expr::Sym(s) => s.as_str() == "->",
+                        _ => false,
+                    };
+                    if is_arrow(&items[1]) {
+                        let param = self.desugar_type_with_params(&items[0], type_params)?;
+                        let (ann, ret_expr) = if items.len() >= 4 {
+                            if let Expr::Vec(ann_items) = &items[2].node {
+                                let (ef, rg, gr, md, dt) = self.desugar_six_dim_annotation(ann_items)?;
+                                (tisp_core::types::FunAnnotation {
+                                    effects: ef, region: rg, grade: gr, mode: md, determinism: dt,
+                                }, &items[3])
+                            } else {
+                                (tisp_core::types::FunAnnotation::default(), &items[2])
+                            }
+                        } else {
+                            (tisp_core::types::FunAnnotation::default(), &items[2])
+                        };
+                        let ret = self.desugar_type_with_params(ret_expr, type_params)?;
+                        return Ok(tisp_core::types::Type::Fun(Box::new(param), ann, Box::new(ret)));
+                    }
+                }
+                // §草稿 多态别名应用:(Pair i32 f32) 且 Pair 为带参别名 → 替换 tvars
+                if let Expr::Sym(head_name) = &items[0].node {
+                    if let Some((tvars, _, body)) = self.type_aliases.borrow().get(head_name).cloned() {
+                        if !tvars.is_empty() && tvars.len() == items.len() - 1 {
+                            let args: Vec<tisp_core::types::Type> = items[1..].iter()
+                                .map(|it| self.desugar_type_with_params(it, type_params))
+                                .collect::<Result<_, _>>()?;
+                            let mut subst = std::collections::HashMap::new();
+                            for (tv, arg) in tvars.iter().zip(args.iter()) {
+                                subst.insert(tv.clone(), arg.clone());
+                            }
+                            return Ok(substitute_type_vars(&body, &subst));
+                        }
                     }
                 }
                 // Type application: (List i32), (Map String i32), etc.
@@ -1149,7 +1656,7 @@ impl Desugarer {
         }
     }
 
-    fn desugar_def_form(&self, items: &[SExpr], span: Span) -> Result<CoreDef, DesugarError> {
+    fn desugar_def_form(&self, items: &[SExpr], span: Span, visibility: Visibility) -> Result<CoreDef, DesugarError> {
         if items.len() < 3 {
             return Err(DesugarError {
                 message: "def requires name and body".into(),
@@ -1174,6 +1681,8 @@ impl Desugarer {
             grade: Grade::Omega,
             mode: Mode::In,
             determinism: Determinism::Det,
+            region: None,
+            visibility,
             mode_sigs: vec![],
             body,
             requires: None,
@@ -1182,7 +1691,7 @@ impl Desugarer {
         })
     }
 
-    fn desugar_defn_form(&self, items: &[SExpr], span: Span) -> Result<CoreDef, DesugarError> {
+    fn desugar_defn_form(&self, items: &[SExpr], span: Span, visibility: Visibility) -> Result<CoreDef, DesugarError> {
         if items.len() < 4 {
             return Err(DesugarError {
                 message: "defn requires name, params, and body".into(),
@@ -1202,14 +1711,19 @@ impl Desugarer {
         // (defn name ([p1] b1) ([p2] b2) ...)
         if let Expr::List(first_clause) = &items[2].node {
             if !first_clause.is_empty() && matches!(&first_clause[0].node, Expr::Vec(_)) {
-                return self.desugar_multi_arity_defn(name, &items[2..], span);
+                return self.desugar_multi_arity_defn(name, &items[2..], span, visibility);
             }
         }
 
         let params = self.desugar_params(&items[2])?;
 
-        // Look for -> ReturnType annotation
+        // Look for -> ReturnType annotation(支持六维注解 ->[ε, ρ, @r, m, d] Ret)
         let mut ret_type = None;
+        let mut effects = EffectRow::Pure;
+        let mut region: Option<RegionVar> = None;
+        let mut grade = Grade::Omega;
+        let mut mode = Mode::In;
+        let mut determinism = Determinism::Det;
         let mut body_start = 3;
         while body_start < items.len() {
             // `->` 被词法解析为 Sym(而非 Keyword),两种都接受
@@ -1220,8 +1734,20 @@ impl Desugarer {
             };
             if is_arrow {
                 if body_start + 1 < items.len() {
-                    ret_type = Some(self.desugar_type_with_params(&items[body_start + 1], &[])?);
-                    body_start += 2;
+                    // 六维注解形式:-> [ε, ρ, @r, m, d] Ret
+                    if let Expr::Vec(ann_items) = &items[body_start + 1].node {
+                        let (ef, rg, gr, md, dt) = self.desugar_six_dim_annotation(ann_items)?;
+                        effects = ef; region = rg; grade = gr; mode = md; determinism = dt;
+                        if body_start + 2 < items.len() {
+                            ret_type = Some(self.desugar_type_with_params(&items[body_start + 2], &[])?);
+                            body_start += 3;
+                        } else {
+                            return Err(DesugarError { message: "-> [...] requires a return type".into(), span: items[body_start].span });
+                        }
+                    } else {
+                        ret_type = Some(self.desugar_type_with_params(&items[body_start + 1], &[])?);
+                        body_start += 2;
+                    }
                 } else {
                     return Err(DesugarError { message: "-> requires a return type".into(), span: items[body_start].span });
                 }
@@ -1303,10 +1829,12 @@ impl Desugarer {
         Ok(CoreDef {
             name,
             ty: ret_type,
-            effects: EffectRow::Pure,
-            grade: Grade::Omega,
-            mode: Mode::In,
-            determinism: Determinism::Det,
+            effects,
+            grade,
+            mode,
+            determinism,
+            region,
+            visibility,
             mode_sigs: vec![],
             body: CoreExpr::new(lambda, span),
             requires,
@@ -1535,6 +2063,8 @@ impl Desugarer {
         Ok(CoreDef {
             name, ty: None, effects: EffectRow::Open(vec![EffectLabel::Search], Box::new(EffectRow::Pure)),
             grade: Grade::Omega, mode: Mode::Free, mode_sigs, determinism,
+            region: None,
+            visibility: Visibility::Public,
             body: CoreExpr::new(lambda, span), requires: None, ensures: None, span,
         })
     }
@@ -1551,19 +2081,29 @@ impl Desugarer {
                             let grade = Grade::Omega;
                             let mut ty = None;
                             let name = name.clone();
-                            // Check if next items are : type
+                            // Check if next items are : type / 内联模式注解(§13.2)
                             let mut mode = Mode::In;
-                            if i + 2 < items.len() {
+                            if i + 1 < items.len() {
                                 if let Expr::Keyword(kw) = &items[i + 1].node {
                                     if kw.as_str() == ":" {
-                                        ty = Some(self.desugar_type_with_params(&items[i + 2], &[])?);
-                                        i += 2; // skip : and type
+                                        if i + 2 < items.len() {
+                                            ty = Some(self.desugar_type_with_params(&items[i + 2], &[])?);
+                                            i += 2; // skip : and type
+                                        }
                                     } else if kw.as_str() == "free" {
                                         // §21.2 模式注解:name :free(输出逻辑变量)
                                         mode = Mode::Free;
                                         i += 1;
                                     } else if kw.as_str() == "ground" {
                                         mode = Mode::In;
+                                        i += 1;
+                                    } else if kw.as_str() == "in" {
+                                        // §13.2 内联模式注解:name :in(输入)
+                                        mode = Mode::In;
+                                        i += 1;
+                                    } else if kw.as_str() == "out" {
+                                        // §13.2 内联模式注解:name :out(输出)
+                                        mode = Mode::Out;
                                         i += 1;
                                     }
                                 }
@@ -1578,6 +2118,18 @@ impl Desugarer {
                         }
                         // Graded parameter: {grade name : type} — parsed as Map
                         Expr::Map(pairs) if !pairs.is_empty() => {
+                            // 隐式绑定 {n : T}(§10.2):键为名称符号、值为类型 → 默认等级 0
+                            if matches!(&pairs[0].0.node, Expr::Sym(_))
+                                && matches!(&pairs[0].1.node, Expr::List(_)) {
+                                let name = match &pairs[0].0.node {
+                                    Expr::Sym(s) => s.clone(),
+                                    _ => unreachable!(),
+                                };
+                                let ty = self.desugar_type_with_params(&pairs[0].1, &[])?;
+                                params.push(Param { name, ty: Some(ty), grade: Grade::Zero, mode: Mode::In });
+                                i += 1;
+                                continue;
+                            }
                             let grade = self.desugar_grade_expr(&pairs[0].0)?;
                             let name = match &pairs[0].1.node {
                                 Expr::Sym(s) => s.clone(),
@@ -1637,6 +2189,8 @@ impl Desugarer {
     /// 符号 → Var(等级变量);(op a b) → Add/Mul(+/*);其余报错
     fn desugar_grade_expr(&self, expr: &SExpr) -> Result<Grade, DesugarError> {
         match &expr.node {
+            // 单元素向量 [n] → 等级 n(§11.2 `@[n]` 分级应用的词法形态)
+            Expr::Vec(items) if items.len() == 1 => self.desugar_grade_expr(&items[0]),
             Expr::Int(0) => Ok(Grade::Zero),
             Expr::Int(1) => Ok(Grade::One),
             Expr::Int(n) if *n > 1 => Ok(Grade::Nat(*n as u64)),
@@ -1666,6 +2220,149 @@ impl Desugarer {
                 message: "grade must be 0, 1, ω, a symbol, or a grade expression (+ *)".into(),
                 span: expr.span,
             }),
+        }
+    }
+
+    /// §6.6:解析六维注解 [ε, ρ, @r, m, d] → (effects, region, grade, mode, determinism)
+    fn desugar_six_dim_annotation(&self, items: &[SExpr]) -> Result<(EffectRow, Option<RegionVar>, Grade, Mode, Determinism), DesugarError> {
+        let mut effects = EffectRow::Pure;
+        let mut region: Option<RegionVar> = None;
+        let mut grade = Grade::Omega;
+        let mut mode = Mode::In;
+        let mut determinism = Determinism::Det;
+        for (idx, item) in items.iter().enumerate() {
+            match idx {
+                0 => effects = self.desugar_effect_row(item)?,
+                1 => region = self.desugar_region_annotation(item)?,
+                2 => grade = self.desugar_grade_annotation(item)?,
+                3 => mode = self.desugar_mode_annotation(item)?,
+                4 => determinism = self.desugar_determinism_annotation(item)?,
+                _ => return Err(DesugarError { message: "六维注解最多 5 个槽位 [ε, ρ, @r, m, d]".into(), span: item.span }),
+            }
+        }
+        Ok((effects, region, grade, mode, determinism))
+    }
+
+    /// 效果行: Pure / IO / [IO State] / (IO State) / #{IO State} / {IO State}
+    fn desugar_effect_row(&self, expr: &SExpr) -> Result<EffectRow, DesugarError> {
+        match &expr.node {
+            Expr::Sym(s) if s.as_str() == "Pure" || s.as_str() == "pure" => Ok(EffectRow::Pure),
+            Expr::Sym(s) => Ok(EffectRow::Closed(vec![self.effect_label_from_sym(s)?])),
+            Expr::Vec(items) | Expr::List(items) | Expr::Set(items) => {
+                let labels = items.iter().map(|i| self.desugar_effect_label(i)).collect::<Result<Vec<_>, _>>()?;
+                Ok(EffectRow::Closed(labels))
+            }
+            Expr::Map(pairs) => {
+                // {IO State} 形式:逗号分隔被 parse_map 折为相邻键值对,收集键
+                let mut labels = Vec::new();
+                for (k, _) in pairs {
+                    if let Expr::Sym(s) = &k.node {
+                        labels.push(self.effect_label_from_sym(s)?);
+                    }
+                }
+                Ok(EffectRow::Closed(labels))
+            }
+            _ => Err(DesugarError { message: "效果行须为符号或效果列表".into(), span: expr.span }),
+        }
+    }
+
+    fn desugar_effect_label(&self, expr: &SExpr) -> Result<EffectLabel, DesugarError> {
+        match &expr.node {
+            Expr::Sym(s) => self.effect_label_from_sym(s),
+            _ => Err(DesugarError { message: "效果标签须为符号".into(), span: expr.span }),
+        }
+    }
+
+    fn effect_label_from_sym(&self, s: &Symbol) -> Result<EffectLabel, DesugarError> {
+        Ok(match s.as_str() {
+            "IO" => EffectLabel::IO,
+            "Search" => EffectLabel::Search,
+            "Unsafe" => EffectLabel::Unsafe,
+            "Ambient" => EffectLabel::Ambient,
+            "State" => EffectLabel::State(Box::new(tisp_core::types::Type::unit())),
+            "Reader" => EffectLabel::Reader(Box::new(tisp_core::types::Type::unit())),
+            "Writer" => EffectLabel::Writer(Box::new(tisp_core::types::Type::unit())),
+            "Except" => EffectLabel::Except(Box::new(tisp_core::types::Type::unit())),
+            "Channel" => EffectLabel::Channel(Box::new(tisp_core::types::Type::unit())),
+            _ => EffectLabel::Named(s.clone()),
+        })
+    }
+
+    /// 区域维:符号 → RegionVar;_ / any → None(未标注)
+    fn desugar_region_annotation(&self, expr: &SExpr) -> Result<Option<RegionVar>, DesugarError> {
+        match &expr.node {
+            Expr::Sym(s) if s.as_str() == "_" || s.as_str() == "any" => Ok(None),
+            Expr::Sym(s) => Ok(Some(RegionVar { name: s.clone(), id: 0 })),
+            _ => Ok(None),
+        }
+    }
+
+    /// 等级维:@r(前缀标记 (at r))或裸等级表达式
+    fn desugar_grade_annotation(&self, expr: &SExpr) -> Result<Grade, DesugarError> {
+        match &expr.node {
+            Expr::List(items) if items.len() == 2 && matches!(&items[0].node, Expr::Sym(s) if s.as_str() == "@") => {
+                self.desugar_grade_expr(&items[1])
+            }
+            _ => self.desugar_grade_expr(expr),
+        }
+    }
+
+    /// §11.2:等级下标(_r/_n/_level 或 0/1/ω)→ Grade
+    fn desugar_grade_subscript(&self, expr: &SExpr) -> Result<Grade, DesugarError> {
+        match &expr.node {
+            Expr::Sym(s) => {
+                let name = s.as_str();
+                if let Some(stripped) = name.strip_prefix('_') {
+                    if stripped.is_empty() {
+                        Err(DesugarError { message: "分级必然缺少等级下标".into(), span: expr.span })
+                    } else if stripped == "ω" || stripped == "omega" {
+                        Ok(Grade::Omega)
+                    } else {
+                        Ok(Grade::Var(Symbol::new(stripped)))
+                    }
+                } else {
+                    self.desugar_grade_expr(expr)
+                }
+            }
+            _ => self.desugar_grade_expr(expr),
+        }
+    }
+
+    /// 模式维:in/out/ground/free/crisp/cohesive(Sym 或 Keyword)
+    fn desugar_mode_annotation(&self, expr: &SExpr) -> Result<Mode, DesugarError> {
+        let s = match &expr.node {
+            Expr::Keyword(k) => k.as_str().to_string(),
+            Expr::Sym(s) => s.as_str().to_string(),
+            _ => return Err(DesugarError { message: "模式须为符号".into(), span: expr.span }),
+        };
+        match s.as_str() {
+            "in" => Ok(Mode::In),
+            "out" => Ok(Mode::Out),
+            "ground" => Ok(Mode::Ground),
+            "free" => Ok(Mode::Free),
+            "crisp" => Ok(Mode::Crisp),
+            "cohesive" => Ok(Mode::Cohesive),
+            _ => Err(DesugarError { message: format!("未知模式 '{}'", s), span: expr.span }),
+        }
+    }
+
+    /// 确定性维:det/semidet/multi/nondet/cc_multi/cc_nondet/failure/erroneous
+    fn desugar_determinism_annotation(&self, expr: &SExpr) -> Result<Determinism, DesugarError> {
+        let s = match &expr.node {
+            Expr::Keyword(k) => k.as_str().to_string(),
+            Expr::Sym(s) => s.as_str().to_string(),
+            _ => return Err(DesugarError { message: "确定性须为符号".into(), span: expr.span }),
+        };
+        match s.as_str() {
+            "det" => Ok(Determinism::Det),
+            "semidet" => Ok(Determinism::SemiDet),
+            "multi" => Ok(Determinism::Multi),
+            "nondet" => Ok(Determinism::NonDet),
+            "cc_multi" => Ok(Determinism::CcMulti),
+            "cc_nondet" => Ok(Determinism::CcNonDet),
+            "failure" => Ok(Determinism::Failure),
+            "erroneous" => Ok(Determinism::Erroneous),
+            _ => Err(DesugarError { message: format!("未知确定性 '{}'", s), span: expr.span }),
         }
     }
 
@@ -1906,6 +2603,20 @@ impl Desugarer {
                     "match" => self.desugar_match(items, span),
                     "handle" => self.desugar_handle(items, span),
                     "perform" => self.desugar_perform(items, span),
+                    // §12.6 monadic 风格:get-m/put-m/pure/mlet(零开销状态传递降级)
+                    "get-m" => {
+                        Ok(CoreExpr::new(CoreExprNode::Perform(Symbol::new("get"), vec![]), span))
+                    }
+                    "put-m" => {
+                        if items.len() < 2 { return Err(DesugarError { message: "put-m requires a value".into(), span }); }
+                        let v = self.desugar_expr(&items[1])?;
+                        Ok(CoreExpr::new(CoreExprNode::Perform(Symbol::new("put"), vec![v]), span))
+                    }
+                    "pure" => {
+                        if items.len() < 2 { return Err(DesugarError { message: "pure requires a value".into(), span }); }
+                        self.desugar_expr(&items[1])
+                    }
+                    "mlet" => self.desugar_mlet(items, span),
                     "do" => self.desugar_do(items, span),
                     // §5.9 类型标注 (ann expr Type):运行时无操作,类型检查时校验
                     "ann" => {
@@ -1986,6 +2697,8 @@ impl Desugarer {
                     "invoke"    => self.desugar_binary_wrap(|a, b| CoreExprNode::SigmaInvoke(a, b), items, span),
                     "update!"   => self.desugar_binary_wrap(|a, b| CoreExprNode::SigmaUpdate(a, b), items, span),
                     // HoTT
+                    "hcomp"     => self.desugar_hott_unary(CoreExprNode::HComp, items, span),
+                    "transp"    => self.desugar_transp(items, span),
                     "flat"      => self.desugar_hott_unary(CoreExprNode::FlatMod, items, span),
                     "sharp"     => self.desugar_hott_unary(CoreExprNode::SharpMod, items, span),
                     "shape"     => self.desugar_hott_unary(CoreExprNode::ShapeMod, items, span),
@@ -2106,6 +2819,11 @@ impl Desugarer {
         Ok(result)
     }
 
+    /// §12.6 monadic let:mlet [x e1 y e2] body → 嵌套 Let(与 let 同构)
+    fn desugar_mlet(&self, items: &[SExpr], span: Span) -> Result<CoreExpr, DesugarError> {
+        self.desugar_let(items, span)
+    }
+
     fn desugar_if(&self, items: &[SExpr], span: Span) -> Result<CoreExpr, DesugarError> {
         if items.len() != 4 {
             return Err(DesugarError {
@@ -2219,7 +2937,7 @@ impl Desugarer {
         }
     }
 
-    fn desugar_multi_arity_defn(&self, name: Symbol, clauses: &[SExpr], span: Span) -> Result<CoreDef, DesugarError> {
+    fn desugar_multi_arity_defn(&self, name: Symbol, clauses: &[SExpr], span: Span, visibility: Visibility) -> Result<CoreDef, DesugarError> {
         let mut arms = Vec::new();
         let mut all_params = Vec::new();
         for clause in clauses {
@@ -2260,6 +2978,8 @@ impl Desugarer {
             name,
             ty: None, effects: EffectRow::Pure, grade: Grade::Omega, mode: Mode::In,
             determinism: Determinism::Det,
+            region: None,
+            visibility,
             mode_sigs: vec![], body: CoreExpr::new(lambda, span),
             requires: None, ensures: None, span,
         })
@@ -2778,6 +3498,19 @@ impl Desugarer {
         Ok(CoreExpr::new(CoreExprNode::Abduce(Box::new(goal), abducibles), span))
     }
 
+    /// §16.3:(transp 路径 目标端点) — Transp(Type::unit 占位, path, target)
+    fn desugar_transp(&self, items: &[SExpr], span: Span) -> Result<CoreExpr, DesugarError> {
+        if items.len() != 3 {
+            return Err(DesugarError { message: "transp requires path and target endpoint".into(), span });
+        }
+        let path = self.desugar_expr(&items[1])?;
+        let target = self.desugar_expr(&items[2])?;
+        Ok(CoreExpr::new(
+            CoreExprNode::Transp(Box::new(tisp_core::types::Type::unit()), Box::new(path), Box::new(target)),
+            span,
+        ))
+    }
+
     fn desugar_hott_unary(&self, wrap: fn(Box<CoreExpr>) -> CoreExprNode, items: &[SExpr], span: Span) -> Result<CoreExpr, DesugarError> {
         if items.len() != 2 {
             return Err(DesugarError { message: "flat/sharp expects 1 argument".into(), span });
@@ -2994,6 +3727,235 @@ mod tests {
             panic!("offer-p 应解析为 Session(Offer)");
         }
     }
+
+    #[test]
+    fn test_cost_annotation() {
+        // §11.1/11.4:Cost 注解(@Cost 等级)经 @ 前缀解析为 Cost 等级变量
+        let d = Desugarer::new();
+        let src = "(defn f [x] -> [Pure, rho1, @Cost, in, det] i64 x)";
+        let prog = d.desugar_program(parse(src)).unwrap();
+        let def = prog.defs.iter().find(|def| def.name.as_str() == "f").unwrap();
+        assert_eq!(def.grade, Grade::Var(Symbol::new("Cost")), "@Cost 应解析为 Cost 等级变量");
+    }
+
+    #[test]
+    fn test_dependent_session_type() {
+        // §20.2 依赖会话:协议体引用依赖类型(Vec i64 n / Pi)
+        let d = Desugarer::new();
+        let src = "(defsession dep-proto (send (Vec i64 n) (recv (pi (x : i64) (Vec i64 x)) (end))))";
+        let prog = d.desugar_program(parse(src)).unwrap();
+        let def = prog.defs.iter().find(|def| def.name.as_str() == "dep-proto").unwrap();
+        assert!(matches!(def.ty, Some(tisp_core::types::Type::Session(_))), "依赖会话应解析为 Session 类型");
+    }
+
+    #[test]
+    fn test_six_dim_annotation() {
+        // §6.6:defn 的 ->[ε, ρ, @r, m, d] Ret 解析六维并写入 CoreDef
+        let d = Desugarer::new();
+        let src = "(defn f [x] -> [IO, rho1, @1, out, nondet] i64 x)";
+        let prog = d.desugar_program(parse(src)).unwrap();
+        let def = prog.defs.iter().find(|def| def.name.as_str() == "f").unwrap();
+        assert_eq!(def.effects, EffectRow::Closed(vec![EffectLabel::IO]), "效果维应解析为 {{IO}}");
+        assert!(def.region.is_some(), "区域维应解析");
+        assert_eq!(def.region.as_ref().unwrap().name.as_str(), "rho1");
+        assert_eq!(def.grade, Grade::One, "等级维 @1 应解析为 One");
+        assert_eq!(def.mode, Mode::Out, "模式维 out 应解析为 Out");
+        assert_eq!(def.determinism, Determinism::NonDet, "确定性维 nondet 应解析为 NonDet");
+        assert!(def.ty.is_some(), "返回类型应解析");
+    }
+
+    #[test]
+    fn test_six_dim_annotation_defaults() {
+        // 未标注六维时取默认值(纯效果/ω/in/det/无区域)
+        let d = Desugarer::new();
+        let src = "(defn g [x] -> i64 x)";
+        let prog = d.desugar_program(parse(src)).unwrap();
+        let def = prog.defs.iter().find(|def| def.name.as_str() == "g").unwrap();
+        assert_eq!(def.effects, EffectRow::Pure);
+        assert!(def.region.is_none());
+        assert_eq!(def.grade, Grade::Omega);
+        assert_eq!(def.mode, Mode::In);
+        assert_eq!(def.determinism, Determinism::Det);
+    }
+
+    #[test]
+    fn test_implicit_binding_default_zero() {
+        // §10.2:隐式绑定 {n : T} 默认等级 0;显式 {0 n : T} 亦为 0
+        let d = Desugarer::new();
+        let prog = d.desugar_program(parse("(defn f [{n : Nat}] -> Nat n)")).unwrap();
+        let def = prog.defs.iter().find(|def| def.name.as_str() == "f").unwrap();
+        if let CoreExprNode::Lam(Lambda { params, .. }) = &def.body.node {
+            assert_eq!(params.len(), 1);
+            assert_eq!(params[0].name.as_str(), "n");
+            assert_eq!(params[0].grade, Grade::Zero, "隐式绑定应默认 0 级");
+            assert!(params[0].ty.is_some());
+        } else {
+            panic!("f 应为 Lam");
+        }
+    }
+
+    #[test]
+    fn test_inline_mode_annotation() {
+        // §13.2 内联模式:defpred [x :in, y :out] → Param.mode In/Out
+        let d = Desugarer::new();
+        let prog = d.desugar_program(parse("(defpred p [x :in, y :out] :det ([x] y))")).unwrap();
+        let def = prog.defs.iter().find(|def| def.name.as_str() == "p").unwrap();
+        if let CoreExprNode::Lam(Lambda { params, .. }) = &def.body.node {
+            assert_eq!(params.len(), 2);
+            assert_eq!(params[0].name.as_str(), "x");
+            assert_eq!(params[0].mode, Mode::In, "x :in 应解析为 In");
+            assert_eq!(params[1].name.as_str(), "y");
+            assert_eq!(params[1].mode, Mode::Out, "y :out 应解析为 Out");
+        } else {
+            panic!("p 应为 Lam");
+        }
+    }
+
+    #[test]
+    fn test_hit_boundary_spec_syntax() {
+        // §7.4:spec 的 (i = i0) -> base 边界子句被接受(区间变量 i 加入 known 集)
+        let d = Desugarer::new();
+        let src = "(defdata-hit S1 (base) (loop :boundary [(i = i0) -> base (i = i1) -> base]))";
+        let prog = d.desugar_program(parse(src)).unwrap();
+        assert!(prog.data_decls[0].is_hit, "应解析为 HIT");
+        assert!(prog.data_decls[0].boundary.is_some(), "boundary 应记录");
+    }
+
+    #[test]
+    fn test_hit_boundary_symbolic_endpoint_unsat() {
+        // §16.3 符号端点求解:区间 i 只可等于 i0/i1,guard (i = loop)(构造器)不可满足
+        let d = Desugarer::new();
+        let src = "(defdata-hit S1 (base) (loop :boundary [(i = loop) -> base]))";
+        let err = d.desugar_program(parse(src)).unwrap_err();
+        assert!(err.message.contains("符号端点方程不可满足"), "应报符号端点不可满足,实际: {}", err.message);
+    }
+
+    #[test]
+    fn test_hit_boundary_endpoint_uniqueness() {
+        // §7.4:同一端点钉到不同目标 → 边界违反
+        let d = Desugarer::new();
+        let src = "(defdata-hit S1 (base) (other) (loop :boundary [(i = i0) -> base (i = i0) -> other]))";
+        let err = d.desugar_program(parse(src)).unwrap_err();
+        assert!(err.message.contains("边界违反"), "应报端点不一致,实际: {}", err.message);
+    }
+
+    #[test]
+    fn test_private_visibility() {
+        // §6.5:defn-/def- 私有,defn/def 公开
+        let d = Desugarer::new();
+        let prog = d.desugar_program(parse("(defn pub [x] x)\n(defn- priv [x] x)\n(def pubv 1)\n(def- privv 2)")).unwrap();
+        let pub_def = prog.defs.iter().find(|def| def.name.as_str() == "pub").unwrap();
+        assert_eq!(pub_def.visibility, Visibility::Public);
+        let priv_def = prog.defs.iter().find(|def| def.name.as_str() == "priv").unwrap();
+        assert_eq!(priv_def.visibility, Visibility::Private, "defn- 应私有");
+        let pubv = prog.defs.iter().find(|def| def.name.as_str() == "pubv").unwrap();
+        assert_eq!(pubv.visibility, Visibility::Public);
+        let privv = prog.defs.iter().find(|def| def.name.as_str() == "privv").unwrap();
+        assert_eq!(privv.visibility, Visibility::Private, "def- 应私有");
+    }
+
+    #[test]
+    fn test_ns_refer_parsing() {
+        // §25.2:ns 的 :refer 列表解析进 Namespace 第三元素(不再丢弃)
+        let d = Desugarer::new();
+        let forms = parse("(ns my.core (:require [lib]) (:refer [f g]))");
+        let tl = d.desugar_top_level(&forms[0]).unwrap().unwrap();
+        match tl {
+            TopLevel::Namespace(_, requires, refers) => {
+                assert_eq!(requires.len(), 1);
+                assert_eq!(refers, vec![Symbol::new("f"), Symbol::new("g")], ":refer 列表应保留");
+            }
+            _ => panic!("应解析为 Namespace"),
+        }
+    }
+
+    #[test]
+    fn test_ns_import_filtering() {
+        // §25.2/§6.5:跨文件加载按导出表过滤——私有定义不可见,:refer 仅导入列出的公开符号
+        let dir = std::env::temp_dir().join(format!("tisp-ns-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 模块 lib:公开 pub/extra,私有 priv
+        std::fs::write(dir.join("lib.tisp"), "(defn pub [x] x)\n(defn- priv [x] x)\n(defn extra [x] x)\n").unwrap();
+        let d = Desugarer::new();
+        d.set_base_dir(&dir.to_string_lossy());
+        // :refer [pub] → 仅 pub 导入(priv 私有不可见,extra 未列入 refer)
+        let prog = d.desugar_program(parse("(ns my.core (:require [lib]) (:refer [pub]))")).unwrap();
+        let names: Vec<&str> = prog.defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"pub"), "pub 应导入,实际 {:?}", names);
+        assert!(!names.contains(&"priv"), "私有定义不可跨文件引用,实际 {:?}", names);
+        assert!(!names.contains(&"extra"), ":refer 未列出 extra,不应导入,实际 {:?}", names);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_macro_fn_param_hygiene() {
+        // §24.3:fn 参数卫生——模板 (fn [x] x) 的 x 被 freshen,不捕获调用点变量
+        let mut renames = std::collections::HashMap::new();
+        let mut counter = 0;
+        let bindings = std::collections::HashMap::new();
+        let template = crate::reader::read("(fn [x] x)").unwrap().pop().unwrap();
+        let out = substitute_macro_hygienic(&template, &bindings, &mut renames, &mut counter);
+        match &out.node {
+            Expr::List(items) => {
+                if let Expr::Vec(params) = &items[1].node {
+                    if let Expr::Sym(p) = &params[0].node {
+                        assert_ne!(p.as_str(), "x", "fn 参数应被 freshen");
+                    } else { panic!("参数应为 Sym"); }
+                } else { panic!("应解析为 fn"); }
+            }
+            _ => panic!("应为 List"),
+        }
+    }
+
+    #[test]
+    fn test_macro_fn_param_no_collision() {
+        // §24.3:(defmacro m [x] (fn [x] x)) 中 fn 参数 x 不替换为宏实参
+        let mut renames = std::collections::HashMap::new();
+        let mut counter = 0;
+        let mut bindings = std::collections::HashMap::new();
+        bindings.insert(Symbol::new("x"), crate::reader::read("5").unwrap().pop().unwrap());
+        let template = crate::reader::read("(fn [x] x)").unwrap().pop().unwrap();
+        let out = substitute_macro_hygienic(&template, &bindings, &mut renames, &mut counter);
+        match &out.node {
+            Expr::List(items) => {
+                if let (Expr::Vec(params), Expr::Sym(body)) = (&items[1].node, &items[2].node) {
+                    if let Expr::Sym(p) = &params[0].node {
+                        assert_eq!(body, p, "body 引用应指向 freshen 后的参数,而非宏实参");
+                    }
+                }
+            }
+            _ => panic!("应为 List"),
+        }
+    }
+
+    #[test]
+    fn test_macro_unquote_substitutes() {
+        // §24.1:~x 内的宏参数应替换为实参
+        let mut renames = std::collections::HashMap::new();
+        let mut counter = 0;
+        let mut bindings = std::collections::HashMap::new();
+        bindings.insert(Symbol::new("x"), crate::reader::read("5").unwrap().pop().unwrap());
+        let template = crate::reader::read("~x").unwrap().pop().unwrap();
+        let out = substitute_macro_hygienic(&template, &bindings, &mut renames, &mut counter);
+        match &out.node {
+            Expr::Unquote(inner) => assert!(matches!(&inner.node, Expr::Int(5)), "~x 应替换为 5"),
+            other => panic!("应保持 Unquote,实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_monadic_forms_desugar() {
+        // §12.6:get-m/put-m/pure/mlet 解析为 Perform/Let(monadic 风格)
+        let d = Desugarer::new();
+        let e = d.desugar_expr(&parse("(get-m)").pop().unwrap()).unwrap();
+        assert!(matches!(e.node, CoreExprNode::Perform(ref op, ref a) if op.as_str() == "get" && a.is_empty()));
+        let e2 = d.desugar_expr(&parse("(put-m 3)").pop().unwrap()).unwrap();
+        assert!(matches!(e2.node, CoreExprNode::Perform(ref op, _) if op.as_str() == "put"));
+        let e3 = d.desugar_expr(&parse("(pure 5)").pop().unwrap()).unwrap();
+        assert!(matches!(e3.node, CoreExprNode::Lit(Literal::I64(5))));
+        let e4 = d.desugar_expr(&parse("(mlet [x (get-m)] x)").pop().unwrap()).unwrap();
+        assert!(matches!(e4.node, CoreExprNode::Let(..)), "mlet 应 desugar 为 Let");
+    }
 }
 
 #[cfg(test)]
@@ -3016,6 +3978,188 @@ mod pi_tests {
             &[],
         ).unwrap();
         assert!(matches!(t2, Type::Sigma(..)), "expected Sigma, got {:?}", t2);
+    }
+
+    #[test]
+    fn test_fun_arrow_with_six_dim() {
+        let d = Desugarer::new();
+        // (i64 -> i64) → Type::Fun(param, default, ret)
+        let t = d.desugar_type_with_params(
+            &crate::reader::read("(i64 -> i64)").unwrap().pop().unwrap(),
+            &[],
+        ).unwrap();
+        assert!(matches!(t, Type::Fun(..)), "expected Fun, got {:?}", t);
+        // (i64 ->[IO, rho1, @1, out, nondet] i64) → Type::Fun 带六维注解
+        let t2 = d.desugar_type_with_params(
+            &crate::reader::read("(i64 ->[IO, rho1, @1, out, nondet] i64)").unwrap().pop().unwrap(),
+            &[],
+        ).unwrap();
+        if let Type::Fun(_, ann, _) = &t2 {
+            assert_eq!(ann.grade, tisp_core::types::Grade::One);
+            assert_eq!(ann.mode, tisp_core::types::Mode::Out);
+            assert_eq!(ann.determinism, tisp_core::types::Determinism::NonDet);
+            assert!(ann.region.is_some());
+            assert_eq!(ann.effects, tisp_core::types::EffectRow::Closed(vec![tisp_core::types::EffectLabel::IO]));
+        } else {
+            panic!("expected Fun with annotation, got {:?}", t2);
+        }
+    }
+
+    #[test]
+    fn test_graded_necessity_type() {
+        let d = Desugarer::new();
+        // (□_level a) → Modal(Necessity(Var(level)), a)
+        let t = d.desugar_type_with_params(
+            &crate::reader::read("(□_level a)").unwrap().pop().unwrap(),
+            &[],
+        ).unwrap();
+        match &t {
+            Type::Modal(tisp_core::types::ModalOp::Necessity(g), inner) => {
+                assert_eq!(*g, tisp_core::types::Grade::Var(tisp_core::symbol::Symbol::new("level")));
+                assert!(matches!(**inner, Type::Con(_)));
+            }
+            other => panic!("expected Modal(Necessity), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tlambda_type_syntax() {
+        let d = Desugarer::new();
+        // (A => B) → TLambda(A, B)
+        let t = d.desugar_type_with_params(
+            &crate::reader::read("(i64 => bool)").unwrap().pop().unwrap(),
+            &[],
+        ).unwrap();
+        match &t {
+            Type::TLambda(p, b) => {
+                assert!(matches!(**p, Type::Con(ref c) if c.name.as_str() == "i64"));
+                assert!(matches!(**b, Type::Con(ref c) if c.name.as_str() == "bool"));
+            }
+            other => panic!("expected TLambda, got {:?}", other),
+        }
+        // (=> B) → TLambda(Unit, B)
+        let t2 = d.desugar_type_with_params(
+            &crate::reader::read("(=> bool)").unwrap().pop().unwrap(),
+            &[],
+        ).unwrap();
+        match &t2 {
+            Type::TLambda(p, b) => {
+                assert!(matches!(**p, Type::Con(ref c) if c.name.as_str() == "Unit"));
+                assert!(matches!(**b, Type::Con(ref c) if c.name.as_str() == "bool"));
+            }
+            other => panic!("expected TLambda(Unit, bool), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_conj_disj_type_literal() {
+        let d = Desugarer::new();
+        // () → Unit
+        let u = d.desugar_type_with_params(&crate::reader::read("()").unwrap().pop().unwrap(), &[]).unwrap();
+        assert!(matches!(u, Type::Con(ref c) if c.name.as_str() == "Unit"), "() 应为 Unit,实际 {:?}", u);
+        // (conj I32 F32) → Tuple
+        let t = d.desugar_type_with_params(&crate::reader::read("(conj i32 f32)").unwrap().pop().unwrap(), &[]).unwrap();
+        match &t {
+            Type::Tuple(ts) => assert_eq!(ts.len(), 2, "conj 应为二元乘积"),
+            other => panic!("conj 应为 Tuple,实际 {:?}", other),
+        }
+        // (disj A B) → Tuple(和类型糖)
+        let s = d.desugar_type_with_params(&crate::reader::read("(disj i32 String)").unwrap().pop().unwrap(), &[]).unwrap();
+        match &s {
+            Type::Tuple(ts) => assert_eq!(ts.len(), 2, "disj 应为二元和类型"),
+            other => panic!("disj 应为 Tuple(糖),实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_deftrait_sugar() {
+        // §草稿 trait 语法糖:(deftrait Demo (defabsmember m)) → defclass Demo (m)
+        let d = Desugarer::new();
+        let prog = d.desugar_program(crate::reader::read("(deftrait Demo (defabsmember get-os-name))").unwrap()).unwrap();
+        assert_eq!(prog.defs.len(), 1);
+        match &prog.defs[0].body.node {
+            tisp_core::core_ast::CoreExprNode::ClassDef(name, tvars, methods, _, _) => {
+                assert_eq!(name.as_str(), "Demo");
+                assert!(tvars.is_empty());
+                assert_eq!(methods.len(), 1);
+                assert_eq!(methods[0].0.as_str(), "get-os-name");
+            }
+            other => panic!("deftrait 应脱糖为 ClassDef,实际 {:?}", other),
+        }
+        // polytrait 带类型参数
+        let prog2 = d.desugar_program(crate::reader::read("(polytrait Demo [a b] (defabsmember m))").unwrap()).unwrap();
+        match &prog2.defs[0].body.node {
+            tisp_core::core_ast::CoreExprNode::ClassDef(name, tvars, methods, _, _) => {
+                assert_eq!(name.as_str(), "Demo");
+                assert_eq!(tvars.len(), 2);
+                assert_eq!(methods[0].0.as_str(), "m");
+            }
+            other => panic!("polytrait 应脱糖为带参 ClassDef,实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_type_def_form() {
+        let d = Desugarer::new();
+        // (type Result (disj Ok Err)) → defdata with constructors Ok/Err(和类型 ADT 糖)
+        let prog = d.desugar_program(crate::reader::read("(type Result (disj Ok Err))").unwrap()).unwrap();
+        assert_eq!(prog.data_decls.len(), 1);
+        assert_eq!(prog.data_decls[0].name.as_str(), "Result");
+        assert_eq!(prog.data_decls[0].constructors.len(), 2);
+        assert_eq!(prog.data_decls[0].constructors[0].name.as_str(), "Ok");
+        assert_eq!(prog.data_decls[0].constructors[1].name.as_str(), "Err");
+    }
+
+    #[test]
+    fn test_type_alias_substitution() {
+        let d = Desugarer::new();
+        // (type Pair (conj i32 f32)) → 别名 Pair = Tuple(i32, f32)
+        let _ = d.desugar_program(crate::reader::read("(type Pair (conj i32 f32))").unwrap()).unwrap();
+        let t = d.desugar_type_with_params(&crate::reader::read("Pair").unwrap().pop().unwrap(), &[]).unwrap();
+        match &t {
+            Type::Tuple(ts) => assert_eq!(ts.len(), 2, "Pair 应替换为 Tuple"),
+            other => panic!("Pair 应替换为 Tuple,实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_defpoly_where_parsing() {
+        let d = Desugarer::new();
+        // (defpoly Pair [a b where Number] (conj a b)) → 别名 Pair[a,b]=Tuple(a,b),约束 [Number]
+        let _ = d.desugar_program(crate::reader::read("(defpoly Pair [a b where Number] (conj a b))").unwrap()).unwrap();
+        let (tvars, constraints, body) = d.type_aliases.borrow().get(&Symbol::new("Pair")).cloned().unwrap();
+        assert_eq!(tvars.len(), 2, "tvars 应为 [a b]");
+        assert_eq!(constraints.len(), 1, "约束应为 [Number]");
+        assert_eq!(constraints[0].as_str(), "Number");
+        assert!(matches!(body, Type::Tuple(_)), "body 应为 Tuple(conj a b)");
+    }
+
+    #[test]
+    fn test_defpoly_application_substitutes() {
+        let d = Desugarer::new();
+        // (defpoly Pair [a b] (conj a b)) → (Pair i32 f32) 替换 tvars
+        let _ = d.desugar_program(crate::reader::read("(defpoly Pair [a b] (conj a b))").unwrap()).unwrap();
+        let t = d.desugar_type_with_params(&crate::reader::read("(Pair i32 f32)").unwrap().pop().unwrap(), &[]).unwrap();
+        match &t {
+            Type::Tuple(ts) => {
+                assert_eq!(ts.len(), 2);
+                assert!(matches!(&ts[0], Type::Con(c) if c.name.as_str() == "i32"));
+                assert!(matches!(&ts[1], Type::Con(c) if c.name.as_str() == "f32"));
+            }
+            other => panic!("(Pair i32 f32) 应替换为 Tuple(i32, f32),实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_type_with_instance() {
+        let d = Desugarer::new();
+        // (deftrait Show (defabsmember show)) + (type Point (conj i32 i32) (with Show (fn show)))
+        // → Show ClassDef + Point 别名 + Show/Point InstanceDef
+        let prog = d.desugar_program(crate::reader::read(
+            "(deftrait Show (defabsmember show))\n(type Point (conj i32 i32) (with Show (fn show)))",
+        ).unwrap()).unwrap();
+        let has_instance = prog.defs.iter().any(|def| matches!(&def.body.node, tisp_core::core_ast::CoreExprNode::InstanceDef(c, _, _) if c.as_str() == "Show"));
+        assert!(has_instance, "with 子句应产生 Show 的 definstance");
     }
 }
 
@@ -3085,6 +4229,21 @@ mod quote_tests {
     }
 
     #[test]
+    fn test_resource_algebra_keyword_form() {
+        // §11.1 关键字形式:(defresource-algebra Cost :semiring (+ 0 * 1) :order <= :asymptotic true)
+        let d = Desugarer::new();
+        let prog = d.desugar_program(parse(
+            "(defresource-algebra Cost :semiring (+ 0 * 1) :order <= :asymptotic true)")).unwrap();
+        assert_eq!(prog.resource_algebras.len(), 1);
+        let alg = &prog.resource_algebras[0];
+        assert_eq!(alg.name.as_str(), "Cost");
+        assert_eq!(alg.op.as_str(), "+");
+        assert_eq!(alg.unit, "0");
+        assert_eq!(alg.order.as_ref().map(|o| o.as_str()), Some("<="));
+        assert!(alg.asymptotic, "asymptotic 应解析为 true");
+    }
+
+    #[test]
     fn test_dependent_grade_desugar() {
         // §10:数字/符号/复合等级解析;0/1/ω 兼容
         let d = Desugarer::new();
@@ -3128,6 +4287,27 @@ mod quote_tests {
     }
 
     #[test]
+    fn test_typefamily_multi_pattern() {
+        // §9 单声明多模式:(typefamily Elem (List a) a (Pair b c) b) → 两个实例
+        let d = Desugarer::new();
+        let src = "(typefamily Elem (List a) a (Pair b c) b)";
+        let prog = d.desugar_program(parse(src)).unwrap();
+        assert_eq!(prog.type_families.len(), 2, "单声明多模式应生成两个实例,实际 {}", prog.type_families.len());
+        assert_eq!(prog.type_families[0].name.as_str(), "Elem");
+        assert!(matches!(prog.type_families[0].result, Type::Var(_)));
+        assert_eq!(prog.type_families[1].name.as_str(), "Elem");
+    }
+
+    #[test]
+    fn test_rewrite_rule_desugar() {
+        // §9 rewrite 规则:(rewrite Elem (List a) a) 等价于类型族实例
+        let d = Desugarer::new();
+        let prog = d.desugar_program(parse("(rewrite Elem (List a) a)")).unwrap();
+        assert_eq!(prog.type_families.len(), 1);
+        assert_eq!(prog.type_families[0].name.as_str(), "Elem");
+    }
+
+    #[test]
     fn test_mode_sigs_desugar() {
         // §13:defpred 的 :mode (i o) / :mode (o i) 注解写入 CoreDef.mode_sigs
         let d = Desugarer::new();
@@ -3163,7 +4343,7 @@ mod quote_tests {
 impl Desugarer {
     /// §9:解析 (typefamily 名称 参数模式 结果)
     /// 例:(typefamily Elem (List a) a)
-    fn desugar_typefamily_form(&self, items: &[SExpr], span: Span) -> Result<tisp_core::types::TypeFamilyInstance, DesugarError> {
+    fn desugar_typefamily_form(&self, items: &[SExpr], span: Span) -> Result<Vec<tisp_core::types::TypeFamilyInstance>, DesugarError> {
         if items.len() < 4 {
             return Err(DesugarError { message: "typefamily requires name, param pattern, and result type".into(), span });
         }
@@ -3171,22 +4351,37 @@ impl Desugarer {
             Expr::Sym(s) => s.clone(),
             _ => return Err(DesugarError { message: "typefamily name must be a symbol".into(), span: items[1].span }),
         };
-        // 收集模式与结果中的小写符号作为类型变量(Haskell 惯例:小写=变量,大写=构造器)
+        // 收集所有模式/结果中的小写符号作为类型变量(Haskell 惯例:小写=变量,大写=构造器)
         let mut type_params: Vec<Symbol> = Vec::new();
         for item in items.iter().skip(2) {
             self.collect_type_vars(item, &mut type_params);
         }
-        // 参数模式:整个 items[2] 是一个类型模式(如 (List a))
-        let params = vec![self.desugar_type_with_params(&items[2], &type_params)?];
-        let result = self.desugar_type_with_params(&items[3], &type_params)?;
-        Ok(tisp_core::types::TypeFamilyInstance { name, params, result })
+        // §9 多模式单声明:items[2..] 交替为 (模式 结果) 对
+        // (typefamily Elem (List a) a (Pair b c) b) → 两个实例
+        let mut instances = Vec::new();
+        let mut i = 2;
+        while i + 1 < items.len() {
+            let params = vec![self.desugar_type_with_params(&items[i], &type_params)?];
+            let result = self.desugar_type_with_params(&items[i + 1], &type_params)?;
+            instances.push(tisp_core::types::TypeFamilyInstance { name: name.clone(), params, result });
+            i += 2;
+        }
+        if instances.is_empty() {
+            return Err(DesugarError { message: "typefamily requires at least one (pattern result) pair".into(), span });
+        }
+        Ok(instances)
     }
-    /// 收集 SExpr 中的小写开头符号作为类型变量(§9 类型族模式)
+    /// 收集 SExpr 中的小写开头符号作为类型变量(§9 类型族模式;排除内置类型名)
     fn collect_type_vars(&self, expr: &SExpr, out: &mut Vec<Symbol>) {
         match &expr.node {
             Expr::Sym(sym) => {
                 let first = sym.as_str().chars().next();
-                if matches!(first, Some(c) if c.is_ascii_lowercase()) && !out.contains(sym) {
+                let is_builtin = matches!(sym.as_str(),
+                    "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
+                    | "f32" | "f64" | "bool" | "String" | "Unit");
+                if matches!(first, Some(c) if c.is_ascii_lowercase())
+                    && !is_builtin
+                    && !out.contains(sym) {
                     out.push(sym.clone());
                 }
             }
@@ -3213,18 +4408,72 @@ fn substitute_macro_hygienic(
 ) -> SExpr {
     match &template.node {
         Expr::Sym(s) => {
-            if let Some(repl) = bindings.get(s) {
-                repl.clone()
-            } else if let Some(new) = renames.get(s) {
+            // 卫生优先级:模板内新绑定(renames)> 宏参数替换(bindings)
+            if let Some(new) = renames.get(s) {
                 Spanned::new(Expr::Sym(new.clone()), template.span)
+            } else if let Some(repl) = bindings.get(s) {
+                repl.clone()
             } else {
                 template.clone()
             }
         }
         Expr::List(items) => {
-            // let 绑定重命名:模板引入的绑定名加唯一后缀(§24 hygiene)
+            // fn/lambda 参数卫生:模板引入的参数名加唯一后缀(§24 hygiene)
             if let Some(Expr::Sym(head)) = items.first().map(|i| &i.node) {
-                if head.as_str() == "let" && items.len() >= 2 {
+                if (head.as_str() == "fn" || head.as_str() == "lambda") && items.len() >= 3 {
+                    if let Expr::Vec(params) = &items[1].node {
+                        let mut new_params = Vec::new();
+                        for p in params {
+                            match &p.node {
+                                Expr::Sym(n) => {
+                                    if !renames.contains_key(n) {
+                                        *counter += 1;
+                                        let fresh = Symbol::new(&format!("{}_g{}", n, counter));
+                                        renames.insert(n.clone(), fresh.clone());
+                                        new_params.push(Spanned::new(Expr::Sym(fresh), p.span));
+                                    } else if let Some(new) = renames.get(n) {
+                                        new_params.push(Spanned::new(Expr::Sym(new.clone()), p.span));
+                                    } else {
+                                        new_params.push(p.clone());
+                                    }
+                                }
+                                _ => new_params.push(substitute_macro_hygienic(p, bindings, renames, counter)),
+                            }
+                        }
+                        let new_items: Vec<SExpr> = items.iter().enumerate().map(|(idx, item)| {
+                            if idx == 0 {
+                                item.clone()
+                            } else if idx == 1 {
+                                Spanned::new(Expr::Vec(new_params.clone()), item.span)
+                            } else {
+                                substitute_macro_hygienic(item, bindings, renames, counter)
+                            }
+                        }).collect();
+                        return Spanned::new(Expr::List(new_items), template.span);
+                    }
+                }
+                if head.as_str() == "match" && items.len() >= 3 {
+                    // §24.3 match 模式变量卫生:freshen 各 arm 的模式绑定
+                    let scrutinee = substitute_macro_hygienic(&items[1], bindings, renames, counter);
+                    let mut new_items = vec![items[0].clone(), scrutinee];
+                    for arm in &items[2..] {
+                        if let Expr::List(arm_items) = &arm.node {
+                            if let Some(first) = arm_items.first() {
+                                let mut new_arm_items = vec![freshen_pattern(first, renames, counter)];
+                                for rest in &arm_items[1..] {
+                                    new_arm_items.push(substitute_macro_hygienic(rest, bindings, renames, counter));
+                                }
+                                new_items.push(Spanned::new(Expr::List(new_arm_items), arm.span));
+                            } else {
+                                new_items.push(substitute_macro_hygienic(arm, bindings, renames, counter));
+                            }
+                        } else {
+                            new_items.push(substitute_macro_hygienic(arm, bindings, renames, counter));
+                        }
+                    }
+                    return Spanned::new(Expr::List(new_items), template.span);
+                }
+                if matches!(head.as_str(), "let" | "if-let" | "when-let") && items.len() >= 2 {
                     if let Expr::Vec(bs) = &items[1].node {
                         let mut new_bs = Vec::new();
                         let mut i = 0;
@@ -3279,6 +4528,71 @@ fn substitute_macro_hygienic(
                 .collect();
             Spanned::new(Expr::ConsPattern(new_items, Box::new(substitute_macro_hygienic(tail, bindings, renames, counter))), template.span)
         }
+        // §24.1 syntax-quote/unquote 参与宏参数替换:~x 内替换宏参数
+        Expr::SyntaxQuote(inner) => {
+            Spanned::new(Expr::SyntaxQuote(Box::new(substitute_macro_hygienic(inner, bindings, renames, counter))), template.span)
+        }
+        Expr::Unquote(inner) => {
+            Spanned::new(Expr::Unquote(Box::new(substitute_macro_hygienic(inner, bindings, renames, counter))), template.span)
+        }
+        Expr::UnquoteSplice(inner) => {
+            Spanned::new(Expr::UnquoteSplice(Box::new(substitute_macro_hygienic(inner, bindings, renames, counter))), template.span)
+        }
         _ => template.clone(),
     }
 }
+
+/// §24 hygiene:match 模式变量 freshen(构造器名保留,变量/子模式加唯一后缀)
+fn freshen_pattern(
+    pat: &SExpr,
+    renames: &mut std::collections::HashMap<Symbol, Symbol>,
+    counter: &mut usize,
+) -> SExpr {
+    match &pat.node {
+        Expr::Sym(s) => {
+            if s.as_str() == "_" {
+                pat.clone()
+            } else if let Some(new) = renames.get(s) {
+                Spanned::new(Expr::Sym(new.clone()), pat.span)
+            } else {
+                *counter += 1;
+                let fresh = Symbol::new(&format!("{}_g{}", s, counter));
+                renames.insert(s.clone(), fresh.clone());
+                Spanned::new(Expr::Sym(fresh), pat.span)
+            }
+        }
+        Expr::List(items) if !items.is_empty() => {
+            // (Con subpats...):构造器名(首项)保留,子模式 freshen
+            let mut new_items = vec![items[0].clone()];
+            for sub in &items[1..] {
+                new_items.push(freshen_pattern(sub, renames, counter));
+            }
+            Spanned::new(Expr::List(new_items), pat.span)
+        }
+        Expr::Vec(items) => {
+            let new_items: Vec<SExpr> = items.iter().map(|i| freshen_pattern(i, renames, counter)).collect();
+            Spanned::new(Expr::Vec(new_items), pat.span)
+        }
+        Expr::ConsPattern(items, tail) => {
+            let new_items: Vec<SExpr> = items.iter().map(|i| freshen_pattern(i, renames, counter)).collect();
+            Spanned::new(Expr::ConsPattern(new_items, Box::new(freshen_pattern(tail, renames, counter))), pat.span)
+        }
+        _ => pat.clone(),
+    }
+}
+
+/// 判定表达式是否为指定区间端点符号(i0/i1)
+fn is_interval_endpoint(e: &SExpr, name: &str) -> bool {
+    matches!(&e.node, Expr::Sym(s) if s.as_str() == name)
+}
+
+/// §16.3 端点常量值:i0 → false、i1 → true;其余返回 None
+fn endpoint_value_free(e: &SExpr) -> Option<bool> {
+    match &e.node {
+        Expr::Sym(s) if s.as_str() == "i0" => Some(false),
+        Expr::Sym(s) if s.as_str() == "i1" => Some(true),
+        _ => None,
+    }
+}
+
+

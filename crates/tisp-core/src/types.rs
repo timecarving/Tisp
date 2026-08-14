@@ -21,6 +21,10 @@ pub enum Type {
     Pi(Symbol, Box<Type>, Box<Type>),
     /// 依赖对类型 Σ(x : T). R(§19.1)
     Sigma(Symbol, Box<Type>, Box<Type>),
+    /// 类型 λ(tlambda,草稿 type-system):类型级抽象,参数类型 → 返回类型
+    TLambda(Box<Type>, Box<Type>),
+    /// 可变引用(§统一内存管理):Ref a 分级值(1 线性可变 / ω 共享读 / 0 擦除)
+    Ref(Box<Type>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -118,6 +122,8 @@ pub struct ResourceAlgebra {
     pub op: Symbol,
     /// 阶(preorder,可无)
     pub order: Option<Symbol>,
+    /// §11.1 `:asymptotic true` — 渐近代价分析(Big-O)
+    pub asymptotic: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -357,6 +363,8 @@ impl std::fmt::Display for Type {
             Type::Interval => write!(f, "I"),
             Type::Pi(name, dom, cod) => write!(f, "Π({} : {}). {}", name, dom, cod),
             Type::Sigma(name, dom, cod) => write!(f, "Σ({} : {}). {}", name, dom, cod),
+            Type::TLambda(param, body) => write!(f, "{} => {}", param, body),
+            Type::Ref(t) => write!(f, "Ref {}", t),
             _ => write!(f, "{:?}", self),
         }
     }

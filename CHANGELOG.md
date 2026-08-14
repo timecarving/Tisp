@@ -9,6 +9,78 @@
 
 ### 新增
 
+**统一内存管理(unified-memory-management)**
+- 归档 4 个已完成变更,同步 7 个新能力到主规范(18 specs 通过)
+- `Type::Ref(Box<Type>)` 变体 + Display + reduce_families + unify 接线
+- `ref`/`deref`/`set!` 内置建模为 State 效应操作(区别于 Unsafe 的 ptr-read/write),带悬垂检测
+- `ref : i64 -> Ref i64`、`deref : Ref i64 -> i64`、`set! : Ref i64 -> i64 -> Unit` 类型签名接线,`(ref 42)` 源码端到端 typecheck 通过
+
+**全链路补齐(complete-full-chain)**
+- 范式解释器接线:24 范式经 `ParadigmRegistry` 接入 interpreter,注册为 `pf-*` 内置(如 `(pf-array-sum [1 2 3])` → 6),`Value ↔ ParadigmValue` 转换,从源码 `--run` 端到端可用
+- 范式类型接线:type_infer 补 24 个 `pf-*` 单态签名,`--typecheck` 端到端通过
+- HoTT 完整立方填充:HComp 边界不一致报错(替换静默返回一端)+ hott.rs `kan_fill_2d` 2 维 Kan
+- 真实自动机:`dfa-accept` 内置接线 `programming::Dfa`(替换 sum%2 占位),源码端到端识别
+- 状态修正:六维注解/私有定义/deriving Ord/□_r◇_ε Modal unify/@Cost 渐近/r+s 依赖等级/□_t 稳定类型/统一约束求解/演算迹等价 核验已实现,status ⚠️→✅
+
+**范式集成(paradigm-integration)**
+- 可接入接口:`ParadigmFacility`(keyword/type_con/effects/eval)+ `ParadigmRegistry` 统一插接入口(tisp-runtime/src/facility.rs)
+- 21+ 范式一等化:12 逻辑范式 + EVOLP/DLP/MOP + 8 编程范式 + AOP 注册为带类型/效应元数据的可接入设施
+- 跨范式组合:经统一 `ParadigmValue` 抽象传递(如 stream-take → array-sum),副作用接入效应行(State/Search/Signal)
+
+**全链路范式与 AOP(full-chain-paradigms-aop)**
+- 8 类编程范式(组合优先,纯声明式副作用管理):数组(多维 + 归约)、栈(纯函数栈操作)、连接式(点自由组合)、符号(代换/化简)、自动机(DFA)、状态机(事件驱动)、数据驱动(分发表)、基于流(惰性数据流)(tisp-runtime/src/programming.rs)
+- AOP:aspect/pointcut/advice 编织(before/after/around),基于编译器纯声明式 MOP,无运行时反射(tisp-runtime/src/aop.rs)
+- 全链路补齐语义助手:□_r/◇_ε 分级模态推理、Cost 渐近代价(Big-O)、时序稳定类型、区域逃逸检查、HoTT 完整立方填充(tisp-runtime/src/full_chain.rs)
+
+**Everything-as-ADT 逻辑编程扩展(evolp-dlp-mop)**
+- Everything-as-ADT:`Rule`/`Program`/`EvolInstr` 一等不可变数据模型(tisp-core/src/evolp.rs),规则/程序可绑定/传递/匹配/增删查
+- EVOLP:演化指令(assert/retract)+ `evolve` 纯函数 + `foldl` 折叠 + 稳定模型求解器(Gelfond-Lifschitz 约化 + 最小模型)+ `evolve_fixpoint` 不动点
+- DLP:状态序列 + `dynamic_stable_models`(拒绝被后续状态否定的规则 + 约化 + 最小模型)
+- MOP:`GetKB`/`SetKB` 效应操作 + `MetaInterpreter` handler 元解释器 + `compile_time_resolve` 编译期元编程
+- State Effect:`Ref<T>` + `ref_`/`deref_`/`set_` 引用管理(线性写消费句柄)
+- 12 类 LP 范式(组合优先):高阶/ILP/PLP/时序/描述/可废止/模糊/Tabled/一体化/响应式/情境/模态(tisp-runtime/src/paradigms.rs)
+
+**草案方向落地(implement-draft-directions)**
+- 语法 DSL:`::>` 声明式语法定义 + meta-tag(`<tag>`/`\x`/`[]`/`{}`/`[{}]`/`|`)+ 内置字符类 + 扫描器(grammar.rs)
+- 类型 λ:`Type::TLambda` 变体 + `A => B`/`=> B` 类型字面量
+- 多态类型:`(defpoly Name [params where 约束] body)` + 类型别名 + `(Pair i32 f32)` 类型实参替换
+- 和/积类型字面量:`(conj A B)` → Tuple、`(disj A B)` → defdata ADT、`()` → Unit
+- trait 语法糖:`deftrait`/`polytrait` → `defclass`、`defabsmember`/`defmember` → 抽象方法
+
+**全链路缺口补齐(close-full-chain-gaps)**
+- 持久化集合:Vector/Map/Set 改用 im HAMT(结构共享),`Value` 实现结构 Hash/Eq;`conj/assoc/contains?/dissoc/disj` 内置;quote 产生可操作数据
+- TCO:解释器 `apply` 蹦床 + `eval_tail` 尾位置循环(`sum-to 100000` 1MB 栈不溢出);`--run` 改 256MB 栈线程(修深递归 debug 溢出)
+- 五维子类型:`subtype.rs`(det/grade/mode/region 子类型格)+ 确定性子类型接入 determinism_analysis
+- Cost 渐近代价:`grade_le_asymptotic`(Big-O 忽略常数因子)
+- Cohesive:♭/♯ 从直通改为 Flat/Sharp 容器(可区分语义)
+- 时序:稳定类型谓词 `is_stable_type` + always/eventually 类型方案
+- 系统级:ptr-read/ptr-write/region-alloc/with-region 模拟内存 + Unsafe 门控警告
+- 优化器:`opt-level`(内联阈值)+`inline!`(强制内联)+`noinline!` 接线;pragma 数值参数解析修复
+- 反射:`reflect` 内置返回名称/参数/类型/效果/等级/模式/确定性全真实;密码学 XOR 占位输出警告
+- 文本 IR:带参函数签名 + 用户函数 call 指令(替换 `ret i64 0` 占位)
+
+**设计阶段 + 深度缺口补齐(finish-design-stage-features)**
+- 类型类:defclass 支持 `[tvars]`/`:fun-deps`/`:super`;definstance 支持 `(Class T1 T2)` 形式 + fun-deps 冲突/超类检测
+- 依赖会话:defsession 协议体可引用依赖类型(Vec/Pi);Cost 注解 `@Cost` 经 `@` 前缀
+- HoTT:fun-ext/幺半等价内置(有限域枚举)、shape-graph 连通图、dolev-yao 知识合成、hott.rs Interval 接线、HIT 符号端点求解
+- 时序:clock/always/eventually/resample + LTL-as-types(delay : a→(next a)、advance : (next a)→a)
+- deriving 移 desugar:生成 eq-/ord-/show- 函数定义(`--desugar` 可见;未知 trait 报错)
+- dlopen 字符串签名(CString);编译指示解析 + suppress-warning 过滤
+- Prolog:逻辑变量统一 + 递归多解(空解过滤)——递归 `member` 现返回正确解集
+- Monad:直接状态线程(direct_state 状态槽);演算:全演算迹等价
+
+**部分实现补齐(finish-partial-features)**
+- 六维注解:`->[ε,ρ,@r,m,d]` 解析 + `FunAnnotation` 贯通;`CoreDef` 增 region 字段
+- 模块可见性:`defn-`/`def-` 私有 + `CoreDef.visibility` + ns `:refer` 过滤 + 跨文件私有不可见
+- 类型族:单声明多模式 + `rewrite` 形式 + 未声明族报错;类型一等值(显示/模式匹配/六维反射真实化)
+- QTT 隐式绑定默认 0(`{n : T}` → 擦除);资源代数 `:semiring` 关键字形式 + `check_cost_bound`
+- Mercury:内联 `:in/:out` + `infer_modes` 接线 + 同名多模式合并
+- 宏卫生:fn/lambda/if-let/when-let/match 绑定 + `~x` unquote 参与替换
+- 泛型特化:构造器类型驱动 + 多参数 + 接入 `--run`;反射 `type-of/effects-of/grade-of/mode-of/determinism-of` 真实化
+- Monad:`mlet/get-m/put-m/pure` 语法 + 真单处理器/无嵌套检测
+- 逻辑:结构化值统一(Cons)+ 分支 trail 隔离;CLP 乘/除/模收 z + 精确除法 + 线性 `+`/`-`;ALP domain 感知 + `assign` 域相交
+- HIT:结构化边界子句 + 端点唯一一致性 + spec `(i = i0)` 语法;deriving `ord-*`;演算 5 编码 + SKI K 负载修复
+
 **类型系统**
 - 词法与语法:
   - lexer 支持 `,`(分隔符)、`:::`(构造器名)、`⃝`(时态算子,§18.1)
@@ -154,6 +226,18 @@
 - 复现修正:原「递归返回闭包」用例经诊断为无限类型(T = Unit -> T),HM 拒绝为正确行为;有限类型递归返回闭包确认可用
 - 零参 lambda 类型修正:`(fn [] body)` → `Unit -> body`(此前误判为 body 本身,导致递归返回闭包类程序类型错误或误放行)
 - 已知局限(预存在,非本变更引入):多顶层表达式 + 递归的 `--run` 卡死;深递归栈溢出(记录于 04 文档)
+
+**部分实现特性全链路化**
+- §10 符号等级诊断:自由等级变量记录诊断警告(不误报);实施修正:Z3 严格验证对自由变量不成立(任何 count 有 n=0 反例),spec 已同步
+- §16.3 HIT 端点方程可满足性检查(端点常量 i0/i1 等式判定);HComp(KanFill 边界值)/Transp(目标端点传输)真实求值(替换直通)
+- §17 ʃ 路径连通计算(端点相等性判定,替换最小容器)
+- §21.5 CLP 算术约束编译:乘法/除法/模传播器 + all-different 全局约束;修复 add_eq/add_mul 空域冲突处理与 label 传播状态保留
+- §21.6 abduce 多解枚举(全部一致解释)+ 不可满足原因(no-consistent-explanation);修复假设绑定(assign 替代 add_eq 的 id 冲突)
+- §9 类型一等值:Value::Type 变体,reflect-type 返回类型值(绑定/传递/比较)
+- §9 类型族多模式实例归约(遍历同名实例);修复 collect_type_vars 把小写内置类型名(i64 等)误当类型变量
+- §13 多模式自动推断(未声明 :mode 谓词按调用形态收集);修复 walk_calls 重复收集
+- 修复既有缺陷:reflect-type 测试适配、desugar_hott_unary 未用方法清理
+- 新增 9 个单元测试
 
 ### 测试
 

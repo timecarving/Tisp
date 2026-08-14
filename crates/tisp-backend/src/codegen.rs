@@ -105,10 +105,23 @@ impl TextIrGenerator {
             self.next_label = 0;
             self.ir_buf.clear();
 
-            let body_ir = self.compile_expr(&def.body);
+            // §30/§26 函数参数:def 体为 Lam 时生成带参函数签名(可读伪 IR)
+            let (params, body): (Vec<Param>, &CoreExpr) = match &def.body.node {
+                CoreExprNode::Lam(lam) => (lam.params.clone(), lam.body.as_ref()),
+                _ => (vec![], &def.body),
+            };
+            // 绑定参数名到寄存器(伪 IR 中用参数名作寄存器)
+            for p in &params {
+                self.locals.insert(p.name.as_str().to_string(), format!("%{}", p.name.as_str()));
+            }
+            let param_str = params.iter()
+                .map(|p| format!("i64 %{}", p.name.as_str()))
+                .collect::<Vec<_>>().join(", ");
+
+            let body_ir = self.compile_expr(body);
             let fn_ir = format!(
-                "define i64 @{}() {{\nentry:\n{}{}\n}}\n",
-                def.name.as_str(), self.ir_buf, body_ir
+                "define i64 @{}({}) {{\nentry:\n{}{}\n}}\n",
+                def.name.as_str(), param_str, self.ir_buf, body_ir
             );
             ir.push_str(&fn_ir);
         }
@@ -153,25 +166,68 @@ impl TextIrGenerator {
     }
 
     fn compile_app(&mut self, func: &CoreExpr, arg: &CoreExpr) -> String {
-        // Handle curried binary operations: (+ 21 21) = App(App(Var("+"), Lit(21)), Lit(21))
-        // Outer: func = App(Var("+"), Lit(21)), arg = Lit(21)
-        if let CoreExprNode::App(inner_func, inner_arg) = &func.node {
-            if let CoreExprNode::Var(op_name) = &inner_func.node {
-                let lhs_reg = self.eval_to_reg(inner_arg.as_ref());
-                let rhs_reg = self.eval_to_reg(arg);
-                let result = self.fresh_reg();
+        // 收集左结合应用链的全部参数:(f a b) = App(App(f,a),b)
+        let mut args: Vec<&CoreExpr> = vec![arg];
+        let mut head = func;
+        while let CoreExprNode::App(inner_f, inner_a) = &head.node {
+            args.push(inner_a);
+            head = inner_f;
+        }
+        args.reverse();
+
+        match &head.node {
+            // 二元算术运算:(+ a b) → add i64 a, b
+            CoreExprNode::Var(op_name) if matches!(op_name.as_str(), "+" | "-" | "*" | "/") && args.len() == 2 => {
                 let op = match op_name.as_str() {
                     "+" => "add", "-" => "sub", "*" => "mul", "/" => "sdiv",
-                    _ => "add",
+                    _ => unreachable!(),
                 };
-                return format!("  %{} = {} i64 {}, {}\n  ret i64 %{}", result, op, lhs_reg, rhs_reg, result);
+                let lhs_reg = self.eval_to_reg(args[0]);
+                let rhs_reg = self.eval_to_reg(args[1]);
+                let result = self.fresh_reg();
+                format!("  %{} = {} i64 {}, {}\n  ret i64 %{}", result, op, lhs_reg, rhs_reg, result)
             }
+            // §30 用户函数调用(单参或多参)→ call @f(args)(可读伪 IR,替换 ret i64 0 占位)
+            CoreExprNode::Var(fname) => {
+                let arg_regs: Vec<String> = args.iter().map(|a| self.eval_to_reg(a)).collect();
+                let call_args = arg_regs.iter().map(|r| format!("i64 {}", r)).collect::<Vec<_>>().join(", ");
+                let result = self.fresh_reg();
+                format!("  %{} = call i64 @{}({})\n  ret i64 %{}", result, fname.as_str(), call_args, result)
+            }
+            _ => "  ret i64 0".to_string(),
         }
-        "  ret i64 0".to_string()
     }
 
     fn compile_lambda(&mut self, lambda: &Lambda) -> String {
-        self.compile_expr(&lambda.body)
+        // §30 闭包代码生成:检测捕获的自由变量 + 绑定参数(嵌套 lambda 亦正确)
+        let mut referenced = std::collections::HashSet::new();
+        collect_free_vars(&lambda.body, &mut referenced);
+        let mut captured: Vec<String> = referenced.iter()
+            .filter(|r| !lambda.params.iter().any(|p| p.name.as_str() == r.as_str())
+                && !self.locals.contains_key(r.as_str()))
+            .cloned()
+            .collect();
+        captured.sort();
+        // 绑定参数到新寄存器
+        let mut saved: Vec<(String, Option<String>)> = Vec::new();
+        for p in &lambda.params {
+            let reg = self.fresh_reg();
+            let old = self.locals.insert(p.name.as_str().to_string(), format!("%{}", reg));
+            saved.push((p.name.as_str().to_string(), old));
+        }
+        let body_ir = self.compile_expr(&lambda.body);
+        // 恢复外层绑定
+        for (n, old) in saved {
+            match old {
+                Some(v) => { self.locals.insert(n, v); }
+                None => { self.locals.remove(&n); }
+            }
+        }
+        if captured.is_empty() {
+            body_ir
+        } else {
+            format!("  ; closure captures: [{}]\n{}", captured.join(", "), body_ir)
+        }
     }
 
     fn compile_let(&mut self, name: &tisp_core::symbol::Symbol, value: &CoreExpr, body: &CoreExpr) -> String {
@@ -246,6 +302,29 @@ impl TextIrGenerator {
     }
 }
 
+/// 收集表达式中的自由变量名(嵌套 lambda 排除其自身参数)
+fn collect_free_vars(expr: &CoreExpr, out: &mut std::collections::HashSet<String>) {
+    match &expr.node {
+        CoreExprNode::Var(n) => {
+            // 内置运算符不是自由变量(由 compile_app 特判),不计入捕获
+            if !matches!(n.as_str(), "+" | "-" | "*" | "/" | "<" | ">" | "<=" | ">=" | "=" | "!=" | "not=" | "mod") {
+                out.insert(n.as_str().to_string());
+            }
+        }
+        CoreExprNode::App(f, a) => { collect_free_vars(f, out); collect_free_vars(a, out); }
+        CoreExprNode::Lam(l) => {
+            let mut inner = std::collections::HashSet::new();
+            collect_free_vars(&l.body, &mut inner);
+            for p in &l.params { inner.remove(p.name.as_str()); }
+            out.extend(inner);
+        }
+        CoreExprNode::Let(_, _, v, b) => { collect_free_vars(v, out); collect_free_vars(b, out); }
+        CoreExprNode::If(c, t, e) => { collect_free_vars(c, out); collect_free_vars(t, out); collect_free_vars(e, out); }
+        CoreExprNode::Do(es) => { for e in es { collect_free_vars(e, out); } }
+        _ => {}
+    }
+}
+
 /// inkwell 真实 IR 生成(仅 llvm feature)
 #[cfg(feature = "llvm")]
 fn llvm_generate(program: &CoreProgram) -> String {
@@ -294,25 +373,28 @@ fn llvm_generate(program: &CoreProgram) -> String {
                 // 二元运算/比较:(op a b) → App(App(Var(op), a), b)
                 if let CoreExprNode::App(inner_func, inner_arg) = &func_expr.node {
                     if let CoreExprNode::Var(op_name) = &inner_func.node {
-                        let lhs = compile_expr(context, builder, i64_ty, func, funcs, inner_arg, env);
-                        let rhs = compile_expr(context, builder, i64_ty, func, funcs, arg, env);
-                        // 比较结果(i1)统一零扩展为 i64,保证所有值同类型
-                        let cmp = |pred: IntPredicate, name: &str| {
-                            let c = builder.build_int_compare(pred, lhs, rhs, name).unwrap();
-                            builder.build_int_z_extend(c, *i64_ty, name).unwrap()
-                        };
-                        return match op_name.as_str() {
-                            "+" => builder.build_int_add(lhs, rhs, "add").unwrap(),
-                            "-" => builder.build_int_sub(lhs, rhs, "sub").unwrap(),
-                            "*" => builder.build_int_mul(lhs, rhs, "mul").unwrap(),
-                            "/" => builder.build_int_signed_div(lhs, rhs, "div").unwrap(),
-                            "<" => cmp(IntPredicate::SLT, "lt"),
-                            ">" => cmp(IntPredicate::SGT, "gt"),
-                            "<=" => cmp(IntPredicate::SLE, "le"),
-                            ">=" => cmp(IntPredicate::SGE, "ge"),
-                            "=" => cmp(IntPredicate::EQ, "eq"),
-                            _ => lhs,
-                        };
+                        let is_op = matches!(op_name.as_str(), "+" | "-" | "*" | "/" | "<" | ">" | "<=" | ">=" | "=");
+                        if is_op {
+                            let lhs = compile_expr(context, builder, i64_ty, func, funcs, inner_arg, env);
+                            let rhs = compile_expr(context, builder, i64_ty, func, funcs, arg, env);
+                            // 比较结果(i1)统一零扩展为 i64,保证所有值同类型
+                            let cmp = |pred: IntPredicate, name: &str| {
+                                let c = builder.build_int_compare(pred, lhs, rhs, name).unwrap();
+                                builder.build_int_z_extend(c, *i64_ty, name).unwrap()
+                            };
+                            return match op_name.as_str() {
+                                "+" => builder.build_int_add(lhs, rhs, "add").unwrap(),
+                                "-" => builder.build_int_sub(lhs, rhs, "sub").unwrap(),
+                                "*" => builder.build_int_mul(lhs, rhs, "mul").unwrap(),
+                                "/" => builder.build_int_signed_div(lhs, rhs, "div").unwrap(),
+                                "<" => cmp(IntPredicate::SLT, "lt"),
+                                ">" => cmp(IntPredicate::SGT, "gt"),
+                                "<=" => cmp(IntPredicate::SLE, "le"),
+                                ">=" => cmp(IntPredicate::SGE, "ge"),
+                                "=" => cmp(IntPredicate::EQ, "eq"),
+                                _ => unreachable!(),
+                            };
+                        }
                     }
                 }
                 // 用户函数调用:(f a b ...),支持递归;collect_args 收集 func 链上的
@@ -443,6 +525,8 @@ mod tests {
             grade: tisp_core::types::Grade::Omega,
             mode: tisp_core::types::Mode::In,
             determinism: tisp_core::types::Determinism::Det,
+            region: None,
+            visibility: Visibility::Public,
             mode_sigs: vec![],
             body,
             requires: None,
@@ -456,7 +540,7 @@ mod tests {
         // §30:define i64 @main() { 语法正确
         let body = expr(CoreExprNode::Lit(Literal::I64(42)));
         let program = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![],
-            resource_algebras: vec![], defs: vec![def("main", body)] };
+            resource_algebras: vec![], defs: vec![def("main", body)], pragmas: vec![] };
         let ir = IrGenerator::new().generate(&program);
         // 文本生成器以 define 开头;inkwell 输出带 ModuleID 头,统一断言包含定义
         assert!(ir.contains("define i64 @main() {"), "header malformed: {}", ir);
@@ -472,13 +556,38 @@ mod tests {
             Box::new(expr(CoreExprNode::Lit(Literal::I64(21)))),
         ));
         let program = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![],
-            resource_algebras: vec![], defs: vec![def("main", add)] };
+            resource_algebras: vec![], defs: vec![def("main", add)], pragmas: vec![] };
         let ir = IrGenerator::new().generate(&program);
         // LLVM IRBuilder 对常量操作数立即折叠(21+21 → 42,不发射 add 指令)
         #[cfg(feature = "llvm")]
         assert!(ir.contains("ret i64 42"), "expected folded constant: {}", ir);
         #[cfg(not(feature = "llvm"))]
         assert!(ir.contains("= add i64 "), "expected add instruction: {}", ir);
+    }
+
+    #[test]
+    fn test_ir_user_function_call() {
+        // §30 用户函数调用:(add 1 2) → call @add(替换 ret 占位)
+        let p = |name: &str| tisp_core::core_ast::Param {
+            name: Symbol::new(name), ty: None, grade: tisp_core::types::Grade::Omega, mode: tisp_core::types::Mode::In,
+        };
+        let add_body = expr(CoreExprNode::App(
+            Box::new(expr(CoreExprNode::App(Box::new(expr(CoreExprNode::Var(Symbol::new("+")))), Box::new(expr(CoreExprNode::Var(Symbol::new("a"))))))),
+            Box::new(expr(CoreExprNode::Var(Symbol::new("b")))),
+        ));
+        let add_def = def("add", expr(CoreExprNode::Lam(Lambda {
+            params: vec![p("a"), p("b")],
+            body: Box::new(add_body),
+            ret_type: None,
+        })));
+        let call = expr(CoreExprNode::App(
+            Box::new(expr(CoreExprNode::App(Box::new(expr(CoreExprNode::Var(Symbol::new("add")))), Box::new(expr(CoreExprNode::Lit(Literal::I64(1))))))),
+            Box::new(expr(CoreExprNode::Lit(Literal::I64(2)))),
+        ));
+        let program = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![],
+            resource_algebras: vec![], defs: vec![add_def, def("main", call)], pragmas: vec![] };
+        let ir = IrGenerator::new().generate(&program);
+        assert!(ir.contains("call i64 @add"), "expected call @add, got: {}", ir);
     }
 
     #[test]
@@ -494,7 +603,7 @@ mod tests {
             Box::new(expr(CoreExprNode::Lit(Literal::I64(0)))),
         ));
         let program = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![],
-            resource_algebras: vec![], defs: vec![def("main", ife)] };
+            resource_algebras: vec![], defs: vec![def("main", ife)], pragmas: vec![] };
         let ir = IrGenerator::new().generate(&program);
         assert!(ir.contains("phi i64"), "expected phi: {}", ir);
         // 每处 ret i64 %N 引用的寄存器都有定义
@@ -504,5 +613,29 @@ mod tests {
                 assert!(ir.contains(&format!("%{} = ", rest)), "ret references undefined %{}", rest);
             }
         }
+    }
+
+    #[test]
+    fn test_ir_closure_capture() {
+        // 嵌套 lambda:外层 (fn [x] (fn [z] (+ x y))) —— 内层闭包捕获自由变量 y(x 是外层参数,在 locals 中)
+        let add_xy = expr(CoreExprNode::App(
+            Box::new(expr(CoreExprNode::App(Box::new(expr(CoreExprNode::Var(Symbol::new("+")))), Box::new(expr(CoreExprNode::Var(Symbol::new("x"))))))),
+            Box::new(expr(CoreExprNode::Var(Symbol::new("y")))),
+        ));
+        let inner = expr(CoreExprNode::Lam(Lambda {
+            params: vec![Param { name: Symbol::new("z"), ty: None, grade: tisp_core::types::Grade::Omega, mode: tisp_core::types::Mode::In }],
+            body: Box::new(add_xy),
+            ret_type: None,
+        }));
+        let outer = expr(CoreExprNode::Lam(Lambda {
+            params: vec![Param { name: Symbol::new("x"), ty: None, grade: tisp_core::types::Grade::Omega, mode: tisp_core::types::Mode::In }],
+            body: Box::new(inner),
+            ret_type: None,
+        }));
+        let program = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![],
+            resource_algebras: vec![], defs: vec![def("main", outer)], pragmas: vec![] };
+        let ir = IrGenerator::new().generate(&program);
+        // 内层闭包捕获自由变量 y(x 是外层参数已绑定,不在捕获列)
+        assert!(ir.contains("closure captures: [y]"), "expected closure capture annotation, got: {}", ir);
     }
 }

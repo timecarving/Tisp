@@ -1,0 +1,49 @@
+0(灵感 参考System F量化类型，讲类型多态化 我考虑讲多态类型和lambda-calculus融合 创立了基于类型的lambda-calculus
+
+(1 tlambda 类型lambda 属于polymorph type
+  (1 tif
+  (2 tequal
+  (3 tlamdba
+  (4 tvector
+  (5 tunpack
+  (6 tmeta:get-trait-of
+  (7 tmeta:impl-trait-in
+  (8 make-unmatchable-type-subset  设置一个最小的类型 没有任何重量 只用于表达不能匹配
+  (9 make-matchable-type-subset 设置一个最小的类型 没有任何重量 表达这个类型可以匹配
+  ..... 无穷多 还没有定论 可以暂时使用伪代码表示逻辑
+  (final!! tlambda可以作为编译时变量!和参数!使用! 作为变量用绑定的polytype别名 作为参数请用 'x where type-lambda 并且是特定的语法 不能有多个where约束条件
+  (warning 请注意区分编译语义和运行时语义 tlambda 只支持静态语义 只能通过[]和类型系统通信 暂时无法处置动态变量
+
+(2 polymorph type
+(defpoly Demo01
+  (tlambda ['a : I8 'b where AnyType]
+    (if (eqv? (tsystem-ext:get-os-info) "Linux")
+        (tmeta:impl-trait-in 'b (defmemeber get-os-name/*code*/))
+	(tmeta:impl-trait-in 'b (defmember get-os-name /*code*/)))))
+(deftrait Demo02
+  (defabsmember get-os-name))
+(call-member Demo01[00 Demo02] get-os-name) => Linux
+
+
+(defpoly Demo03
+  ['a 'b 'c 'd 'e where Number,BiggerThan[60]]
+  (def-field .....)
+  (def-member .....)
+  .......) ;;;就像不同的泛型函数一样 最后在使用的使用应用[]并且匹配上面的参数即可
+
+(deftype A B) ;;;别名
+
+;;;可以以此实现ADT GADT等
+
+
+(3 普通类型
+(deftype A B) ;;;别名
+(deftype  TypeDemo01
+  (def-field ....)
+  (def-member ....)
+  ....)
+
+//Todo 高级依赖类型
+
+
+请遵循Church's Simply typed lambda calculus,Curry-Howard correspondence

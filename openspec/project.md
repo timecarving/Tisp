@@ -6,7 +6,7 @@
 ## 1. 项目概述
 
 **Tisp 0.1.0** — 基于静态类型、纯声明式、系统级定位的 Lisp 方言。
-Rust workspace 实现,6 个 crate,当前 117 个单元测试,零编译警告。
+Rust workspace 实现,6 个 crate,当前 319 个单元测试,零编译警告。
 
 核心设计思想(详见 `docs/spec.md` §2 与 `standard_doc/INDEX.md`):
 
@@ -84,7 +84,7 @@ crates/
 
 ```bash
 cargo build --release            # 构建
-cargo test --workspace           # 117 个测试
+cargo test --workspace           # 319 个测试
 cargo check --workspace          # 应 0 警告
 
 ./target/release/tisp --run examples/hello.tisp      # 解释运行

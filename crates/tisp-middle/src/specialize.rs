@@ -1,39 +1,46 @@
-//! 泛型编译期特化(§22.4):对 GenericDef 的 ground 字面量调用,
-//! 匹配对应 defmethod 的 Literal 模式,生成特化 def 并替换调用点。
+//! 泛型编译期特化(§22.4):对 GenericDef 的构造器类型调用,
+//! 匹配对应 defmethod 的 Con(构造器类型)模式,生成特化 def 并替换调用点。
 //! 未特化调用保持运行时分发(现有 generic_table 语义)。
 
 use std::collections::HashMap;
-use tisp_core::core_ast::{CoreDef, CoreExpr, CoreExprNode, CoreProgram, Literal, Pattern};
+use tisp_core::core_ast::{CoreDef, CoreExpr, CoreExprNode, CoreProgram, Lambda, Literal, Param, Pattern, Visibility};
 use tisp_core::symbol::Symbol;
 
 pub struct Specializer {
     /// 特化数量(统计输出)
     pub specialized: usize,
+    /// 构造器名 → 类型名(用于把调用点构造器映射到方法模式类型)
+    ctor_types: HashMap<String, String>,
 }
 
 impl Specializer {
     pub fn new() -> Self {
-        Self { specialized: 0 }
+        Self { specialized: 0, ctor_types: HashMap::new() }
     }
 
     /// 对程序执行泛型特化,返回特化后的程序
     pub fn specialize(&mut self, program: &CoreProgram) -> CoreProgram {
         self.specialized = 0;
-        // 1) 收集方法表:generic → [(模式, body)]
-        let mut methods: HashMap<String, Vec<(Pattern, CoreExpr)>> = HashMap::new();
+        // 构造器 → 类型映射(§22.4 类型驱动特化)
+        self.ctor_types.clear();
+        for decl in &program.data_decls {
+            for ctor in &decl.constructors {
+                self.ctor_types.insert(ctor.name.as_str().to_string(), decl.name.as_str().to_string());
+            }
+        }
+        // 1) 收集方法表:generic → [(模式列表, body)]
+        let mut methods: HashMap<String, Vec<(Vec<Pattern>, CoreExpr)>> = HashMap::new();
         for def in &program.defs {
             if let CoreExprNode::MethodDef(gen, _cat, patterns, body) = &def.body.node {
-                if let Some(p) = patterns.first() {
-                    methods.entry(gen.as_str().to_string()).or_default()
-                        .push((p.clone(), (**body).clone()));
-                }
+                methods.entry(gen.as_str().to_string()).or_default()
+                    .push((patterns.clone(), (**body).clone()));
             }
         }
         if methods.is_empty() {
             return program.clone();
         }
 
-        // 2) 遍历 defs,特化字面量调用
+        // 2) 遍历 defs,特化构造器类型调用
         let mut spec_defs: Vec<CoreDef> = Vec::new();
         let mut new_defs = Vec::new();
         let mut next_id = 0usize;
@@ -48,6 +55,8 @@ impl Specializer {
                 mode: def.mode.clone(),
                 mode_sigs: def.mode_sigs.clone(),
                 determinism: def.determinism.clone(),
+                region: def.region.clone(),
+                visibility: def.visibility.clone(),
                 body,
                 requires: def.requires.clone(),
                 ensures: def.ensures.clone(),
@@ -61,21 +70,22 @@ impl Specializer {
             type_families: program.type_families.clone(),
             resource_algebras: program.resource_algebras.clone(),
             defs: new_defs,
+            pragmas: vec![],
         }
     }
 
-    /// 递归重建表达式:泛型字面量调用 → 特化 def 调用
+    /// 递归重建表达式:泛型构造器类型调用 → 特化 def 调用
     fn specialize_body(
         &mut self,
         expr: &CoreExpr,
-        methods: &HashMap<String, Vec<(Pattern, CoreExpr)>>,
+        methods: &HashMap<String, Vec<(Vec<Pattern>, CoreExpr)>>,
         next_id: &mut usize,
     ) -> (CoreExpr, Vec<CoreDef>) {
         let span = expr.span.clone();
         let mut specs = Vec::new();
         let node = match &expr.node {
             CoreExprNode::App(f, arg) => {
-                // 柯里化链:收集 (callee, args);callee 是泛型且唯一实参是字面量
+                // 柯里化链:收集 (callee, args)
                 let mut chain: Vec<&CoreExpr> = vec![arg];
                 let mut cur = f;
                 while let CoreExprNode::App(inner_f, inner_a) = &cur.node {
@@ -84,43 +94,55 @@ impl Specializer {
                 }
                 if let CoreExprNode::Var(name) = &cur.node {
                     if let Some(ms) = methods.get(name.as_str()) {
-                        if chain.len() == 1 {
-                            if let CoreExprNode::Lit(lit) = &chain[0].node {
-                                // 匹配 Literal 模式
-                                if let Some((_, body)) = ms.iter().find(|(p, _)| match (p, lit) {
-                                (Pattern::Lit(Literal::I64(a)), Literal::I64(b)) => a == b,
-                                (Pattern::Lit(Literal::I32(a)), Literal::I32(b)) => a == b,
-                                (Pattern::Lit(Literal::Bool(a)), Literal::Bool(b)) => a == b,
-                                (Pattern::Lit(Literal::String(a)), Literal::String(b)) => a == b,
-                                _ => false,
-                            }) {
-                                    *next_id += 1;
-                                    let spec_name = Symbol::new(&format!("{}__spec_{}", name, next_id));
-                                    let spec_def = CoreDef {
-                                        name: spec_name.clone(),
-                                        ty: None,
-                                        effects: tisp_core::types::EffectRow::Pure,
-                                        grade: tisp_core::types::Grade::Omega,
-                                        mode: tisp_core::types::Mode::In,
-                                        mode_sigs: vec![],
-                                        determinism: tisp_core::types::Determinism::Det,
-                                        body: body.clone(),
-                                        requires: None,
-                                        ensures: None,
-                                        span: span.clone(),
-                                    };
-                                    specs.push(spec_def);
-                                    self.specialized += 1;
-                                    // 调用替换为 (spec_name Unit)(特化 def 无参)
-                                    return (CoreExpr::new(
-                                        CoreExprNode::App(
-                                            Box::new(CoreExpr::new(CoreExprNode::Var(spec_name), span.clone())),
-                                            Box::new(CoreExpr::new(CoreExprNode::Lit(tisp_core::core_ast::Literal::Unit), span.clone())),
-                                        ),
-                                        span,
-                                    ), specs);
-                                }
+                        // §22.4 类型驱动:多参数构造器类型匹配
+                        if let Some((patterns, body)) = ms.iter().find(|(pats, _)| {
+                            pats.len() == chain.len()
+                                && pats.iter().zip(&chain).all(|(pat, arg)| self.pat_matches(pat, arg))
+                        }) {
+                            let bound_vars: Vec<Symbol> = patterns.iter().flat_map(pattern_vars).collect();
+                            *next_id += 1;
+                            let spec_name = Symbol::new(&format!("{}__spec_{}", name, next_id));
+                            let spec_body = if bound_vars.is_empty() {
+                                body.clone()
+                            } else {
+                                let params: Vec<Param> = bound_vars.iter().map(|v| Param {
+                                    name: v.clone(),
+                                    ty: None,
+                                    grade: tisp_core::types::Grade::Omega,
+                                    mode: tisp_core::types::Mode::In,
+                                }).collect();
+                                CoreExpr::new(CoreExprNode::Lam(Lambda {
+                                    params,
+                                    body: Box::new(body.clone()),
+                                    ret_type: None,
+                                }), span.clone())
+                            };
+                            let spec_def = CoreDef {
+                                name: spec_name.clone(),
+                                ty: None,
+                                effects: tisp_core::types::EffectRow::Pure,
+                                grade: tisp_core::types::Grade::Omega,
+                                mode: tisp_core::types::Mode::In,
+                                mode_sigs: vec![],
+                                determinism: tisp_core::types::Determinism::Det,
+                                region: None,
+                                visibility: Visibility::Public,
+                                body: spec_body,
+                                requires: None,
+                                ensures: None,
+                                span: span.clone(),
+                            };
+                            specs.push(spec_def);
+                            self.specialized += 1;
+                            // 调用替换为 (spec_name a1 ... an)
+                            let mut call = CoreExpr::new(CoreExprNode::Var(spec_name), span.clone());
+                            for a in &chain {
+                                call = CoreExpr::new(
+                                    CoreExprNode::App(Box::new(call), Box::new((**a).clone())),
+                                    span.clone(),
+                                );
                             }
+                            return (call, specs);
                         }
                     }
                 }
@@ -156,7 +178,7 @@ impl Specializer {
             CoreExprNode::Lam(lam) => {
                 let (b2, s) = self.specialize_body(&lam.body, methods, next_id);
                 specs.extend(s);
-                CoreExprNode::Lam(tisp_core::core_ast::Lambda {
+                CoreExprNode::Lam(Lambda {
                     params: lam.params.clone(),
                     body: Box::new(b2),
                     ret_type: lam.ret_type.clone(),
@@ -165,5 +187,43 @@ impl Specializer {
             other => other.clone(),
         };
         (CoreExpr::new(node, span), specs)
+    }
+
+    /// 方法模式是否匹配调用实参:Lit 匹配字面量;Con(type) 要求实参为构造器应用且构造器类型名匹配
+    fn pat_matches(&self, pat: &Pattern, arg: &CoreExpr) -> bool {
+        match (pat, &arg.node) {
+            (Pattern::Lit(Literal::I64(a)), CoreExprNode::Lit(Literal::I64(b))) => a == b,
+            (Pattern::Lit(Literal::I32(a)), CoreExprNode::Lit(Literal::I32(b))) => a == b,
+            (Pattern::Lit(Literal::Bool(a)), CoreExprNode::Lit(Literal::Bool(b))) => a == b,
+            (Pattern::Lit(Literal::String(a)), CoreExprNode::Lit(Literal::String(b))) => a == b,
+            (Pattern::Con(type_name, _), _) => {
+                if let Some(ctor) = app_head(arg) {
+                    self.ctor_types.get(ctor.as_str()).map_or(false, |t| t == type_name.as_str())
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+/// 展开应用链取最内层 Var(构造器/函数名)
+fn app_head(expr: &CoreExpr) -> Option<&Symbol> {
+    match &expr.node {
+        CoreExprNode::Var(name) => Some(name),
+        CoreExprNode::App(f, _) => app_head(f),
+        _ => None,
+    }
+}
+
+/// 提取模式中绑定的变量名(特化 def 的参数)
+fn pattern_vars(pat: &Pattern) -> Vec<Symbol> {
+    match pat {
+        Pattern::Var(n) => vec![n.clone()],
+        Pattern::Con(_, subs) => subs.iter().flat_map(pattern_vars).collect(),
+        Pattern::Tuple(subs) => subs.iter().flat_map(pattern_vars).collect(),
+        Pattern::Or(subs) => subs.iter().flat_map(pattern_vars).collect(),
+        _ => vec![],
     }
 }

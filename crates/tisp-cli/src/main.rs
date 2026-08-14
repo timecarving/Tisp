@@ -151,6 +151,7 @@ fn compile_file(path: &str, cli: &Cli) -> miette::Result<()> {
         grade_checker.check_program(&core_program)
             .map_err(|e| miette::miette!("{}", e))?;
 
+
         // Hole reporting
         if !type_infer.hole_env.is_empty() {
             println!("{}", type_infer.hole_env.report());
@@ -189,23 +190,34 @@ fn compile_file(path: &str, cli: &Cli) -> miette::Result<()> {
 
         // Optimization
         let mut optimizer = tisp_middle::optimize::optimizer::Optimizer::new();
+        // §30 编译指示接线:opt-level 调内联阈值、inline! 强制内联、noinline! 禁止内联
+        optimizer.configure(&core_program.pragmas);
         let opt_program = optimizer.optimize(&specialized_program);
         println!("; optimizations: {} inlined, {} folded, {} dead-eliminated",
                  optimizer.stats.inlined, optimizer.stats.folded, optimizer.stats.dead_eliminated);
         println!("; program size: {} defs → {} defs after optimization",
                  core_program.defs.len(), opt_program.defs.len());
 
-        // Liquid type verification (§15):精化类型 + 契约(Z3 求解)
+        // Liquid type verification (§15):精化类型 + 契约 + §10 符号等级不等式(Z3 求解)
         let mut liquid_verifier = tisp_backend::liquid_verify::LiquidVerifier::new();
-        let liquid_report = liquid_verifier.verify_program(&core_program);
+        liquid_verifier.verify_program(&core_program);
+        liquid_verifier.verify_grade_inequalities(&grade_checker.inequalities);
+        let liquid_report = liquid_verifier.report().clone();
         if liquid_report.degraded {
             println!("; liquid types: z3 solver unavailable, degraded to constant folding (apt install z3)");
         } else {
             println!("; liquid types: {} verified, {} violated, {} warned",
                      liquid_report.verified, liquid_report.violated, liquid_report.warned);
         }
-        for err in &liquid_report.errors {
-            eprintln!("liquid type error: {}", err.message);
+        // §30 suppress-warning:抑制指定类别的警告(如 (suppress-warning "liquid"))
+        let suppressed = |cat: &str| {
+            core_program.pragmas.iter().any(|(name, targets)|
+                name.as_str() == "suppress-warning" && targets.iter().any(|t| t.as_str() == cat))
+        };
+        if !suppressed("liquid") {
+            for err in &liquid_report.errors {
+                eprintln!("liquid type error: {}", err.message);
+            }
         }
         if liquid_report.violated > 0 {
             miette::bail!("liquid type verification failed: {} violation(s)", liquid_report.violated);
@@ -217,17 +229,32 @@ fn compile_file(path: &str, cli: &Cli) -> miette::Result<()> {
 
     // Run program
     if cli.run {
-        let mut interpreter = tisp_backend::interpreter::Interpreter::new();
-        match interpreter.run_program(&core_program) {
+        // §22.4 泛型编译期特化接入执行路径(非仅 --typecheck 展示)
+        let mut specializer = tisp_middle::specialize::Specializer::new();
+        let run_program = specializer.specialize(&core_program);
+        // §8.2 在较大栈线程中执行:debug 构建下 eval_expr 是巨型函数(帧较大),
+        // 深递归会耗尽主线程 8MB 栈;256MB 栈给非尾递归留足余量(尾递归已由 TCO 保证 O(1) 栈)
+        let run_result = std::thread::Builder::new()
+            .name("tisp-run".into())
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let mut interpreter = tisp_backend::interpreter::Interpreter::new();
+                let r = interpreter.run_program(&run_program);
+                let stats = interpreter.region_stats().clone();
+                (r, stats, interpreter.monadic_handles)
+            })
+            .map_err(|e| miette::miette!("failed to spawn interpreter thread: {}", e))?
+            .join()
+            .map_err(|_| miette::miette!("interpreter thread panicked"))?;
+        match run_result.0 {
             Ok(Some(result)) => {
-                let stats = interpreter.region_stats();
                 println!("=> {:?}", result);
-                if interpreter.monadic_handles > 0 {
-                    println!("; monadic optimization (§12.6): {} single-handler handle(s) via direct state passing", interpreter.monadic_handles);
+                if run_result.2 > 0 {
+                    println!("; monadic optimization (§12.6): {} single-handler handle(s) via direct state passing", run_result.2);
                 }
                 println!("; region stats: {} allocs, {} deallocs, {} bytes (peak: {})",
-                         stats.regions_allocated, stats.regions_deallocated,
-                         stats.bytes_allocated, stats.bytes_peak);
+                         run_result.1.regions_allocated, run_result.1.regions_deallocated,
+                         run_result.1.bytes_allocated, run_result.1.bytes_peak);
             },
             Ok(None) => println!("; no main function"),
             Err(e) => miette::bail!("{}", e),
@@ -315,6 +342,7 @@ fn repl(cli: &Cli) -> miette::Result<()> {
             resource_algebras: vec![],
                         effect_decls: effect_decls.clone(),
                         defs: all_defs,
+                        pragmas: vec![],
                     };
                     let mut type_infer = tisp_middle::type_infer::TypeInfer::new();
                     match type_infer.infer_program(&program_all) {
@@ -374,6 +402,7 @@ fn repl(cli: &Cli) -> miette::Result<()> {
             resource_algebras: vec![],
                                 effect_decls: effect_decls.clone(),
                                 defs: all_defs,
+                                pragmas: vec![],
                             };
                             let mut type_infer = tisp_middle::type_infer::TypeInfer::new();
                             match type_infer.infer_program(&program_all) {

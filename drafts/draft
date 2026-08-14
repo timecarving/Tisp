@@ -1,0 +1,62 @@
+基本语法
+<left> ::> <right>
+<left>代表语法结构名称 右边代表语法结构的具体结构
+0( 此语法表示结构基于自动机 理论上的过程是： 具体语法结构会产生一个状态序列 扫描器从目标源文件逐字符扫描后 对字符做状态判断 非特殊形式下 满足状态（即可以开始下一个状态后）的条件就是语法结构的具体语法结构或者具体语法结构的用于表示的字符或者其他东西的本身 然后到下一个状态 自动机会永远持续下去 知道源文件到达尽头 若期间自动机有一个匹配成功就会继续
+1( 在"::> "后的第一个字符即视为语法的具体结构 读到到换行为止(不包括换行)
+2( 在"::> "此后出现的所有非换行字符即视为语法的具体结构
+3( 特殊形式
+  1( 被"<>"包裹的标签 为元标签 视为指向内部存在的同名语法结构状态 满足的方法就是必须要满足这个标签代表的具体语法结构 数量接收单个
+  2( 被"\"开头后面接单个字符的 状态满足的方法是"\"后面字符的必须要在扫描这个产生的状态的过程中找到并且匹配 数量接收单个
+  3( 被"[]"包裹的 视为可选 在扫描这个产生的状态的过程中 状态满足的方法是这个具体语法结构是可选地(即可以有也可以没有)匹配语法结构或者语法具体结构 接收单个
+  4( 被"{}" 包裹的接收重复的不定数量的 该具体语法结构接受扫描器扫描到的 1到多个不定数量的语法结构或者语法具体结构 接收多个 满足状态是 当扫描器扫描这个产生的状态后 数量有了一个后扫描器不符合 代表满足状态 数量一个都没有扫描器扫描这个状态不符合 代表 不满足状态
+  5( "|"谓词 用于表达逻辑或 注意了 在具体语法结构中"|"极其后面根据空格(注意了是具体语法结构的空格不是扫描器的扫描到的空格)分割的两个具体语法结构或者语法结构 将会视为逻辑"或"本体也就是一整个具体语法结构 当扫描器扫描到这个产生的状态的时候 只要有一个能够匹配后面两个语法或者具体语法元素产生的状态 即视为与这个整体的产生的状态匹配 example : | a b 
+  6( "<nonterm> "形式 一般用于这种形式来代替具体语法结构的空格 代表在扫描这个产生的状态的过程中可以遇到一个或者多个 空格 换行等 满足状态是 当扫描器扫描这个产生的状态后 数量有了一个后扫描器不符合 代表 满足状态 数量一个都没有扫描器扫描这个状态不符合主不满足状态
+  7( multi|谓词 和“|” 谓词一样 不过呢用于表达多个 和上面语义完全一致 就是|谓词拼接了好两个及以上的| 唯一的语义不同点是 接收countof("|")+1个具体语法结构或者语法结构代表可选的 example: || a b c 或者是  ||| a b c d  | a b
+  8( "[{}]" 包裹特化 接受的和“{}”一致 用于特化表示 接受0个到多个的情况
+  note: 当然你不嫌麻烦也可以使用Lisp式的列表 即 | a | b | c | d | e <error>
+4( 编译器可以内建meta-tag 以下是必须内建的
+  <error> 状态满足条件 永远不满足 只要展开到了这里就一定不满足条件 就一定停止就会报错
+5( 本语法表示的扫描过程永远假设语法是正确的 上述的所有扫描过程都不涉及对语法表示本身的语法合规性的判断 请不要搞混扫描过程的合规性和语法本身的合规性
+
+note: 语法结构指的是"具体语法结构"的代指 例如说<letter> 是left的元素 而语法具体结构指右边的 就是会产生状态序列的
+为了防止歧义 整个语法结构本身和具体语法结构的表示统一采用ASCII编码 如果想要其他字符支持请让实现的先实现内建的meta-tag
+
+----------------------------------------------------------------------------
+内置meta tag:
+<ztonLetter> 表示匹配任一的从0到9的字符
+<atozLetter> 表示匹配任一的从a到z的字符
+<AtoZLetter> 表示匹配任一的从A到Z的字符
+<ASCIILetter> 表示A-Z 或者 a-z 或者 0-9
+<ASCIILetterAll> 所有合法的ASCII字符
+<ASCIISpecLetter> 表示 <ASCIILetterAll> 除去了 <ASCIILetter>的部分
+
+identifier ::> | <atozLetter> <AtoZLetter> [{<ASCIILetterAll-Exclude-Quote-Space>}]
+integer ::> [| + -]{<ztonLetter>}
+float ::> [| + -]{<ztonLetter>}.{<ztonLetter>}
+
+number ::> | <integer> <float>
+specialCharacterQuote ::> \\'
+specialStringQuote ::> \\"
+character ::> '[|| <specialStringQuote> <specialCharacterQuote> <ASCIILetterAll-ExcludeQuote>]'
+character语义:
+  其中的ASCIILetterAll-ExcludeQuote是排除了所有引号的
+string ::> "[{ <character> }]"
+string语义：
+  "asdf" yes!
+  "\"" yes!
+  "\"\""yes!
+  "\'\"" yes!
+  "" yes!
+  "'" NO!
+boolean ::> | true false
+emptyList ::> ()
+list ::>  | <emptyList> (<expression><nonterm> .<nonterm> <expression>)
+vector ::> | \[\] \[{<expression>}\]
+datum ::> ||||| <emptyList> <vector> <list> <boolean> <string> <character>
+sexp ::> | <emptyList> (<expression>[{<nonterm> <expression>}])
+
+expression ::> ||| <datum> <identifier> <sexp>
+
+builtinTypeID ::> || String Char I8 I16 I32 I64 U8 U16 u32 I64 F16 F32 F64 Pair
+
+specialForms ::> <sequenceForm> <letForm> <lambdaForm> <letstarForm> <conditionForms> <typeForms> <matchForms>

@@ -163,3 +163,40 @@ impl ModelChecker {
         visited
     }
 }
+
+/// §28 dolev-yao 攻击者:知识集 + 合成规则(窃听/拼接/重放)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DolevYaoAttacker {
+    pub knowledge: Vec<String>,
+}
+
+impl DolevYaoAttacker {
+    pub fn new() -> Self { Self { knowledge: Vec::new() } }
+
+    /// 窃听:把网络传输的消息加入知识(去重有序)
+    pub fn eavesdrop(&mut self, msg: &str) {
+        if !self.knowledge.iter().any(|m| m == msg) {
+            self.knowledge.push(msg.to_string());
+        }
+    }
+
+    /// 合成:拼接任意两条已知消息(攻击者可构造新消息)
+    pub fn synthesize(&mut self) {
+        let known: Vec<String> = self.knowledge.clone();
+        for a in &known {
+            for b in &known {
+                let m = format!("{}_{}", a, b);
+                if !self.knowledge.contains(&m) { self.knowledge.push(m); }
+            }
+        }
+    }
+
+    /// 重放:已窃听的消息可重放
+    pub fn replay(&self, msg: &str) -> bool {
+        self.knowledge.iter().any(|m| m == msg)
+    }
+
+    pub fn knows(&self, msg: &str) -> bool {
+        self.knowledge.iter().any(|m| m == msg)
+    }
+}

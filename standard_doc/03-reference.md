@@ -218,6 +218,7 @@ tisp                                # 进入 REPL
 | `liquid-types-violations.tisp` | 预期报错(退出码非零) | 液态类型负面用例(违反/反例) |
 | `remaining-gaps-demo.tisp` | 综合演示 | 类型族/多模式/cc/反射/特化/宏卫生 |
 | `dependent-linear-test.tisp` | 验证通过 | 依赖线性类型(等级表达式) |
+| `partial-completion-demo.tisp` | 综合演示 | CLP 算术/all-different/多解溯因/HoTT/类型一等值 |
 | `phase5-test.tisp` | 定义型(无入口) | 洞/确定性 |
 | `_qtt-test.tisp` | 定义型(无入口) | QTT |
 

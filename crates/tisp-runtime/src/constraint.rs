@@ -133,8 +133,8 @@ impl ConstraintStore {
                 set
             };
             let new_dom = Domain { values: intersection };
-            if new_dom.is_empty() { return false; }
             let mut changed = false;
+            // 空域也更新(空域 = 冲突信号,由 has_empty_domain 检测)
             if let Some(_) = store.domain_of(x) { changed |= store.update_domain(x, new_dom.clone()); }
             if let Some(_) = store.domain_of(y) { changed |= store.update_domain(y, new_dom); }
             changed
@@ -167,6 +167,218 @@ impl ConstraintStore {
             changed
         });
         self.propagators.push(prop);
+    }
+
+    /// Add multiplication constraint: x * y = z(域枚举收缩,教学级)
+    pub fn add_mul(&mut self, x: u64, y: u64, z: u64) {
+        let prop: Propagator = Rc::new(move |store: &mut ConstraintStore| {
+            let mut changed = false;
+            let x_dom = store.domain_of(x).cloned().unwrap_or(Domain::range(0, 0));
+            let y_dom = store.domain_of(y).cloned().unwrap_or(Domain::range(0, 0));
+            let z_dom = store.domain_of(z).cloned().unwrap_or(Domain::range(0, 0));
+            // x 域收缩:存在 y、z 使 x*y = z
+            let new_x = {
+                let mut set = BTreeSet::new();
+                for v in x_dom.iter() {
+                    if y_dom.iter().any(|w| z_dom.contains(v * w)) { set.insert(*v); }
+                }
+                Domain { values: set }
+            };
+            if new_x != x_dom { changed |= store.update_domain(x, new_x); }
+            let x_dom2 = store.domain_of(x).cloned().unwrap_or(Domain::range(0, 0));
+            let new_y = {
+                let mut set = BTreeSet::new();
+                for w in y_dom.iter() {
+                    if x_dom2.iter().any(|v| z_dom.contains(v * w)) { set.insert(*w); }
+                }
+                Domain { values: set }
+            };
+            if new_y != y_dom { changed |= store.update_domain(y, new_y); }
+            // z 域也收缩:z 必须是 x*y 的可能值(结果变量收窄,§21.5)
+            let x_dom3 = store.domain_of(x).cloned().unwrap_or(Domain::range(0, 0));
+            let y_dom3 = store.domain_of(y).cloned().unwrap_or(Domain::range(0, 0));
+            let new_z = {
+                let mut set = BTreeSet::new();
+                for v in x_dom3.iter() {
+                    for w in y_dom3.iter() {
+                        set.insert(v * w);
+                    }
+                }
+                Domain { values: set }
+            };
+            if new_z != z_dom { changed |= store.update_domain(z, new_z); }
+            changed
+        });
+        self.propagators.push(prop);
+    }
+
+    /// Add addition constraint: x + y = z(域枚举收缩)
+    pub fn add_plus(&mut self, x: u64, y: u64, z: u64) {
+        let prop: Propagator = Rc::new(move |store: &mut ConstraintStore| {
+            let mut changed = false;
+            let x_dom = store.domain_of(x).cloned().unwrap_or(Domain::range(0, 0));
+            let y_dom = store.domain_of(y).cloned().unwrap_or(Domain::range(0, 0));
+            let z_dom = store.domain_of(z).cloned().unwrap_or(Domain::range(0, 0));
+            let new_x = {
+                let mut set = BTreeSet::new();
+                for v in x_dom.iter() {
+                    if y_dom.iter().any(|w| z_dom.contains(v + w)) { set.insert(*v); }
+                }
+                Domain { values: set }
+            };
+            if new_x != x_dom { changed |= store.update_domain(x, new_x); }
+            let x2 = store.domain_of(x).cloned().unwrap_or(Domain::range(0, 0));
+            let new_y = {
+                let mut set = BTreeSet::new();
+                for w in y_dom.iter() {
+                    if x2.iter().any(|v| z_dom.contains(v + w)) { set.insert(*w); }
+                }
+                Domain { values: set }
+            };
+            if new_y != y_dom { changed |= store.update_domain(y, new_y); }
+            let y2 = store.domain_of(y).cloned().unwrap_or(Domain::range(0, 0));
+            let new_z = {
+                let mut set = BTreeSet::new();
+                for v in x2.iter() {
+                    for w in y2.iter() {
+                        set.insert(v + w);
+                    }
+                }
+                Domain { values: set }
+            };
+            if new_z != z_dom { changed |= store.update_domain(z, new_z); }
+            changed
+        });
+        self.propagators.push(prop);
+    }
+
+    /// Add subtraction constraint: x - y = z(域枚举收缩)
+    pub fn add_minus(&mut self, x: u64, y: u64, z: u64) {
+        let prop: Propagator = Rc::new(move |store: &mut ConstraintStore| {
+            let mut changed = false;
+            let x_dom = store.domain_of(x).cloned().unwrap_or(Domain::range(0, 0));
+            let y_dom = store.domain_of(y).cloned().unwrap_or(Domain::range(0, 0));
+            let z_dom = store.domain_of(z).cloned().unwrap_or(Domain::range(0, 0));
+            let new_x = {
+                let mut set = BTreeSet::new();
+                for v in x_dom.iter() {
+                    if y_dom.iter().any(|w| z_dom.contains(v - w)) { set.insert(*v); }
+                }
+                Domain { values: set }
+            };
+            if new_x != x_dom { changed |= store.update_domain(x, new_x); }
+            let x2 = store.domain_of(x).cloned().unwrap_or(Domain::range(0, 0));
+            let new_y = {
+                let mut set = BTreeSet::new();
+                for w in y_dom.iter() {
+                    if x2.iter().any(|v| z_dom.contains(v - w)) { set.insert(*w); }
+                }
+                Domain { values: set }
+            };
+            if new_y != y_dom { changed |= store.update_domain(y, new_y); }
+            let y2 = store.domain_of(y).cloned().unwrap_or(Domain::range(0, 0));
+            let new_z = {
+                let mut set = BTreeSet::new();
+                for v in x2.iter() {
+                    for w in y2.iter() {
+                        set.insert(v - w);
+                    }
+                }
+                Domain { values: set }
+            };
+            if new_z != z_dom { changed |= store.update_domain(z, new_z); }
+            changed
+        });
+        self.propagators.push(prop);
+    }
+
+    /// Add division constraint: x / y = z,即 x = y * z(域枚举收缩)
+    pub fn add_div(&mut self, x: u64, y: u64, z: u64) {
+        let prop: Propagator = Rc::new(move |store: &mut ConstraintStore| {
+            let mut changed = false;
+            let x_dom = store.domain_of(x).cloned().unwrap_or(Domain::range(0, 0));
+            let y_dom = store.domain_of(y).cloned().unwrap_or(Domain::range(0, 0));
+            let z_dom = store.domain_of(z).cloned().unwrap_or(Domain::range(0, 0));
+            let new_x = {
+                let mut set = BTreeSet::new();
+                for v in x_dom.iter() {
+                    // 精确除法:须整除(v % w == 0),不把截断值判为满足(§21.5)
+                    if y_dom.iter().any(|w| *w != 0 && v % w == 0 && z_dom.contains(v / w)) { set.insert(*v); }
+                }
+                Domain { values: set }
+            };
+            if new_x != x_dom { changed |= store.update_domain(x, new_x); }
+            let x_dom2 = store.domain_of(x).cloned().unwrap_or(Domain::range(0, 0));
+            let new_y = {
+                let mut set = BTreeSet::new();
+                for w in y_dom.iter() {
+                    if *w != 0 && x_dom2.iter().any(|v| v % w == 0 && z_dom.contains(v / w)) { set.insert(*w); }
+                }
+                Domain { values: set }
+            };
+            if new_y != y_dom { changed |= store.update_domain(y, new_y); }
+            let x_dom3 = store.domain_of(x).cloned().unwrap_or(Domain::range(0, 0));
+            let y_dom3 = store.domain_of(y).cloned().unwrap_or(Domain::range(0, 0));
+            let new_z = {
+                let mut set = BTreeSet::new();
+                for v in x_dom3.iter() {
+                    for w in y_dom3.iter() {
+                        if *w != 0 && v % w == 0 { set.insert(v / w); }
+                    }
+                }
+                Domain { values: set }
+            };
+            if new_z != z_dom { changed |= store.update_domain(z, new_z); }
+            changed
+        });
+        self.propagators.push(prop);
+    }
+
+    /// Add modulo constraint: x mod y = z(域枚举收缩)
+    pub fn add_mod(&mut self, x: u64, y: u64, z: u64) {
+        let prop: Propagator = Rc::new(move |store: &mut ConstraintStore| {
+            let mut changed = false;
+            let x_dom = store.domain_of(x).cloned().unwrap_or(Domain::range(0, 0));
+            let y_dom = store.domain_of(y).cloned().unwrap_or(Domain::range(0, 0));
+            let z_dom = store.domain_of(z).cloned().unwrap_or(Domain::range(0, 0));
+            let new_x = {
+                let mut set = BTreeSet::new();
+                for v in x_dom.iter() {
+                    if y_dom.iter().any(|w| *w != 0 && z_dom.contains(v % w)) { set.insert(*v); }
+                }
+                Domain { values: set }
+            };
+            if new_x != x_dom { changed |= store.update_domain(x, new_x); }
+            changed
+        });
+        self.propagators.push(prop);
+    }
+
+    /// 是否存在空域(约束冲突)
+    pub fn has_empty_domain(&self) -> bool {
+        self.domains.values().any(|d| d.is_empty())
+    }
+
+    /// 单值赋值(提交解,供 label 提交模式)
+    /// §21.6 域相交:值在当前域内则收窄为单值;越界则置空域(冲突信号,排除越界假设)
+    pub fn assign(&mut self, id: u64, v: i64) {
+        match self.domain_of(id).cloned() {
+            Some(dom) => {
+                if dom.contains(v) {
+                    self.update_domain(id, Domain::singleton(v));
+                } else {
+                    self.update_domain(id, Domain::from_slice(&[]));
+                }
+            }
+            None => {
+                self.domains.insert(id, Domain::singleton(v));
+            }
+        }
+    }
+
+    /// 域快照(诊断)
+    pub fn domains_snapshot(&self) -> Vec<(u64, Vec<i64>)> {
+        self.domains.iter().map(|(id, d)| (*id, d.iter().copied().collect())).collect()
     }
 
     /// Run propagation loop (AC-3 style) until fixpoint

@@ -6,3 +6,15 @@ edition.workspace = true
 [dependencies]
 tisp-core.workspace = true
 im.workspace = true
+
+[dependencies.chacha20]
+workspace = true
+optional = true
+
+[dependencies.sha2]
+workspace = true
+optional = true
+
+[features]
+default = []
+crypto = ["dep:chacha20", "dep:sha2"]

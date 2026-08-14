@@ -224,7 +224,7 @@ h : (Int ->[{IO, State Int}] Bool)
 ### 9.4 溯因(ALP,§21.6)⚠️
 
 - `abduce` 节点接线 `AbductionEngine`(hypothesis 生成)
-- 完整 ALP 搜索策略 ⬜
+- 完整 ALP 搜索策略 ✅(abduce-all 多解枚举 + domain 感知)
 
 ---
 
@@ -256,7 +256,7 @@ h : (Int ->[{IO, State Int}] Bool)
 ### 10.3 其他演算 ⚠️
 
 - SKI 组合子、ambients(enter/exit/open)、ρ-calculus(quote/drop/lift)、κ-calculus(bind/unbind/react)节点存在并求值参数 ⚠️
-- 完整语义 ⬜
+- 完整语义 ✅(5 演算编码 + channel_trace/check_trace_equivalence)
 
 ---
 
@@ -322,3 +322,80 @@ tisp --ir examples/run-test.tisp   # 生成文本 LLVM IR
 - `IrGenerator` 生成文本 IR(无 inkwell 依赖):算术/if-phi/let
 - 已修复:函数头语法、phi 寄存器一致性
 - 真编译需 llvm 工具链(llc);函数调用/闭包生成 ⬜
+
+## 15. 声明式语法 DSL 与类型 λ(草案方向)✅
+
+### 15.1 语法 DSL(`::>`)
+
+`::>` 定义「语法结构 → 具体结构」,支持 meta-tag 特殊形式与内置字符类,生成可逐字符匹配的扫描器:
+
+```
+identifier ::> <atozLetter> [{<ASCIILetter>}]
+integer    ::> [| + -]{<ztonLetter>}
+```
+
+- 特殊形式:`<tag>`(元标签)、`\x`(字面)、`[]`(可选)、`{}`(重复 1+)、`[{}]`(重复 0+)、`|`(或)、`<nonterm>`(空白)、`<error>`(永不满足)
+- 内置字符类:`<ztonLetter>`/`<atozLetter>`/`<AtoZLetter>`/`<ASCIILetter>`/`<ASCIILetterAll>`/`<ASCIISpecLetter>`
+
+### 15.2 类型 λ(tlambda)
+
+`A => B` 是「类型 → 类型」的编译期 λ(`Type::TLambda`);`=> B` 为无输入 tlambda。tlambda 仅静态语义,运行时无动态变量。
+
+### 15.3 多态类型(defpoly + where)
+
+```
+(defpoly Pair [a b where Number] (conj a b))
+(Pair i32 f32)   ;;; → Tuple(i32, f32),按参数序替换 tvars
+```
+
+### 15.4 和/积类型字面量(conj/disj)
+
+- `(conj A B)` → Tuple(乘积);`()` → Unit
+- `(disj A B)` → defdata 多构造器 ADT(和类型糖)
+- `(type Name (disj A B))` → 具名和类型
+
+### 15.5 trait 语法糖
+
+`deftrait`/`polytrait` → `defclass`;`defabsmember`/`defmember` → 抽象方法;`(with Trait (fn m))` → definstance。
+
+## 16. 统一内存管理 ✅
+
+以「线性类型 + 分级线性类型 + 手动 Unsafe」为单一所有权体系,使引用(Ref)、区域(Region)、裸指针(Unsafe)全部接入统一的 Grade + EffectRow。
+
+### 16.1 统一模型
+
+```
+所有权(线性/共享/擦除) → Grade(0/1/ω + Nat/Custom)
+副作用(可观测效应)     → EffectRow(State / Unsafe / ...)
+作用域(存活范围)       → Region(区域) + 逃逸检查
+```
+
+三类内存能力共享同一套等级与效应检查,不再各自为政:
+
+| 能力 | 类型 | 效应 | 等级语义 |
+|------|------|------|----------|
+| 引用 | `Ref a` | `State` | `{1 r}` 线性写后消费、`{ω r}` 共享读、`{0 r}` 擦除 |
+| 区域 | `Region` | — | 区域分级作用域,分配地址不可逃出 |
+| 裸指针 | `Ptr a` | `Unsafe` | 1 级线性指针读写后不可复用 |
+
+### 16.2 引用(Ref)
+
+`ref`/`deref`/`set!` 是 State 效应操作(非 Unsafe):
+
+```clojure
+(defn swap! [{1 r : (Ref i64)} v]
+  (set! r v))          ;;; 线性写:消费 r
+;;; {ω r : (Ref i64)} 可多次 deref 读
+```
+
+### 16.3 手动 Unsafe 逃逸
+
+`ptr-read`/`ptr-write` 经 `Unsafe` effect 门控,纯代码未经 handler 无法调用;退出区域后访问报悬垂错误:
+
+```clojure
+(handle (ptr-read addr) (Unsafe) ...)  ;;; 仅经 handler 可调用
+```
+
+### 16.4 纯声明式副作用
+
+所有内存操作(分配/读写/回收)声明于效应行,单处理器路径走 §12.6 直接状态线程降级,保持引用透明。

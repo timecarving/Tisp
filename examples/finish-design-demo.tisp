@@ -1,0 +1,24 @@
+;; 设计阶段 + 深度缺口补齐综合示例(fun-ext/幺半等价/类型类 fun-deps/deriving/时序)
+;; 运行:tisp --run finish-design-demo.tisp
+
+;; §16.3 fun-ext:有限域函数点态等价
+(defn id [x] x)
+(defn not-id [x] (+ x 1))
+
+;; §16.4 幺半等价:整数加法结合律 + 单位元
+(defn plus [a b] (+ a b))
+
+;; §7.5 deriving:结构比较/排序/打印(desugar 生成)
+(defdata Color :deriving (Eq Ord Show) (Red) (RGB i64 i64 i64))
+
+;; §23.3 类型类 fun-deps
+(defclass Coll [c e] :fun-deps [(c -> e)] (elem [c] -> e))
+(definstance (Coll i64 i64) (elem [x] x))
+
+;; 入口
+(defn main []
+  (println (fun-ext id id [1 2 3]))        ; => true
+  (println (fun-ext id not-id [1 2 3]))    ; => false
+  (println (monoid-check plus 0 [1 2 3]))  ; => true(加法幺半群)
+  (println (ord-Color (RGB 1 2 3) (RGB 1 2 4))) ; => -1
+  (println (clock "c" 5)))                 ; => Clock 值

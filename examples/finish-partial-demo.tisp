@@ -1,0 +1,24 @@
+;; 部分实现补齐综合示例(六维注解/私有定义/类型族/隐式绑定/monadic)
+;; 运行:tisp --typecheck finish-partial-demo.tisp
+
+;; §6.6 六维注解:->[ε, ρ, @r, m, d] Ret
+(defn annotated-fn [x : i64] -> [IO, rho1, @1, out, det] i64 x)
+
+;; §9 类型族:单声明多模式 + rewrite 形式
+(typefamily Elem (List a) a (Pair b c) b)
+(rewrite Elem (Map k v) k)
+
+;; §10.2 隐式绑定默认 0:{n : T} 擦除
+(defn erased-arg [{n : i64}] -> i64 0)
+
+;; §6.5 私有定义(不可跨文件引用)
+(defn- helper [x] (+ x 1))
+
+;; §12.6 monadic 风格状态热路径(mlet/get-m/put-m/pure)
+(defn monadic-demo []
+  (mlet [x (get-m) _ (put-m (+ x 1))] (pure x)))
+
+;; 入口
+(defn main []
+  (println (helper 41))     ; => 42
+  (println (erased-arg 7))) ; => 0(隐式参数擦除,不求值)

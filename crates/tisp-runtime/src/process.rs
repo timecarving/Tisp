@@ -41,16 +41,40 @@ impl CryptoEngine {
 
     pub fn encrypt(&self, data: &[u8], key_name: &str) -> Option<CryptoValue> {
         let key = self.keys.get(key_name)?;
-        // Simple XOR encryption (placeholder — production should use AES/ChaCha)
-        let encrypted: Vec<u8> = data.iter().zip(key.iter().cycle()).map(|(a, b)| a ^ b).collect();
-        Some(CryptoValue { data: encrypted, tag: CryptoTag::Encrypted(key.clone()) })
+        // §7.1 crypto feature:ChaCha20 流密码(替换 XOR 占位)
+        #[cfg(feature = "crypto")]
+        {
+            use chacha20::cipher::{KeyIvInit, StreamCipher};
+            let (key32, nonce12) = derive_key_nonce(key);
+            let mut cipher = chacha20::ChaCha20::new(&key32.into(), &nonce12.into());
+            let mut buf = data.to_vec();
+            cipher.apply_keystream(&mut buf);
+            Some(CryptoValue { data: buf, tag: CryptoTag::Encrypted(key.clone()) })
+        }
+        #[cfg(not(feature = "crypto"))]
+        {
+            let encrypted: Vec<u8> = data.iter().zip(key.iter().cycle()).map(|(a, b)| a ^ b).collect();
+            Some(CryptoValue { data: encrypted, tag: CryptoTag::Encrypted(key.clone()) })
+        }
     }
 
     pub fn decrypt(&self, val: &CryptoValue, key_name: &str) -> Option<Vec<u8>> {
         let key = self.keys.get(key_name)?;
         match &val.tag {
             CryptoTag::Encrypted(_) => {
-                Some(val.data.iter().zip(key.iter().cycle()).map(|(a, b)| a ^ b).collect())
+                #[cfg(feature = "crypto")]
+                {
+                    use chacha20::cipher::{KeyIvInit, StreamCipher};
+                    let (key32, nonce12) = derive_key_nonce(key);
+                    let mut cipher = chacha20::ChaCha20::new(&key32.into(), &nonce12.into());
+                    let mut buf = val.data.clone();
+                    cipher.apply_keystream(&mut buf);
+                    Some(buf)
+                }
+                #[cfg(not(feature = "crypto"))]
+                {
+                    Some(val.data.iter().zip(key.iter().cycle()).map(|(a, b)| a ^ b).collect())
+                }
             }
             _ => None,
         }
@@ -74,10 +98,31 @@ impl CryptoEngine {
     }
 
     pub fn hash(&self, data: &[u8]) -> CryptoValue {
-        // Simple hash (placeholder — should use SHA-256/Blake3)
-        let h: u64 = data.iter().fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64));
-        CryptoValue { data: h.to_le_bytes().to_vec(), tag: CryptoTag::Hashed }
+        // §7.1 crypto feature:SHA-256(替换简单 hash 占位)
+        #[cfg(feature = "crypto")]
+        {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(data);
+            let h = hasher.finalize();
+            CryptoValue { data: h.to_vec(), tag: CryptoTag::Hashed }
+        }
+        #[cfg(not(feature = "crypto"))]
+        {
+            let h: u64 = data.iter().fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64));
+            CryptoValue { data: h.to_le_bytes().to_vec(), tag: CryptoTag::Hashed }
+        }
     }
+}
+
+/// §7.1 从声明密钥派生 ChaCha20 密钥(32B)与非临(12B)
+#[cfg(feature = "crypto")]
+fn derive_key_nonce(key: &[u8]) -> ([u8; 32], [u8; 12]) {
+    let mut key32 = [0u8; 32];
+    for (i, b) in key.iter().take(32).enumerate() { key32[i] = *b; }
+    let mut nonce12 = [0u8; 12];
+    for (i, b) in key.iter().take(12).enumerate() { nonce12[i] = *b; }
+    (key32, nonce12)
 }
 
 /// spi-calculus: security protocol verification primitives
@@ -198,13 +243,59 @@ impl SKI {
                     _ => SKI::App(Box::new(SKI::App(s, x)), y),
                 },
                 SKI::I => *y,
-                SKI::K => SKI::K,
+                // K 应用一个参数是常量函数 K x,须保留负载 x(等待第二参数);不得丢弃为 K
+                SKI::K => SKI::App(Box::new(SKI::K), y),
                 other => SKI::App(Box::new(other), y),
             },
             other => other,
         }
     }
 
+    /// 归约到范式(迭代 reduce 至不动点)
+    pub fn reduce_all(mut ski: SKI) -> SKI {
+        for _ in 0..1000 {
+            let next = SKI::reduce(ski.clone());
+            if format!("{:?}", next) == format!("{:?}", ski) {
+                return next;
+            }
+            ski = next;
+        }
+        ski
+    }
+
+    /// 提取 SKI 项中的全部整数观察值(Num)
+    pub fn collect_nums(ski: &SKI) -> Vec<i64> {
+        match ski {
+            SKI::Num(n) => vec![*n],
+            SKI::App(a, b) => {
+                let mut v = SKI::collect_nums(a);
+                v.extend(SKI::collect_nums(b));
+                v
+            }
+            _ => vec![],
+        }
+    }
+}
+
+/// §27.10 观察等价:π 进程的观察值(Send 负载)与其 SKI 编码的观察值一致
+pub fn check_observational_equivalence(ops: &[ChannelOp], encoded: &SKI) -> bool {
+    let orig = channel_trace(ops);
+    let reduced = SKI::reduce_all(encoded.clone());
+    let enc: Vec<i64> = SKI::collect_nums(&reduced);
+    orig == enc
+}
+
+/// §27.10 通道迹:通道操作序列的观察值(Send 负载,按序)
+pub fn channel_trace(ops: &[ChannelOp]) -> Vec<i64> {
+    ops.iter().filter_map(|op| match op {
+        ChannelOp::Send(v) => Some(*v),
+        ChannelOp::Recv => None,
+    }).collect()
+}
+
+/// §27.10 迹等价:两段通道操作序列的观察值一致
+pub fn check_trace_equivalence(a: &[ChannelOp], b: &[ChannelOp]) -> bool {
+    channel_trace(a) == channel_trace(b)
 }
 
 use std::rc::Rc;
@@ -226,6 +317,22 @@ mod tests {
         let cipher = engine.encrypt(b"hello", "key1").unwrap();
         let plain = engine.decrypt(&cipher, "key1").unwrap();
         assert_eq!(plain, b"hello");
+    }
+
+    /// §7.1 crypto feature:SHA-256 32 字节摘要 + ChaCha20 非 XOR 密文
+    #[cfg(feature = "crypto")]
+    #[test]
+    fn test_crypto_strong_algorithms() {
+        let mut engine = CryptoEngine::new();
+        engine.add_key("k", b"0123456789abcdef0123456789abcdef".to_vec());
+        // SHA-256 输出 32 字节(非简单 hash 的 8 字节)
+        let h = engine.hash(b"hello");
+        assert_eq!(h.data.len(), 32, "SHA-256 应输出 32 字节,实际 {}", h.data.len());
+        // ChaCha20 密文非 XOR:密文与明文不同且可往返
+        let cipher = engine.encrypt(b"hello world", "k").unwrap();
+        assert_ne!(cipher.data, b"hello world".to_vec(), "密文不应等于明文");
+        let plain = engine.decrypt(&cipher, "k").unwrap();
+        assert_eq!(plain, b"hello world");
     }
 
     #[test] fn test_ambient() {
@@ -251,11 +358,66 @@ mod tests {
     }
 
     #[test]
+    fn test_ski_reduce_preserves_k_payload() {
+        // §27.10 修复:K 应用一个参数须保留负载(K x 是常量函数),不得丢弃为 K
+        let k_apply = SKI::App(Box::new(SKI::K), Box::new(SKI::Num(42)));
+        let reduced = SKI::reduce(k_apply.clone());
+        assert!(matches!(reduced, SKI::App(..)), "App(K, 42) 应保持为 App,而非 K,实际 {:?}", reduced);
+        // 完整两步:K x y → x(负载提取)
+        let full = SKI::App(Box::new(k_apply), Box::new(SKI::Num(0)));
+        let reduced_full = SKI::reduce(full);
+        assert!(matches!(reduced_full, SKI::Num(42)), "App(App(K,42), 0) → 42,实际 {:?}", reduced_full);
+    }
+
+    #[test]
     fn test_ambient_cap_encoding() {
         // §27.10:ambient 能力 → 通道消息
         assert_eq!(ambient_cap_to_channel_msg(&AmbientCap::Enter("room".into())), "enter:room");
         assert_eq!(ambient_cap_to_channel_msg(&AmbientCap::Exit("room".into())), "exit:room");
         assert_eq!(ambient_cap_to_channel_msg(&AmbientCap::Open("box".into())), "open:box");
+    }
+
+    #[test]
+    fn test_calculus_encodings() {
+        // §27.10:补 async→sync / applied→π / ρ→π 三种编码
+        let a = encode_async_to_sync(&[AsyncOp::Send(7), AsyncOp::Recv]);
+        assert_eq!(a, vec![ChannelOp::Send(7), ChannelOp::Recv]);
+        let p = encode_applied_to_pi(&[AppliedOp::Encrypt(3), AppliedOp::Decrypt(3)]);
+        assert_eq!(p, vec![ChannelOp::Send(3), ChannelOp::Send(3)]);
+        let r = encode_rho_to_pi(&[RhoOp::Quote(9), RhoOp::Drop]);
+        assert_eq!(r, vec![ChannelOp::Send(9)]);
+    }
+
+    #[test]
+    fn test_observational_equivalence() {
+        // §27.10:原进程与编码结果的观察值(Send 负载)一致
+        let ops = [ChannelOp::Send(42), ChannelOp::Send(7)];
+        let encoded = SKI::encode_pi_to_ski(&ops);
+        assert!(check_observational_equivalence(&ops, &encoded),
+            "π 进程与其 SKI 编码应观察等价");
+        // 不一致:不同负载
+        let encoded2 = SKI::encode_pi_to_ski(&[ChannelOp::Send(99)]);
+        assert!(!check_observational_equivalence(&ops, &encoded2),
+            "不同负载不应观察等价");
+    }
+
+    #[test]
+    fn test_trace_equivalence_all_encodings() {
+        // §27.10 全演算迹等价:async/applied/ρ 编码后观察值与原进程一致
+        let async_src = [ChannelOp::Send(7), ChannelOp::Recv];
+        let async_enc = encode_async_to_sync(&[AsyncOp::Send(7), AsyncOp::Recv]);
+        assert!(check_trace_equivalence(&async_src, &async_enc), "async→sync 应迹等价");
+
+        let applied_src = [ChannelOp::Send(3)];
+        let applied_enc = encode_applied_to_pi(&[AppliedOp::Encrypt(3)]);
+        assert!(check_trace_equivalence(&applied_src, &applied_enc), "applied→π 应迹等价");
+
+        let rho_src = [ChannelOp::Send(9)];
+        let rho_enc = encode_rho_to_pi(&[RhoOp::Quote(9), RhoOp::Drop]);
+        assert!(check_trace_equivalence(&rho_src, &rho_enc), "ρ→π 应迹等价");
+
+        // 不等价:不同负载
+        assert!(!check_trace_equivalence(&[ChannelOp::Send(1)], &[ChannelOp::Send(2)]));
     }
 
 }
@@ -287,6 +449,54 @@ impl SKI {
         }
         acc
     }
+}
+
+/// §27.10 异步 π 操作(编码源)
+#[derive(Debug, Clone, PartialEq)]
+pub enum AsyncOp {
+    Send(i64),
+    Recv,
+}
+
+/// §27.10 async→sync 编码:异步操作 → 同步通道操作
+pub fn encode_async_to_sync(ops: &[AsyncOp]) -> Vec<ChannelOp> {
+    ops.iter().map(|op| match op {
+        AsyncOp::Send(v) => ChannelOp::Send(*v),
+        AsyncOp::Recv => ChannelOp::Recv,
+    }).collect()
+}
+
+/// §27.10 applied-π 操作(加密/解密/签名/验证)
+#[derive(Debug, Clone, PartialEq)]
+pub enum AppliedOp {
+    Encrypt(i64),
+    Decrypt(i64),
+    Sign(i64),
+    Verify(i64),
+}
+
+/// §27.10 applied-π→π 编码:加密原语 → 通道操作(加密值经通道传输)
+pub fn encode_applied_to_pi(ops: &[AppliedOp]) -> Vec<ChannelOp> {
+    ops.iter().map(|op| match op {
+        AppliedOp::Encrypt(v) | AppliedOp::Decrypt(v) | AppliedOp::Sign(v) | AppliedOp::Verify(v) => ChannelOp::Send(*v),
+    }).collect()
+}
+
+/// §27.10 ρ-calculus 操作(quote/lift/drop)
+#[derive(Debug, Clone, PartialEq)]
+pub enum RhoOp {
+    Quote(i64),
+    Lift(i64),
+    Drop,
+}
+
+/// §27.10 ρ→π 编码:反射操作 → 通道操作(quote 发送、lift 接收、drop 空操作)
+pub fn encode_rho_to_pi(ops: &[RhoOp]) -> Vec<ChannelOp> {
+    ops.iter().filter_map(|op| match op {
+        RhoOp::Quote(v) => Some(ChannelOp::Send(*v)),
+        RhoOp::Lift(_) => Some(ChannelOp::Recv),
+        RhoOp::Drop => None,
+    }).collect()
 }
 
 /// ambient 能力 → 通道消息编码(enter/exit/open → 结构化消息)

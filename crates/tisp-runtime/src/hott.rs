@@ -150,6 +150,39 @@ impl<A: Clone> Squash<A> {
     }
 }
 
+/// §16 Kan 填充(2 维立方面组合):四条边共享四角,角一致则填充成功。
+/// 返回与所有边界面一致的填充值;角不一致报告边界错误。
+pub fn kan_fill_2d(
+    top: impl Fn(Interval) -> PointValue + Send + Sync + 'static,
+    bottom: impl Fn(Interval) -> PointValue + Send + Sync + 'static,
+    left: impl Fn(Interval) -> PointValue + Send + Sync + 'static,
+    right: impl Fn(Interval) -> PointValue + Send + Sync + 'static,
+) -> Result<PointValue, String> {
+    // 四个角各由两条边共享,须一致
+    let tl_t = top(Interval::i0());
+    let tl_l = left(Interval::i0());
+    if tl_t != tl_l {
+        return Err(format!("Kan 填充边界不一致:左上角 top(i0)={:?} != left(i0)={:?}", tl_t, tl_l));
+    }
+    let tr_t = top(Interval::i1());
+    let tr_r = right(Interval::i0());
+    if tr_t != tr_r {
+        return Err(format!("Kan 填充边界不一致:右上角 top(i1)={:?} != right(i0)={:?}", tr_t, tr_r));
+    }
+    let bl_b = bottom(Interval::i0());
+    let bl_l = left(Interval::i1());
+    if bl_b != bl_l {
+        return Err(format!("Kan 填充边界不一致:左下角 bottom(i0)={:?} != left(i1)={:?}", bl_b, bl_l));
+    }
+    let br_b = bottom(Interval::i1());
+    let br_r = right(Interval::i1());
+    if br_b != br_r {
+        return Err(format!("Kan 填充边界不一致:右下角 bottom(i1)={:?} != right(i1)={:?}", br_b, br_r));
+    }
+    // 填充值 = 左上角(与所有边一致)
+    Ok(tl_t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +224,25 @@ mod tests {
     #[test] fn test_quotient() {
         let q = Quotient::<i64, ()>::quot(42);
         assert_eq!(q.proj(), 42);
+    }
+
+    #[test]
+    fn test_kan_fill_2d_consistent() {
+        // §16 2D Kan 填充:四边共享四角一致 → 返回填充值
+        let top = |_: Interval| PointValue::Int(1);
+        let bottom = |_: Interval| PointValue::Int(1);
+        let left = |_: Interval| PointValue::Int(1);
+        let right = |_: Interval| PointValue::Int(1);
+        assert_eq!(kan_fill_2d(top, bottom, left, right).unwrap(), PointValue::Int(1));
+    }
+
+    #[test]
+    fn test_kan_fill_2d_inconsistent() {
+        // §16 边界不一致:左上角 top(i0) != left(i0) → 报错
+        let top = |_: Interval| PointValue::Int(1);
+        let bottom = |_: Interval| PointValue::Int(1);
+        let left = |_: Interval| PointValue::Int(2);
+        let right = |_: Interval| PointValue::Int(1);
+        assert!(kan_fill_2d(top, bottom, left, right).is_err(), "边界不一致应报错");
     }
 }

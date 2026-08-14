@@ -38,7 +38,18 @@ impl DeterminismAnalyzer {
 
     fn analyze_def(&mut self, def: &CoreDef) -> Result<Determinism, DetError> {
         let cat = self.analyze_expr(&def.body)?;
-        Ok(cat.to_det())
+        let computed = cat.to_det();
+        // §9 确定性子类型:computed 须 <: declared(函数体至少与声明一样确定)
+        if !crate::subtype::det_subtype(computed.clone(), def.determinism.clone()) {
+            return Err(DetError {
+                message: format!(
+                    "determinism mismatch: '{}' body is {:?} but declared {:?}",
+                    def.name, computed, def.determinism
+                ),
+                span: def.span.clone(),
+            });
+        }
+        Ok(computed)
     }
 
     fn analyze_expr(&mut self, expr: &CoreExpr) -> Result<DetCategory, DetError> {

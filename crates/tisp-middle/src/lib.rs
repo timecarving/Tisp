@@ -9,3 +9,6 @@ pub mod optimize;
 pub mod liquid_types;
 pub mod holes;
 pub mod specialize;
+pub mod subtype;
+pub mod constraint;
+pub mod solve;

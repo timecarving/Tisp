@@ -8,6 +8,10 @@ use std::collections::HashMap;
 pub struct Optimizer {
     /// Function definitions available for inlining
     inline_candidates: HashMap<Symbol, CoreDef>,
+    /// §30 opt-level 控制的内联阈值(expr_size ≤ threshold 才内联)
+    inline_threshold: usize,
+    /// §30 inline! 强制内联的目标函数名
+    force_inline: Vec<Symbol>,
     /// Optimization statistics
     pub stats: OptStats,
 }
@@ -24,7 +28,33 @@ impl Optimizer {
     pub fn new() -> Self {
         Self {
             inline_candidates: HashMap::new(),
+            inline_threshold: 5,
+            force_inline: Vec::new(),
             stats: OptStats::default(),
+        }
+    }
+
+    /// §30 编译指示接线:opt-level 调内联阈值;inline! 强制内联;noinline! 禁止内联
+    pub fn configure(&mut self, pragmas: &[(Symbol, Vec<Symbol>)]) {
+        for (name, targets) in pragmas {
+            match name.as_str() {
+                "opt-level" => {
+                    // opt-level N:提高内联阈值(N 越大越激进);level 0 关闭内联
+                    if let Some(t) = targets.first() {
+                        if let Ok(n) = t.as_str().parse::<u64>() {
+                            self.inline_threshold = if n == 0 { 0 } else { 5 + (n as usize) * 3 };
+                        }
+                    }
+                }
+                "inline!" => {
+                    for t in targets { self.force_inline.push(t.clone()); }
+                }
+                "noinline!" => {
+                    // noinline!:从内联候选中移除
+                    for t in targets { self.inline_candidates.remove(t); }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -53,6 +83,7 @@ impl Optimizer {
             resource_algebras: program.resource_algebras.clone(),
             effect_decls: program.effect_decls.clone(),
             defs: optimized_defs,
+            pragmas: vec![],
         }
     }
 
@@ -180,7 +211,9 @@ impl Optimizer {
     fn try_inline(&self, func: &CoreExpr, arg: &CoreExpr, _span: Span) -> Option<CoreExpr> {
         if let CoreExprNode::Var(name) = &func.node {
             if let Some(def) = self.inline_candidates.get(name) {
-                if self.is_small_body(&def.body) {
+                // §30 inline!:强制内联(无视阈值);否则按 opt-level 阈值判断
+                let force = self.force_inline.iter().any(|f| f == name);
+                if force || self.is_small_body(&def.body) {
                     if let CoreExprNode::Lam(lambda) = &def.body.node {
                         if lambda.params.len() == 1 {
                             let param = &lambda.params[0];
@@ -197,7 +230,7 @@ impl Optimizer {
 
     /// Check if a body is small enough to inline
     fn is_small_body(&self, expr: &CoreExpr) -> bool {
-        self.expr_size(expr) <= 5
+        self.expr_size(expr) <= self.inline_threshold
     }
 
     fn expr_size(&self, expr: &CoreExpr) -> usize {
@@ -412,5 +445,70 @@ fn has_side_effects(expr: &CoreExpr) -> bool {
         CoreExprNode::App(f, _) => has_side_effects(f),
         CoreExprNode::Let(_, _, v, _) => has_side_effects(v),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tisp_core::types::{Grade, Mode, Determinism, EffectRow};
+
+    fn var(name: &str) -> CoreExpr { CoreExpr::new(CoreExprNode::Var(Symbol::new(name)), Span::dummy()) }
+    fn int(n: i64) -> CoreExpr { CoreExpr::new(CoreExprNode::Lit(Literal::I64(n)), Span::dummy()) }
+    fn app(f: CoreExpr, a: CoreExpr) -> CoreExpr {
+        CoreExpr::new(CoreExprNode::App(Box::new(f), Box::new(a)), Span::dummy())
+    }
+
+    fn make_def(name: &str, params: Vec<&str>, body: CoreExpr) -> CoreDef {
+        CoreDef {
+            name: Symbol::new(name),
+            ty: None,
+            effects: EffectRow::Pure,
+            grade: Grade::Omega,
+            mode: Mode::In,
+            region: None,
+            visibility: Visibility::Public,
+            mode_sigs: vec![],
+            determinism: Determinism::Det,
+            body: CoreExpr::new(CoreExprNode::Lam(Lambda {
+                params: params.into_iter().map(|p| Param { name: Symbol::new(p), ty: None, grade: Grade::Omega, mode: Mode::In }).collect(),
+                body: Box::new(body),
+                ret_type: None,
+            }), Span::dummy()),
+            requires: None,
+            ensures: None,
+            span: Span::dummy(),
+        }
+    }
+
+    fn make_program(defs: Vec<CoreDef>, pragmas: Vec<(Symbol, Vec<Symbol>)>) -> CoreProgram {
+        CoreProgram {
+            data_decls: vec![], effect_decls: vec![], type_families: vec![], resource_algebras: vec![],
+            defs, pragmas,
+        }
+    }
+
+    /// §30 inline!:强制内联(忽略阈值);double 体大小 6 > 默认阈值 5
+    #[test]
+    fn test_optimizer_pragma_inline_force() {
+        let double = make_def("double", vec!["x"], app(app(var("+"), var("x")), var("x")));
+        let main_def = make_def("main", vec![], app(var("double"), int(21)));
+        let prog = make_program(vec![double, main_def], vec![(Symbol::new("inline!"), vec![Symbol::new("double")])]);
+        let mut opt = Optimizer::new();
+        opt.configure(&prog.pragmas);
+        let _ = opt.optimize(&prog);
+        assert!(opt.stats.inlined >= 1, "inline! 应强制内联 double");
+    }
+
+    /// §30 opt-level 0:关闭内联
+    #[test]
+    fn test_optimizer_opt_level_zero() {
+        let double = make_def("double", vec!["x"], app(app(var("+"), var("x")), var("x")));
+        let main_def = make_def("main", vec![], app(var("double"), int(21)));
+        let prog = make_program(vec![double, main_def], vec![(Symbol::new("opt-level"), vec![Symbol::new("0")])]);
+        let mut opt = Optimizer::new();
+        opt.configure(&prog.pragmas);
+        let _ = opt.optimize(&prog);
+        assert_eq!(opt.stats.inlined, 0, "opt-level 0 应关闭内联");
     }
 }

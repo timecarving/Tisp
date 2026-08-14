@@ -53,14 +53,27 @@ impl TypeInfer {
                 let (head, args) = self.collect_app(ty);
                 match &*head {
                     Type::Con(tc) => {
-                        if let Some(inst) = self.type_families.iter().find(|i| i.name == tc.name) {
-                            let mut bindings = HashMap::new();
-                            if self.match_family_pattern(&inst.params, &args, &mut bindings) {
-                                let result = self.subst_family(&inst.result, &bindings);
-                                return self.reduce_families(&result);
+                        // §多模式实例:遍历同名全部实例,任一模式匹配即归约;全不匹配报错
+                        let instances: Vec<&TypeFamilyInstance> = self.type_families.iter()
+                            .filter(|i| i.name == tc.name)
+                            .collect();
+                        if !instances.is_empty() {
+                            for inst in &instances {
+                                let mut bindings = HashMap::new();
+                                if self.match_family_pattern(&inst.params, &args, &mut bindings) {
+                                    let result = self.subst_family(&inst.result, &bindings);
+                                    return self.reduce_families(&result);
+                                }
                             }
                             return Err(TypeError {
                                 message: format!("type family '{}' application has no matching instance", tc.name),
+                                span: Span::dummy(),
+                            });
+                        }
+                        // 未声明类型族:非数据构造器/非内置类型构造器却被用作应用 → 明确报错
+                        if self.is_undeclared_type_family(&tc.name) {
+                            return Err(TypeError {
+                                message: format!("type family '{}' is not declared (missing typefamily instance)", tc.name),
                                 span: Span::dummy(),
                             });
                         }
@@ -95,7 +108,18 @@ impl TypeInfer {
             Type::Interval => Ok(Type::Interval),
             Type::Var(v) => Ok(Type::Var(v.clone())),
             Type::Con(c) => Ok(Type::Con(c.clone())),
+            Type::TLambda(p, b) => Ok(Type::TLambda(Box::new(self.reduce_families(p)?), Box::new(self.reduce_families(b)?))),
+            Type::Ref(t) => Ok(Type::Ref(Box::new(self.reduce_families(t)?))),
         }
+    }
+
+    /// 判定名称是否为「未声明类型族」:既非内置类型构造器,也非已声明的数据类型
+    fn is_undeclared_type_family(&self, name: &Symbol) -> bool {
+        let builtin = matches!(name.as_str(),
+            "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
+            | "f32" | "f64" | "bool" | "String" | "Unit" | "Char"
+            | "List" | "Map" | "Set" | "Vec" | "Maybe" | "Result" | "Option" | "Tuple");
+        !builtin && self.data_env.lookup(name).is_none()
     }
 
     /// 展开类型应用链:(F a1 a2) → (head, [a1, a2]);head 为最内层非 App 类型
@@ -228,6 +252,8 @@ impl TypeInfer {
         // 第二遍:逐 def 推断(占位与推断结果 unify)
         for def in &program.defs {
             let ty = self.infer_def(&mut env, def)?;
+            // §18.4 生产率检查(返回 next 的流定义须受 delay 保护)
+            check_productivity(def, &ty)?;
             results.push((def.name.clone(), ty));
         }
 
@@ -366,8 +392,14 @@ impl TypeInfer {
         env.insert(Symbol::new("recv"), TypeScheme::mono(Type::fun(Type::string(), Type::i64())));
         env.insert(Symbol::new("stream"), TypeScheme::mono(Type::fun(Type::i64(), Type::Temporal(TemporalOp::Next, Box::new(Type::i64())))));
         env.insert(Symbol::new("stream-take"), TypeScheme::mono(Type::fun(Type::Temporal(TemporalOp::Next, Box::new(Type::i64())), Type::fun(Type::i64(), Type::list(Type::i64())))));
-        env.insert(Symbol::new("delay"), TypeScheme::poly(vec![tv(60, "a")], Type::fun(Type::Var(tv(60, "a")), Type::Var(tv(60, "a")))));
-        env.insert(Symbol::new("advance"), TypeScheme::poly(vec![tv(61, "a")], Type::fun(Type::Var(tv(61, "a")), Type::Var(tv(61, "a")))));
+        // §18.5 LTL-as-types:delay : a → (next a);advance : (next a) → a(时序模态类型匹配)
+        env.insert(Symbol::new("delay"), TypeScheme::poly(vec![tv(60, "a")], Type::fun(Type::Var(tv(60, "a")), Type::Temporal(TemporalOp::Next, Box::new(Type::Var(tv(60, "a")))))));
+        env.insert(Symbol::new("advance"), TypeScheme::poly(vec![tv(61, "a")], Type::fun(Type::Temporal(TemporalOp::Next, Box::new(Type::Var(tv(61, "a")))), Type::Var(tv(61, "a")))));
+        // §18.1 always/eventually:流判定(有限窗口) → bool
+        let stream_pred_bool = Type::fun(Type::Temporal(TemporalOp::Next, Box::new(Type::i64())),
+            Type::fun(Type::fun(Type::i64(), Type::bool()), Type::fun(Type::i64(), Type::bool())));
+        env.insert(Symbol::new("always"), TypeScheme::mono(stream_pred_bool.clone()));
+        env.insert(Symbol::new("eventually"), TypeScheme::mono(stream_pred_bool));
         env.insert(Symbol::new("clock"), TypeScheme::mono(Type::fun(Type::unit(), Type::string())));
         env.insert(Symbol::new("~"), TypeScheme::mono(Type::fun(Type::bool(), Type::bool())));
         env.insert(Symbol::new("interval-neg"), TypeScheme::mono(Type::fun(Type::bool(), Type::bool())));
@@ -379,6 +411,44 @@ impl TypeInfer {
         env.insert(Symbol::new("find-all"), TypeScheme::poly(vec![tv(65, "a")],
             Type::fun(Type::Var(tv(65, "a")), Type::list(Type::list(Type::i64())))));
         env.insert(Symbol::new("commit!"), TypeScheme::poly(vec![tv(63, "a")], Type::fun(Type::Var(tv(63, "a")), Type::unit())));
+
+        // ── §31/§32 范式内置(pf-*):经 ParadigmRegistry 接入,与解释器 register_builtins 对应 ──
+        let li = Type::list(Type::i64());
+        let i64t = Type::i64();
+        let f64t = Type::f64();
+        let bt = Type::bool();
+        let st = Type::string();
+        let ut = Type::unit();
+        let mut m = |name: &str, ty: Type| env.insert(Symbol::new(name), TypeScheme::mono(ty));
+        m("pf-higher-order", Type::fun(i64t.clone(), bt.clone()));
+        m("pf-induce", Type::fun(li.clone(), Type::fun(li.clone(), li.clone())));
+        m("pf-prob", Type::fun(f64t.clone(), f64t.clone()));
+        m("pf-eventually", Type::fun(li.clone(), Type::fun(i64t.clone(), bt.clone())));
+        m("pf-subsume", Type::fun(ut.clone(), bt.clone()));
+        m("pf-settle", Type::fun(i64t.clone(), Type::fun(i64t.clone(), bt.clone())));
+        m("pf-fuzzy-and", Type::fun(f64t.clone(), Type::fun(f64t.clone(), f64t.clone())));
+        m("pf-tabling", Type::fun(bt.clone(), bt.clone()));
+        m("pf-typed-pred", Type::fun(i64t.clone(), bt.clone()));
+        m("pf-reactive", Type::fun(i64t.clone(), i64t.clone()));
+        m("pf-context-query", Type::fun(bt.clone(), Type::fun(bt.clone(), bt.clone())));
+        m("pf-possible", Type::fun(bt.clone(), Type::fun(bt.clone(), bt.clone())));
+        m("pf-evolp", Type::fun(i64t.clone(), i64t.clone()));
+        m("pf-dlp", Type::fun(li.clone(), li.clone()));
+        m("pf-get-kb", Type::fun(ut.clone(), st.clone()));
+        m("pf-array-sum", Type::fun(li.clone(), i64t.clone()));
+        m("pf-stack-top", Type::fun(li.clone(), i64t.clone()));
+        m("pf-compose", Type::fun(i64t.clone(), i64t.clone()));
+        m("pf-sym-eval", Type::fun(i64t.clone(), i64t.clone()));
+        m("pf-dfa-accept", Type::fun(li.clone(), bt.clone()));
+        m("pf-sm-drive", Type::fun(i64t.clone(), i64t.clone()));
+        m("pf-dispatch", Type::fun(i64t.clone(), st.clone()));
+        m("pf-stream-take", Type::fun(i64t.clone(), li.clone()));
+        m("pf-aop-weave", Type::fun(i64t.clone(), i64t.clone()));
+        // §统一内存管理:ref/deref/set! 为 State 效应操作,Ref a 分级值
+        let ref_i64 = Type::Ref(Box::new(i64t.clone()));
+        m("ref", Type::fun(i64t.clone(), ref_i64.clone()));
+        m("deref", Type::fun(ref_i64.clone(), i64t.clone()));
+        m("set!", Type::fun(ref_i64.clone(), Type::fun(i64t.clone(), ut.clone())));
 
         env
     }
@@ -879,6 +949,13 @@ impl TypeInfer {
             (Type::Temporal(op1, t1), Type::Temporal(op2, t2)) if op1 == op2 => self.unify(t1, t2, span),
             // ── Cohesive: unify sub-type ──
             (Type::Cohesive(op1, t1), Type::Cohesive(op2, t2)) if op1 == op2 => self.unify(t1, t2, span),
+            // ── 类型 λ(tlambda):unify 参数与返回 ──
+            (Type::TLambda(p1, b1), Type::TLambda(p2, b2)) => {
+                self.unify(p1, p2, span)?;
+                self.unify(b1, b2, span)
+            }
+            // ── 可变引用(Ref a):unify 元素类型 ──
+            (Type::Ref(t1), Type::Ref(t2)) => self.unify(t1, t2, span),
             _ => Err(TypeError {
                 message: format!("cannot unify {:?} with {:?}", t1, t2),
                 span,
@@ -1115,6 +1192,68 @@ impl TypeScheme {
     }
 }
 
+/// §18.3 稳定类型:可安全跨时刻(基元 + 用户 ADT;时序/闭包/类型变量非稳定)
+pub fn is_stable_type(ty: &Type) -> bool {
+    match ty {
+        Type::Con(c) => {
+            let n = c.name.as_str();
+            // 基元稳定
+            if matches!(n, "i64" | "i32" | "f64" | "f32" | "bool" | "String" | "char" | "Unit" | "u8" | "u16" | "u32" | "u64") {
+                return true;
+            }
+            // 用户 ADT(大写构造器)稳定;类型变量(小写)非稳定
+            matches!(n.chars().next(), Some(ch) if ch.is_ascii_uppercase())
+        }
+        // □_t A 稳定当且仅当 A 稳定
+        Type::Temporal(TemporalOp::Always, inner) => is_stable_type(inner),
+        // next/eventually 是时序值,非稳定
+        Type::Temporal(_, _) => false,
+        // 闭包可能捕获时序值,非稳定
+        Type::Fun(..) => false,
+        // 类型变量非稳定
+        Type::Var(_) => false,
+        // 元组/记录/精化等:递归判断(元素稳定则稳定)
+        Type::Tuple(ts) => ts.iter().all(is_stable_type),
+        Type::Refined(base, _) => is_stable_type(base),
+        _ => true,
+    }
+}
+
+/// §18.4 生产率:自递归且返回 next(流)的定义,递归调用须在 delay(⃝)下(受保护)。
+/// 返回未受保护的自递归调用数。
+fn unguarded_self_calls(name: &Symbol, expr: &CoreExpr, under_delay: bool) -> usize {
+    match &expr.node {
+        CoreExprNode::Var(v) if v == name => if under_delay { 0 } else { 1 },
+        CoreExprNode::App(f, a) => {
+            // (delay e) 是保护上下文:实参在 delay 内递归为受保护
+            let is_delay = matches!(&f.node, CoreExprNode::Var(v) if v.as_str() == "delay");
+            unguarded_self_calls(name, f, under_delay)
+                + unguarded_self_calls(name, a, under_delay || is_delay)
+        }
+        CoreExprNode::Lam(l) => unguarded_self_calls(name, &l.body, under_delay),
+        CoreExprNode::Let(_, _, v, b) => unguarded_self_calls(name, v, under_delay) + unguarded_self_calls(name, b, under_delay),
+        CoreExprNode::If(c, t, e) => unguarded_self_calls(name, c, under_delay) + unguarded_self_calls(name, t, under_delay) + unguarded_self_calls(name, e, under_delay),
+        CoreExprNode::Do(exprs) => exprs.iter().map(|e| unguarded_self_calls(name, e, under_delay)).sum(),
+        CoreExprNode::Match(s, arms) => unguarded_self_calls(name, s, under_delay) + arms.iter().map(|a| unguarded_self_calls(name, &a.body, under_delay)).sum::<usize>(),
+        CoreExprNode::Data(_, args) => args.iter().map(|a| unguarded_self_calls(name, a, under_delay)).sum(),
+        _ => 0,
+    }
+}
+
+/// §18.4 生产率检查:返回 next(流)的自递归定义,递归须受 delay 保护
+fn check_productivity(def: &CoreDef, ty: &Type) -> Result<(), TypeError> {
+    if matches!(ty, Type::Temporal(TemporalOp::Next, _)) {
+        let unguarded = unguarded_self_calls(&def.name, &def.body, false);
+        if unguarded > 0 {
+            return Err(TypeError {
+                message: format!("生产率违反:流定义 '{}' 有 {} 处未受 ⃝(delay)保护的递归调用", def.name, unguarded),
+                span: def.span.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Kind inference: compute the kind of a type
 pub fn kind_of(ty: &Type) -> Kind {
     match ty {
@@ -1238,5 +1377,72 @@ impl TypeEnv {
             }
         }
         set
+    }
+}
+
+#[cfg(test)]
+mod ltl_tests {
+    use super::*;
+
+    #[test]
+    fn test_temporal_type_schemes() {
+        // §18.5 LTL-as-types:delay : a → (next a);advance : (next a) → a
+        let ti = TypeInfer::new();
+        let env = ti.initial_env();
+        let advance = env.lookup(&Symbol::new("advance")).expect("advance 应有类型");
+        let advance_ty = match advance {
+            TypeScheme::Poly(_, ty) => ty.clone(),
+            TypeScheme::Mono(ty) => ty.clone(),
+        };
+        match &advance_ty {
+            Type::Fun(param, _, ret) => {
+                assert!(matches!(param.as_ref(), Type::Temporal(TemporalOp::Next, _)), "advance 参数应为 (next a),实际 {:?}", param);
+                assert!(matches!(ret.as_ref(), Type::Var(_)), "advance 返回应为 a");
+            }
+            other => panic!("advance 应为函数类型,实际 {:?}", other),
+        }
+        let delay = env.lookup(&Symbol::new("delay")).expect("delay 应有类型");
+        let delay_ty = match delay {
+            TypeScheme::Poly(_, ty) => ty.clone(),
+            TypeScheme::Mono(ty) => ty.clone(),
+        };
+        match &delay_ty {
+            Type::Fun(param, _, ret) => {
+                assert!(matches!(param.as_ref(), Type::Var(_)), "delay 参数应为 a");
+                assert!(matches!(ret.as_ref(), Type::Temporal(TemporalOp::Next, _)), "delay 返回应为 (next a)");
+            }
+            other => panic!("delay 应为函数类型,实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_stable_type() {
+        // §18.3:基元稳定,next/闭包/类型变量非稳定,□_t A 稳定当且仅当 A 稳定
+        assert!(is_stable_type(&Type::i64()));
+        assert!(is_stable_type(&Type::bool()));
+        assert!(is_stable_type(&Type::string()));
+        assert!(is_stable_type(&Type::Con(tisp_core::types::TypeCon { name: Symbol::new("MyData"), kind: tisp_core::types::Kind::Star })));
+        assert!(!is_stable_type(&Type::Temporal(TemporalOp::Next, Box::new(Type::i64()))), "next 非稳定");
+        assert!(!is_stable_type(&Type::fun(Type::i64(), Type::bool())), "闭包非稳定");
+        assert!(!is_stable_type(&Type::Con(tisp_core::types::TypeCon { name: Symbol::new("a"), kind: tisp_core::types::Kind::Star })), "类型变量非稳定");
+        assert!(is_stable_type(&Type::Temporal(TemporalOp::Always, Box::new(Type::i64()))), "□_t i64 稳定");
+        assert!(!is_stable_type(&Type::Temporal(TemporalOp::Always, Box::new(Type::fun(Type::i64(), Type::bool())))), "□_t 闭包 非稳定");
+    }
+
+    #[test]
+    fn test_productivity_unguarded_self_call() {
+        // §18.4 生产率:自递归调用须受 delay(⃝)保护
+        // (f x) 未保护 → 1
+        let f_call = CoreExpr::new(CoreExprNode::App(
+            Box::new(CoreExpr::new(CoreExprNode::Var(Symbol::new("f")), Span::dummy())),
+            Box::new(CoreExpr::new(CoreExprNode::Var(Symbol::new("x")), Span::dummy())),
+        ), Span::dummy());
+        assert_eq!(unguarded_self_calls(&Symbol::new("f"), &f_call, false), 1);
+        // (delay (f x)) 受保护 → 0
+        let guarded = CoreExpr::new(CoreExprNode::App(
+            Box::new(CoreExpr::new(CoreExprNode::Var(Symbol::new("delay")), Span::dummy())),
+            Box::new(f_call),
+        ), Span::dummy());
+        assert_eq!(unguarded_self_calls(&Symbol::new("f"), &guarded, false), 0);
     }
 }

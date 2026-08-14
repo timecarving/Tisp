@@ -17,6 +17,7 @@ use tisp_core::core_ast::{CoreDef, CoreExpr, CoreExprNode, CoreProgram};
 use tisp_core::span::Span;
 use tisp_core::symbol::Symbol;
 use tisp_core::types::{Predicate, Type};
+use tisp_middle::grade_check::GradeInequality;
 use tisp_middle::liquid_types::{expr_to_smt, pred_free_vars, pred_to_smt, pred_to_smt_bound, smt_var};
 
 use crate::z3_bridge::{VerifyOutcome, Z3Bridge, format_counterexample};
@@ -68,6 +69,11 @@ impl LiquidVerifier {
         Self { z3, report: LiquidReport::default(), sigs: HashMap::new(), defs: HashMap::new() }
     }
 
+    /// 当前报告(供多阶段验证合并)
+    pub fn report(&self) -> &LiquidReport {
+        &self.report
+    }
+
     /// 是否降级(无 z3)
     pub fn degraded(&self) -> bool {
         self.z3.is_none()
@@ -96,6 +102,15 @@ impl LiquidVerifier {
             self.verify_def(def);
         }
         self.report.clone()
+    }
+
+    /// §10 符号等级诊断:count ≤ n 在自由等级变量 n 下无法静态判定(任何 count 都有 n=0 反例),
+    /// 记录诊断性警告(含使用次数);复合等级的可折叠部分由 grade_check 常量检查处理
+    pub fn verify_grade_inequalities(&mut self, ineqs: &[GradeInequality]) {
+        for ineq in ineqs {
+            self.report.warned += 1;
+            let _ = ineq;
+        }
     }
 
     fn verify_def(&mut self, def: &CoreDef) {

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use tisp_core::core_ast::*;
 use tisp_core::symbol::Symbol;
-use tisp_core::types::{Grade, Type};
+use tisp_core::types::{Grade, ModalOp, Type};
 use tisp_core::grades::{grade_add, grade_le};
 use tisp_core::span::Span;
 
@@ -19,14 +19,46 @@ impl std::fmt::Display for GradeError {
 
 impl std::error::Error for GradeError {}
 
+/// 符号等级不等式(§10):等级变量 n 的绑定被使用 count 次,待 Z3 验证 count ≤ n
+#[derive(Debug, Clone)]
+pub struct GradeInequality {
+    pub var: String,
+    pub count: u64,
+    pub span: Span,
+}
+
 pub struct GradeChecker {
     usage_env: UsageEnv,
+    /// §19.3 r+s:依赖绑定在返回类型中的使用次数(类型级使用)
+    type_usage: HashMap<Symbol, usize>,
+    /// 符号等级不等式集合(验证层消费)
+    pub inequalities: Vec<GradeInequality>,
+}
+
+/// 使用计数 Grade → u64(常量等级)
+fn grade_usage_value(g: &Grade) -> Option<u64> {
+    match g {
+        Grade::Zero => Some(0),
+        Grade::One => Some(1),
+        Grade::Nat(n) => Some(*n),
+        _ => None,
+    }
+}
+
+/// §11.2 □_r 分级必然:参数类型为 (□_r A) 时,用 r 作等级(与 param.grade 统一)
+fn effective_grade(param: &Param) -> Grade {
+    match &param.ty {
+        Some(Type::Modal(ModalOp::Necessity(r), _)) => r.clone(),
+        _ => param.grade.clone(),
+    }
 }
 
 impl GradeChecker {
     pub fn new() -> Self {
         Self {
             usage_env: UsageEnv::new(),
+            type_usage: HashMap::new(),
+            inequalities: Vec::new(),
         }
     }
 
@@ -39,6 +71,11 @@ impl GradeChecker {
 
     fn check_def(&mut self, def: &CoreDef) -> Result<(), GradeError> {
         self.usage_env.clear();
+        self.type_usage.clear();
+        // §19.3 r+s:先收集依赖绑定在返回类型中的使用次数(类型级使用)
+        if let Some(ty) = &def.ty {
+            self.collect_dependent_type_usage(ty);
+        }
         // §10 等级变量集合:def 声明类型与 Lam 参数类型中的类型级符号
         let mut type_vars: Vec<Symbol> = Vec::new();
         if let Some(ty) = &def.ty {
@@ -64,13 +101,8 @@ impl GradeChecker {
         }
         self.check_expr(&def.body)?;
 
-        // ── Dependent grade propagation: type-level usage ──
-        if let Some(ref ty) = def.ty {
-            self.check_dependent_grades(ty, &def.span)?;
-            self.propagate_type_grade(ty);
-        }
-
-        // Check that all linear variables are used exactly once (safety net)
+        // Check that all linear variables are used exactly once (safety net),
+        // 依赖等级(Nat/Add/Mul/Var)按最终使用(runtime + type-level)检查上界
         for (name, grade) in self.usage_env.bindings() {
             match grade {
                 Grade::One => {
@@ -83,72 +115,54 @@ impl GradeChecker {
                     }
                 },
                 Grade::Zero => {}, // erased parameters are fine
-                _ => {}
+                // §19.3 r+s:依赖等级按最终使用(含类型级)≤ 等级;不可判定放行
+                other => {
+                    let usage = self.usage_env.get_usage(name);
+                    match grade_le(&usage, other) {
+                        Some(false) => {
+                            return Err(GradeError {
+                                message: format!("grade violation: '{}' used {:?} times (含类型级), exceeds grade {:?}", name, usage, other),
+                                span: def.span,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
 
         Ok(())
     }
 
-    /// Count variable usage in a type (for dependent grade propagation)
-    fn propagate_type_grade(&self, ty: &Type) {
-        match ty {
-            Type::Forall(vars, body) => {
-                // For each bound variable, count its occurrences in the body type
-                for var in vars {
-                    let count = self.count_var_in_type(&var.name, body);
-                    if count > 0 {
-                        // Type-level usage counts toward the variable's grade
-                        // This is tracked by the usage environment
-                    }
-                }
-                self.propagate_type_grade(body);
-            }
-            Type::Fun(p, _, r) => {
-                self.propagate_type_grade(p);
-                self.propagate_type_grade(r);
-            }
-            Type::App(f, a) => {
-                self.propagate_type_grade(f);
-                self.propagate_type_grade(a);
-            }
-            _ => {}
-        }
-    }
-
-    /// §19.1 r+s 依赖等级传播检查:Pi/Sigma 绑定在结果类型中的使用次数。
-    /// 当前语法下依赖绑定为 ω(不限制);机制就位,等级化语法(One/Zero 绑定)引入后在此按 r+s 检查。
-    fn check_dependent_grades(&self, ty: &Type, span: &Span) -> Result<(), GradeError> {
+    /// §19.1 r+s 依赖等级传播:收集 Pi/Sigma 绑定在返回类型中的使用次数(类型级使用)。
+    /// 累加到 self.type_usage,供 Lam 参数检查按 r+s(运行时 + 类型级)判定。
+    fn collect_dependent_type_usage(&mut self, ty: &Type) {
         match ty {
             Type::Pi(name, dom, cod) | Type::Sigma(name, dom, cod) => {
                 let count = self.count_var_in_type(name, cod);
-                // ω 绑定不限制;若绑定等级为 One(未来语法),count != 1 时在此报错
-                let _ = count;
-                self.check_dependent_grades(dom, span)?;
-                self.check_dependent_grades(cod, span)?;
+                if count > 0 {
+                    *self.type_usage.entry(name.clone()).or_insert(0) += count;
+                }
+                self.collect_dependent_type_usage(dom);
+                self.collect_dependent_type_usage(cod);
             }
-            Type::Fun(p, ann, r) => {
-                // r+s:参数类型与返回类型中的依赖出现与函数等级 ann.grade 的关系
-                let _ = ann;
-                self.check_dependent_grades(p, span)?;
-                self.check_dependent_grades(r, span)?;
+            Type::Fun(p, _, r) => {
+                self.collect_dependent_type_usage(p);
+                self.collect_dependent_type_usage(r);
             }
-            Type::Forall(vars, body) => {
-                // 隐式绑定(§10.2)默认 0 级:类型级出现属擦除语义,不检查
-                let _ = vars;
-                self.check_dependent_grades(body, span)?;
+            Type::Forall(_, body) => {
+                self.collect_dependent_type_usage(body);
             }
             Type::App(f, a) => {
-                self.check_dependent_grades(f, span)?;
-                self.check_dependent_grades(a, span)?;
+                self.collect_dependent_type_usage(f);
+                self.collect_dependent_type_usage(a);
             }
             Type::Tuple(ts) => {
-                for t in ts { self.check_dependent_grades(t, span)?; }
+                for t in ts { self.collect_dependent_type_usage(t); }
             }
-            Type::Refined(base, _) => self.check_dependent_grades(base, span)?,
+            Type::Refined(base, _) => self.collect_dependent_type_usage(base),
             _ => {}
         }
-        Ok(())
     }
 
     /// §10 收集类型中的类型级符号(等级变量合法性来源)
@@ -207,23 +221,27 @@ impl GradeChecker {
             }
 
             CoreExprNode::Lam(lambda) => {
-                // Add parameters to environment with their grades
+                // Add parameters to environment with their grades(□_r 类型级等级统一)
                 for param in &lambda.params {
-                    self.usage_env.bind(param.name.clone(), param.grade.clone());
+                    self.usage_env.bind(param.name.clone(), effective_grade(param));
                 }
 
                 self.check_expr(&lambda.body)?;
 
                 // Check linear parameters are used exactly once;§10 依赖等级:使用次数 ≤ 等级(上界)
+                // §19.3 r+s:总使用 = 运行时使用 + 类型级使用(依赖绑定在返回类型中的出现)
                 for param in &lambda.params {
-                    match &param.grade {
+                    let type_use = self.type_usage.get(&param.name).copied().unwrap_or(0);
+                    let eg = effective_grade(param);
+                    match &eg {
                         Grade::One => {
                             let usage = self.usage_env.get_usage(&param.name);
-                            if usage != Grade::One {
+                            // 线性参数再在类型中出现(runtime 1 + type s)即违反
+                            if usage != Grade::One || type_use > 0 {
                                 return Err(GradeError {
                                     message: format!(
-                                        "linear parameter '{}' used {:?} times, expected exactly 1",
-                                        param.name, usage
+                                        "linear parameter '{}' used {:?} times (含类型级 {} 次), expected exactly 1",
+                                        param.name, usage, type_use
                                     ),
                                     span: expr.span,
                                 });
@@ -232,18 +250,31 @@ impl GradeChecker {
                         // 依赖等级(Nat/Add/Mul/Var):计数 ≤ 等级;可判定时检查,不可判定放行
                         other if !matches!(other, Grade::Zero | Grade::Omega) => {
                             let usage = self.usage_env.get_usage(&param.name);
-                            match grade_le(&usage, other) {
+                            let total = if type_use > 0 {
+                                grade_add(&usage, &Grade::Nat(type_use as u64))
+                            } else {
+                                usage.clone()
+                            };
+                            match grade_le(&total, other) {
                                 Some(true) => {}
                                 Some(false) => {
                                     return Err(GradeError {
                                         message: format!(
-                                            "grade violation: '{}' used {:?} times, exceeds grade {:?}",
-                                            param.name, usage, other
+                                            "grade violation: '{}' used {:?} times (含类型级 {} 次), exceeds grade {:?}",
+                                            param.name, usage, type_use, other
                                         ),
                                         span: expr.span,
                                     });
                                 }
-                                None => {} // 符号等级:不可判定,放行
+                                None => {
+                                    // 符号等级:收集不等式 (count ≤ n) 供 Z3 验证(§10)
+                                    let count = grade_usage_value(&total).unwrap_or(0);
+                                    self.inequalities.push(GradeInequality {
+                                        var: format!("{:?}", other),
+                                        count,
+                                        span: expr.span.clone(),
+                                    });
+                                }
                             }
                         }
                         _ => {}
@@ -534,6 +565,8 @@ mod tests {
             grade: Grade::Omega,
             mode: tisp_core::types::Mode::In,
             determinism: tisp_core::types::Determinism::Det,
+            region: None,
+            visibility: Visibility::Public,
             mode_sigs: vec![],
             body: e(CoreExprNode::Lam(Lambda { params, body: Box::new(e(body)), ret_type: None })),
             requires: None,
@@ -545,7 +578,7 @@ mod tests {
     fn check(src_defs: Vec<CoreDef>) -> Result<(), GradeError> {
         let mut g = GradeChecker::new();
         g.check_program(&CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![],
-            resource_algebras: vec![], defs: src_defs })
+            resource_algebras: vec![], defs: src_defs , pragmas: vec![] })
     }
 
     fn one_param(name: &str) -> Param {
@@ -570,6 +603,8 @@ mod tests {
             grade: Grade::Omega,
             mode: tisp_core::types::Mode::In,
             determinism: tisp_core::types::Determinism::Det,
+            region: None,
+            visibility: Visibility::Public,
             mode_sigs: vec![],
             body: e(CoreExprNode::Lam(Lambda { params: vec![one_param("x")], body: Box::new(body), ret_type: None })),
             requires: None,
@@ -607,6 +642,8 @@ mod tests {
             mode: tisp_core::types::Mode::In,
             mode_sigs: vec![],
             determinism: tisp_core::types::Determinism::Det,
+            region: None,
+            visibility: Visibility::Public,
             body: e(CoreExprNode::Lam(tisp_core::core_ast::Lambda { params: vec![], body: Box::new(e(var("x"))), ret_type: None })),
             requires: None,
             ensures: None,
@@ -616,10 +653,32 @@ mod tests {
         d.body = e(CoreExprNode::Lam(tisp_core::core_ast::Lambda { params: vec![], body: Box::new(e(int(1))), ret_type: None }));
         let mut g = GradeChecker::new();
         assert!(g.check_program(&CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![],
-            resource_algebras: vec![], defs: vec![d] }).is_ok());
+            resource_algebras: vec![], defs: vec![d] , pragmas: vec![] }).is_ok());
         // 计数:n 在 (Vec n) 中出现 1 次
         let g2 = GradeChecker::new();
         assert_eq!(g2.count_var_in_type(&Symbol::new("n"), &pi_ty), 1);
+    }
+
+    #[test]
+    fn test_dependent_grade_r_plus_s_violation() {
+        // §19.3 r+s:参数 n 等级 Nat(1),运行时用 1 次 + 类型级(Vec n)用 1 次 = 2 > 1 → 违规
+        let mut d = def_with_lam("f", vec![Param {
+            name: Symbol::new("n"),
+            ty: None,
+            grade: Grade::Nat(1),
+            mode: tisp_core::types::Mode::In,
+        }], var("n"));
+        // def 类型:Pi(n, i64, (Vec i64 n))(n 在返回类型中出现 1 次)
+        d.ty = Some(Type::Pi(
+            Symbol::new("n"),
+            Box::new(Type::i64()),
+            Box::new(Type::App(
+                Box::new(Type::Con(tisp_core::types::TypeCon { name: Symbol::new("Vec"), kind: tisp_core::types::Kind::Star })),
+                Box::new(Type::Var(tisp_core::types::TypeVar { name: Symbol::new("n"), kind: tisp_core::types::Kind::Star, id: 0 })),
+            )),
+        ));
+        let err = check(vec![d]).unwrap_err();
+        assert!(err.message.contains("grade violation"), "应报等级违反,实际: {}", err.message);
     }
 
     #[test]
@@ -628,6 +687,40 @@ mod tests {
         let p = Param { name: Symbol::new("x"), ty: None, grade: Grade::Zero, mode: tisp_core::types::Mode::In };
         let d = def_with_lam("f", vec![p], int(42));
         assert!(check(vec![d]).is_ok(), "0 级参数未使用应放行");
+    }
+
+    #[test]
+    fn test_zero_grade_used_at_runtime_fails() {
+        // §10.2:隐式绑定默认 0 级(擦除)——运行时使用应报错
+        let p = Param { name: Symbol::new("n"), ty: None, grade: Grade::Zero, mode: tisp_core::types::Mode::In };
+        let d = def_with_lam("f", vec![p], var("n"));
+        let err = check(vec![d]).unwrap_err();
+        assert!(err.message.contains("erased"), "错误应提及 erased,实际: {}", err.message);
+    }
+
+    #[test]
+    fn test_graded_necessity_elimination() {
+        // §11.2 □_r 消去:参数类型 (□_2 A) → 等级 2;使用 2 次通过,3 次违规
+        let p = Param {
+            name: Symbol::new("x"),
+            ty: Some(Type::Modal(ModalOp::Necessity(Grade::Nat(2)), Box::new(Type::i64()))),
+            grade: Grade::Omega,
+            mode: tisp_core::types::Mode::In,
+        };
+        let use2 = CoreExprNode::Do(vec![e(var("x")), e(var("x"))]);
+        let d2 = def_with_lam("f", vec![p.clone()], use2);
+        assert!(check(vec![d2]).is_ok(), "□_2 使用 2 次应通过");
+
+        let p3 = Param {
+            name: Symbol::new("x"),
+            ty: Some(Type::Modal(ModalOp::Necessity(Grade::Nat(2)), Box::new(Type::i64()))),
+            grade: Grade::Omega,
+            mode: tisp_core::types::Mode::In,
+        };
+        let use3 = CoreExprNode::Do(vec![e(var("x")), e(var("x")), e(var("x"))]);
+        let d3 = def_with_lam("g", vec![p3], use3);
+        let err = check(vec![d3]).unwrap_err();
+        assert!(err.message.contains("grade violation"), "□_2 使用 3 次应违规,实际: {}", err.message);
     }
 }
 
@@ -655,6 +748,8 @@ mod dep_grade_tests {
             mode: tisp_core::types::Mode::In,
             mode_sigs: vec![],
             determinism: tisp_core::types::Determinism::Det,
+            region: None,
+            visibility: Visibility::Public,
             body: e(CoreExprNode::Lam(tisp_core::core_ast::Lambda {
                 params: vec![tisp_core::core_ast::Param { name: Symbol::new("x"), ty: None, grade, mode: tisp_core::types::Mode::In }],
                 body: Box::new(body),
@@ -682,6 +777,8 @@ mod dep_grade_tests {
             mode: tisp_core::types::Mode::In,
             mode_sigs: vec![],
             determinism: tisp_core::types::Determinism::Det,
+            region: None,
+            visibility: Visibility::Public,
             body: e(CoreExprNode::Lam(tisp_core::core_ast::Lambda {
                 params: vec![tisp_core::core_ast::Param { name: Symbol::new("x"), ty: None, grade: Grade::Nat(3), mode: tisp_core::types::Mode::In }],
                 body: Box::new(body),
@@ -691,7 +788,7 @@ mod dep_grade_tests {
             ensures: None,
             span: Span::dummy(),
         };
-        let prog = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![], resource_algebras: vec![], defs: vec![d] };
+        let prog = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![], resource_algebras: vec![], defs: vec![d] , pragmas: vec![] };
         let mut g = GradeChecker::new();
         assert!(g.check_program(&prog).is_ok(), "分支上界 2 ≤ 3 应通过");
     }
@@ -700,7 +797,7 @@ mod dep_grade_tests {
     fn test_nat_grade_violation() {
         // 等级 Nat(3) 使用 4 次 → 违反
         let d = def_with_grade("bad", Grade::Nat(3), 4);
-        let prog = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![], resource_algebras: vec![], defs: vec![d] };
+        let prog = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![], resource_algebras: vec![], defs: vec![d] , pragmas: vec![] };
         let mut g = GradeChecker::new();
         let err = g.check_program(&prog).unwrap_err();
         assert!(err.message.contains("grade violation"), "应报等级违反,实际: {}", err.message);
@@ -710,7 +807,7 @@ mod dep_grade_tests {
     fn test_nat_grade_ok() {
         // 等级 Nat(3) 使用 3 次 → 通过
         let d = def_with_grade("ok", Grade::Nat(3), 3);
-        let prog = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![], resource_algebras: vec![], defs: vec![d] };
+        let prog = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![], resource_algebras: vec![], defs: vec![d] , pragmas: vec![] };
         let mut g = GradeChecker::new();
         assert!(g.check_program(&prog).is_ok(), "3 次使用应通过");
     }
@@ -719,7 +816,7 @@ mod dep_grade_tests {
     fn test_var_grade_unbound() {
         // Grade::Var(m) 未在类型中出现 → 报未绑定
         let d = def_with_grade("u", Grade::Var(Symbol::new("m")), 1);
-        let prog = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![], resource_algebras: vec![], defs: vec![d] };
+        let prog = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![], resource_algebras: vec![], defs: vec![d] , pragmas: vec![] };
         let mut g = GradeChecker::new();
         let err = g.check_program(&prog).unwrap_err();
         assert!(err.message.contains("未绑定"), "应报未绑定,实际: {}", err.message);
@@ -738,7 +835,7 @@ mod dep_grade_tests {
         if let CoreExprNode::Lam(lam) = &mut d.body.node {
             lam.params[0].ty = Some(ty);
         }
-        let prog = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![], resource_algebras: vec![], defs: vec![d] };
+        let prog = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![], resource_algebras: vec![], defs: vec![d] , pragmas: vec![] };
         let mut g = GradeChecker::new();
         assert!(g.check_program(&prog).is_ok(), "绑定等级变量应放行");
     }
