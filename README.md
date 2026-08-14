@@ -69,7 +69,24 @@ CLI flags:`--eval` `--print-ast` `--print-tokens` `--desugar` `--typecheck` `--r
 (println (fib 10))      ; => 55
 ```
 
-语言特性:ADT/GADT、模式匹配(同名变量一致性)、效果系统(handle/perform)、逻辑编程(defpred/CLP/回溯/溯因)、宏(defmacro + 卫生/gensym)、OOP 泛型函数(defgeneric/defmethod + 编译期特化)、FRP 流、进程演算通道与加密、QTT 等级(含依赖线性等级表达式)、液态类型(Z3 验证)、类型族、多模式谓词、MPST 会话、验证(find-attack/check-equivalence)、HoTT。
+### 语言特性
+
+| 类别 | 已实现特性 |
+|------|-----------|
+| **核心语言** | ADT/GADT(defdata/记录/字段)、模式匹配(match/cons/or-pattern/guard/穷尽性检查)、deriving(Eq/Ord/Show)、持久化数据结构(List/Vector/Map/Set,im HAMT 结构共享)、统一 `def` + 六维注解 `->[ε,ρ,@r,m,d]`、私有定义(defn-/def-) |
+| **类型系统** | HM 推断 + 多态 + rank-n + 行多态、QTT 等级(0/1/ω + 数字/符号/复合依赖等级)、液态类型 `{x:T\|pred}`(Z3 验证 + 反例)、Π/Σ 依赖类型、类型族(多模式/rewrite)、类型一等值(Value::Type)、类型类(defclass/definstance + :fun-deps)、tlambda/defpoly/conj/disj/trait 语法糖、五维子类型 |
+| **效果系统** | defeffect/handle/perform、续延 `k`(多 body + 状态写回)、效果行消减与子类型、单处理器直接状态线程(monadic 优化)、内置操作(get/put/ask/tell/throw/choose) |
+| **逻辑编程** | defpred 子句、CLP(域/标签/约束/all-different/精确除法)、回溯 + trail 恢复、溯因(ALP 多解)、committed-choice、任意谓词 Prolog 式多解、12 类逻辑范式(高阶/归纳 ILP/概率 PLP/时序/描述逻辑/可废止/模糊/表格化/一体化基底/响应式/情境/模态)、EVOLP 稳定模型/DLP 动态稳定模型/MOP |
+| **进程演算** | π 通道(FIFO)+ Async + 结构化并发、加密(spi/applied π)、SKI/ambient/ρ/κ 组合子、跨演算迹等价、MPST 会话类型(投影 + 顺序检查) |
+| **宏系统** | defmacro、syntax-quote/unquote/unquote-splice、卫生宏(fn/lambda/if-let/when-let/match 重命名)、gensym |
+| **OOP** | defgeneric/defmethod(模式分发)、方法组合(around/before/after + call-next-method)、构造器类型驱动编译期特化、类型类 |
+| **时序 / FRP** | Stream/Signal/Clock、LTL-as-types(delay/advance/⃝)、生产率检查 + 稳定类型、多时钟重采样、空间回收 |
+| **HoTT / Cohesive** | Interval/Path/HIT、HComp(KanFill)/Transp(端点传输)、`:boundary` 可满足性、2 维/N 维立方填充、Cohesive ♭(flat)/♯(sharp)/ʃ(shape)+ adjoint-triple 全语义 |
+| **系统级** | defextern + dlopen(字符串/指针/i64/f64)、无 GC 栈式区域内存、ptr-read/write + Unsafe 效应门控、编译期区域逃逸检查、统一内存管理(线性类型 + 分级线性 + 手动 Unsafe 经单一 Grade + EffectRow) |
+| **验证** | defprop/verify、模型检查(可达性 + 反例 trace)、find-attack、dolev-yao 攻击者知识合成、check-equivalence |
+| **编译器 / 工具链** | 解释器 + LLVM IR 生成(inkwell 真实 IR + 文本回退 + 闭包环境)、编译指示(inline!/specialize!/opt-level/suppress-warning)、反射(type-of/effects-of/grade-of/mode-of/determinism-of)、90+ 内置函数、REPL(:type 查询) |
+
+> ⚠️ 部分实现(2/32 章):§11 Graded Modal Types(完整可推断等级推导缺)、§19 Dependent Graded Types(符号等级不可判定警告放行)。逐章证据见 [standard_doc/04-implementation-status.md](./standard_doc/04-implementation-status.md)。
 
 ### 文档
 
