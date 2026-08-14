@@ -101,13 +101,13 @@ REPL 约定:定义行(defn/defdata/defpred/defmacro/...)并入累积;表达式�
 
 | 文档 | 用途 |
 |------|------|
-| `docs/spec.md` | 原始设计规范(30 章 + 附录);部分是设计阶段 |
+| `docs/spec.md` | 原始设计规范(32 章 + 6 附录,状态符号内联) |
 | `standard_doc/INDEX.md` | 语言标准文档导航(01 核心 / 02 高级特性 / 03 参考 / 04 实现状态) |
-| `standard_doc/04-implementation-status.md` | 30 章逐章实现状态(含 file:line 证据) |
+| `standard_doc/04-implementation-status.md` | 32 章逐章实现状态(含 file:line 证据,唯一事实源) |
 | `CHANGELOG.md` | Keep a Changelog 格式变更记录 |
-| `PLAN.md` | 分阶段实施计划(Phase 0-12) |
-| `PHASE{N}_SUMMARY.md` | 每阶段完成总结 |
-| `examples/` | 13 个示例;8 个可运行、4 个定义型(仅 `--typecheck`)、1 个部分支持 |
+| `PLAN.md` | 项目现状与后续方向 |
+| `docs/PHASE-HISTORY.md` | 历史阶段总结(归档) |
+| `examples/` | 19 个示例;14 个可运行、3 个定义型(仅 `--typecheck`)、1 个部分支持、1 个预期报错 |
 
 **状态符号**(文档与代码注释通用):✅ 完全实现 / ⚠️ 部分实现 / ⬜ 设计阶段
 
@@ -115,12 +115,14 @@ REPL 约定:定义行(defn/defdata/defpred/defmacro/...)并入累积;表达式�
 
 - schema:`spec-driven`(`openspec/config.yaml`)
 - 变更文件放 `openspec/changes/<change-name>/`,归档到 `openspec/changes/archive/`
-- 能力规范放 `openspec/specs/<capability>/spec.md`(当前为空,待建立)
+- 能力规范放 `openspec/specs/<capability>/spec.md`(当前 19 份)
 - 每个变更遵循:proposal → design → tasks → specs(主 spec 可先放 `docs/spec.md`/`standard_doc/` 参照)
 - 变更实现后更新 `CHANGELOG.md` 与 `standard_doc/04-implementation-status.md`
 
 ## 9. 已知局限(修改代码前必读)
 
-- 加密原语为 XOR/简单哈希占位,生产需换 AES/ChaCha/SHA-256
-- Search effect 续延搜索、液态类型(Z3)、HoTT、类型类实例查找、LLVM 真编译(`llc` 产物链接)为部分实现
-- `docs/spec.md` 部分章节仍处设计阶段,以 `standard_doc/04-implementation-status.md` 为准
+- 加密原语为 XOR/简单哈希占位,生产需换 AES/ChaCha/SHA-256(crypto feature 下接 RustCrypto)
+- §11 Graded Modal Types:完整可推断等级推导(按使用次数推导 r/ε)缺
+- §19 Dependent Graded Types:符号等级不可判定时警告放行(严格 Z3 验证缺)
+- LLVM 真编译链:`--ir` 生成 llc 可编译 IR;编译/链接/运行闭环未做
+- 以 `standard_doc/04-implementation-status.md` 为唯一事实源

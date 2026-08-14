@@ -63,7 +63,7 @@ Tisp is a **pure declarative**, **unified-method**, **multi-paradigm**, **high-p
 
 ---
 
-## 2. Design Philosophy ⚠️
+## 2. Design Philosophy ✅
 
 ### Principle 1: Everything is an Annotated Relation
 
@@ -114,7 +114,7 @@ Tisp is a **strongly statically typed** language: all types are checked at compi
 
 ---
 
-## 3. Lexical Structure ⚠️
+## 3. Lexical Structure ✅
 
 ### 3.1 Character Set
 
@@ -159,7 +159,7 @@ Reserved words: `true`, `false`, `nil`.
 
 ---
 
-## 4. Data Structures ⚠️
+## 4. Data Structures ✅
 
 All data structures are **immutable** (persistent).
 
@@ -214,7 +214,7 @@ Type: `Unit` — the unit type with one value.
 
 ---
 
-## 5. Expressions ⚠️
+## 5. Expressions ✅
 
 ### 5.1 Literals
 
@@ -279,7 +279,7 @@ x                 ; look up x in current scope
 
 ---
 
-## 6. Definitions ⚠️
+## 6. Definitions ✅
 
 ### 6.1 Value Definition
 
@@ -340,7 +340,7 @@ Where:
 
 ---
 
-## 7. Algebraic Data Types ⚠️
+## 7. Algebraic Data Types ✅
 
 ### 7.1 Data Type Definition
 
@@ -390,7 +390,7 @@ Where:
 
 ---
 
-## 8. Pattern Matching ⚠️
+## 8. Pattern Matching ✅
 
 ### 8.1 Match Expression
 
@@ -431,7 +431,7 @@ The compiler verifies that all possible values are covered. Missing cases produc
 
 ---
 
-## 9. Type System Overview ⚠️
+## 9. Type System Overview ✅
 
 Tisp's type system is a **unified modal dependent type theory** organized in layers:
 
@@ -803,7 +803,7 @@ Refinement predicates can use 0-multiplicity variables (verified at compile time
 
 ---
 
-## 16. Homotopy Type Theory ⚠️
+## 16. Homotopy Type Theory ✅
 
 Enabled with `--cubical` compiler flag.
 
@@ -861,7 +861,7 @@ Enabled with `--cubical` compiler flag.
 
 ---
 
-## 17. Cohesive HoTT ⚠️
+## 17. Cohesive HoTT ✅
 
 > 实现注(2026-08):ʃ(shape)返回 Shape 容器(路径端点连通);`shape-graph` 连通图、`crisp` 上下文检查、`♭`(Flat 容器)/`♯`(Sharp 容器)可区分语义已实现;完整 category-theoretic 同伦模型仍为设计目标。
 
@@ -902,7 +902,7 @@ Enabled with `--cohesion` compiler flag.
 
 ---
 
-## 18. Temporal Types ⚠️
+## 18. Temporal Types ✅
 
 ### 18.1 Temporal Modalities
 
@@ -987,7 +987,7 @@ If `f : (Π [x : A]_r -> B x)` and `x` appears in `B x` with grade `s`, then tot
 
 ---
 
-## 20. Session Types ⚠️
+## 20. Session Types ✅
 
 ### 20.1 Binary Session Types
 
@@ -1237,7 +1237,7 @@ Macros are hygienic by default. Use `gensym` for fresh names when needed.
 
 ---
 
-## 26. FFI & System-Level Programming ⚠️
+## 26. FFI & System-Level Programming ✅
 
 ### 26.1 External Function Declaration
 
@@ -1435,7 +1435,7 @@ Encoded via OOP (generic functions + method combination).
 
 ---
 
-## 29. Built-in Functions ⚠️
+## 29. Built-in Functions ✅
 
 ### 29.1 Arithmetic
 
@@ -1467,7 +1467,7 @@ Encoded via OOP (generic functions + method combination).
 
 ---
 
-## 30. Compiler Pragmas ⚠️
+## 30. Compiler Pragmas ✅
 
 ### 30.1 Inline Hint
 
@@ -1495,7 +1495,7 @@ Encoded via OOP (generic functions + method combination).
 
 ---
 
-## 31. Everything-as-ADT Logic Extensions (EVOLP/DLP/MOP) ⚠️
+## 31. Everything-as-ADT Logic Extensions (EVOLP/DLP/MOP) ✅
 
 最终核心思想「一切皆 ADT」:把逻辑程序的规则、约束、项传播与 OOP 对象建模为一等不可变数据,
 在纯声明式约束下实现演化逻辑编程(EVOLP)、动态逻辑编程(DLP)、元对象协议(MOP)与 State Effect 引用管理。
@@ -1546,7 +1546,7 @@ Encoded via OOP (generic functions + method combination).
 
 ---
 
-## 32. Programming Paradigms & AOP ⚠️
+## 32. Programming Paradigms & AOP ✅
 
 以纯声明式副作用管理(代数效应 + 单子)落地 8 类编程范式,并基于编译器纯声明式 MOP 实现 AOP 辅助 OOP。
 
@@ -1573,7 +1573,7 @@ Encoded via OOP (generic functions + method combination).
 ### 32.3 全链路补齐语义助手
 
 分级模态推理(□_r/◇_ε)、Cost 渐近代价、时序稳定类型、区域逃逸检查、HoTT 完整立方填充等
-⚠️ 特性的运行时语义助手实现于 `tisp-runtime/src/full_chain.rs`。
+特性的运行时语义助手实现于 `tisp-runtime/src/full_chain.rs`。
 
 ---
 

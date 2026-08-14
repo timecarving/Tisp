@@ -11,7 +11,7 @@
 | [01-language-core.md](./01-language-core.md) | 词法、语法、数据类型、表达式、定义、ADT/GADT、模式匹配、类型基础 | 语言用户、初学者 |
 | [02-advanced-features.md](./02-advanced-features.md) | 效果系统、模式/确定性、区域、HoTT、FRP、逻辑编程(CLP/ALP)、进程演算、宏、OOP、验证 | 进阶用户、研究者 |
 | [03-reference.md](./03-reference.md) | 内置函数表、CLI 参考、类型系统附录、Core AST 附录、实现状态矩阵、示例程序清单 | 所有用户、贡献者 |
-| [04-implementation-status.md](./04-implementation-status.md) | spec 30 章逐章实现状态与未实现特性清单(含 file:line 证据) | 贡献者、研究者 |
+| [04-implementation-status.md](./04-implementation-status.md) | spec 32 章逐章实现状态与未实现特性清单(含 file:line 证据) | 贡献者、研究者 |
 
 ---
 
@@ -64,7 +64,7 @@ Tisp 的设计围绕两条主线展开(详见 docs/spec.md §2):
 ```
 Tisp/
 ├── standard_doc/         ← 你在看这里(语言标准文档)
-├── docs/spec.md          # 原始设计规范(1569 行,设计目标与语法定义)
+├── docs/spec.md          # 原始设计规范(1680 行,32 章 + 6 附录,设计目标与语法定义)
 ├── CHANGELOG.md          # 变更记录
 ├── crates/
 │   ├── tisp-core/        # 类型、AST、效果、等级、模式、区域、数据声明

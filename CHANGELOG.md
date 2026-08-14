@@ -5,6 +5,15 @@
 
 ---
 
+## 当前状态(0.1.0 收尾,2026-08)
+
+- 6 crate / 64 Rust 源文件 / 26,527 行 / 351 单元测试 / 零编译警告
+- `docs/spec.md` 32 章 + 6 附录:30 ✅ / 2 ⚠️(§11 Graded Modal Types、§19 Dependent Graded Types)/ 0 ⬜
+- 19 个示例;19 份 OpenSpec 能力规范
+- 逐章实现状态以 [standard_doc/04-implementation-status.md](./standard_doc/04-implementation-status.md) 为唯一事实源
+
+---
+
 ## [0.1.0] - 2026-08
 
 ### 新增

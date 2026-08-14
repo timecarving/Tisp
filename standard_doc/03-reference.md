@@ -219,6 +219,8 @@ tisp                                # 进入 REPL
 | `remaining-gaps-demo.tisp` | 综合演示 | 类型族/多模式/cc/反射/特化/宏卫生 |
 | `dependent-linear-test.tisp` | 验证通过 | 依赖线性类型(等级表达式) |
 | `partial-completion-demo.tisp` | 综合演示 | CLP 算术/all-different/多解溯因/HoTT/类型一等值 |
+| `finish-design-demo.tisp` | 综合演示 | fun-ext/幺半等价/HIT 端点/deriving(Eq/Ord/Show) |
+| `finish-partial-demo.tisp` | 综合演示 | 六维注解 `->[ε,ρ,@r,m,d]`/QTT 擦除/Monad |
 | `phase5-test.tisp` | 定义型(无入口) | 洞/确定性 |
 | `_qtt-test.tisp` | 定义型(无入口) | QTT |
 
@@ -229,7 +231,7 @@ tisp                                # 进入 REPL
 ## 6. 测试
 
 ```bash
-cargo test --workspace   # 177 个测试
+cargo test --workspace   # 351 个测试
 ```
 
-覆盖:词法/解析、脱糖、效果处理器、通道/流/加密、CLP、泛型分发、IR 生成、逻辑回溯。
+覆盖:词法/解析、脱糖、效果处理器、通道/流/加密、CLP、泛型分发、IR 生成、逻辑回溯、12 类逻辑范式、编程范式/AOP。

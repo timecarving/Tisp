@@ -18,10 +18,10 @@
 - `Grade::Zero/One/Omega` 三种等级
 - `grade_check` 在类型检查阶段校验线性变量使用(编译器实现于 tisp-middle/grade_check.rs)
 
-### 1.2 依赖等级(depgraded)⚠️
+### 1.2 依赖等级(depgraded)✅
 
 - `depgraded.rs` 提供依赖等级演算的运行时骨架
-- 与 QTT 的完整融合(编译期消除)仍在设计中
+- 数字/符号/复合等级表达式 + 上界检查 + 等级变量绑定已在 grade_check 落地(§10);符号等级不可判定时警告放行
 
 ---
 
@@ -133,11 +133,11 @@ h : (Int ->[{IO, State Int}] Bool)
 
 ---
 
-## 7. Homotopy Type Theory (HoTT) ⚠️
+## 7. Homotopy Type Theory (HoTT) ✅
 
 - Interval 类型：`i0` / `i1` 端点、`interval-neg/and/or` 运算 ✅
-- Path 类型、`~`(取反)、`FunExt` 节点存在 ⚠️
-- HIT(defdata-hit)语法解析 ✅,运行时语义 ⚠️
+- Path 类型、`~`(取反)、`FunExt` 节点真实求值 ✅
+- HIT(defdata-hit)语法解析 ✅,运行时语义(HComp KanFill/Transp 端点传输 + `:boundary` 可满足性检查 + 2 维/N 维立方填充)✅
 
 ---
 
@@ -219,12 +219,12 @@ h : (Int ->[{IO, State Int}] Bool)
 
 - `ClpStore`:Domain(BTreeSet 有序)/add_lt/add_eq/all_different/propagate/label
 - `label` 枚举解并按升序返回(修复了无序域的问题)
-- `constrain` 接受已求值为 true/false 的约束;对 **CLP 变量的算术约束编译**(如 `(> x 2)` 中 x 为变量 id)尚未实现 ⚠️
+- `constrain` 接受已求值为 true/false 的约束;CLP 变量算术约束(乘/除/模收 z + 精确除法 + 线性 `+`/`-` 传播)✅
 
-### 9.4 溯因(ALP,§21.6)⚠️
+### 9.4 溯因(ALP,§21.6)✅
 
 - `abduce` 节点接线 `AbductionEngine`(hypothesis 生成)
-- 完整 ALP 搜索策略 ✅(abduce-all 多解枚举 + domain 感知)
+- 完整 ALP 搜索策略 ✅(abduce-all 多解枚举 + domain 感知生成 + `assign` 域相交)
 
 ---
 
@@ -253,10 +253,10 @@ h : (Int ->[{IO, State Int}] Bool)
 - `encrypt/decrypt/sign/verify/hash` 接线 `CryptoEngine`
 - **算法为 XOR/简单哈希占位**——生产环境应替换为 AES/ChaCha/SHA-256(代码注释已标注)
 
-### 10.3 其他演算 ⚠️
+### 10.3 其他演算 ✅
 
-- SKI 组合子、ambients(enter/exit/open)、ρ-calculus(quote/drop/lift)、κ-calculus(bind/unbind/react)节点存在并求值参数 ⚠️
-- 完整语义 ✅(5 演算编码 + channel_trace/check_trace_equivalence)
+- SKI 组合子、ambients(enter/exit/open)、ρ-calculus(quote/drop/lift)、κ-calculus(bind/unbind/react)节点存在并求值参数 ✅
+- 完整语义 ✅(5 演算编码 + channel_trace/check_trace_equivalence 跨 π/ρ/ambient/SKI 迹等价)
 
 ---
 
@@ -273,7 +273,7 @@ h : (Int ->[{IO, State Int}] Bool)
 - 调用点展开:参数替换模板,递归 desugar(支持嵌套宏)
 - 多表达式模板自动包 `do`
 - **注意**:宏展开在类型检查之前,模板本身须通过静态类型检查(如 `if` 分支类型一致)
-- **未实现**:syntax-quote、卫生宏(hygiene)
+- syntax-quote/unquote/unquote-splice + 卫生宏(fn/lambda/if-let/when-let/match 卫生重命名 + gensym + `~x` unquote 替换)✅
 
 ---
 
@@ -299,10 +299,10 @@ h : (Int ->[{IO, State Int}] Bool)
 - 分发器运行时查 `generic_table`,按模式顺序匹配(§22.3 组合顺序 around→before→primary→after 已登记,分发取首个匹配)
 - 无匹配报错 `no method for generic <name>`
 
-### 12.2 类型类(§23)⚠️
+### 12.2 类型类(§23)✅
 
 - `defclass` / `definstance` 解析并登记 `instance_dict`
-- 实例方法查找(约束求解驱动)⬜
+- 实例方法查找(约束求解驱动 + 构造器→ADT 映射)✅;`:fun-deps`/超类/kind 解析 + 冲突/超类检测 ✅
 
 ---
 
@@ -313,7 +313,7 @@ h : (Int ->[{IO, State Int}] Bool)
 
 ---
 
-## 14. LLVM 代码生成(§30)⚠️
+## 14. LLVM 代码生成(§30)✅
 
 ```bash
 tisp --ir examples/run-test.tisp   # 生成文本 LLVM IR
@@ -321,7 +321,7 @@ tisp --ir examples/run-test.tisp   # 生成文本 LLVM IR
 
 - `IrGenerator` 生成文本 IR(无 inkwell 依赖):算术/if-phi/let
 - 已修复:函数头语法、phi 寄存器一致性
-- 真编译需 llvm 工具链(llc);函数调用/闭包生成 ⬜
+- inkwell 层(需 `llvm` feature)生成真实 IR:define/call + 闭包环境堆分配(`@closure_env` 槽 + 捕获计数),llc 编译验证;文本 IR 回退带参签名 + call + 闭包自由变量标注
 
 ## 15. 声明式语法 DSL 与类型 λ(草案方向)✅
 

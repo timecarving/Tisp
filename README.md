@@ -76,17 +76,17 @@ CLI flags:`--eval` `--print-ast` `--print-tokens` `--desugar` `--typecheck` `--r
 | 文档 | 说明 |
 |------|------|
 | [standard_doc/INDEX.md](./standard_doc/INDEX.md) | 语言标准文档(词法/核心语言/高级特性/参考/实现状态) |
-| [standard_doc/04-implementation-status.md](./standard_doc/04-implementation-status.md) | spec 30 章实现状态与未实现特性清单 |
+| [standard_doc/04-implementation-status.md](./standard_doc/04-implementation-status.md) | spec 32 章实现状态与未实现特性清单 |
 | [CHANGELOG.md](./CHANGELOG.md) | 变更记录(0.1.0 变更声明 + 已知局限) |
-| [docs/spec.md](./docs/spec.md) | 语言设计规范(30 章,状态符号 ✅/⚠️/⬜ 内联) |
+| [docs/spec.md](./docs/spec.md) | 语言设计规范(32 章 + 6 附录,状态符号 ✅/⚠️/⬜ 内联) |
 | [PLAN.md](./PLAN.md) | 项目现状与后续方向(替代历史分阶段计划) |
 
 ### 实现状态概览
 
-✅ 全链路可用:核心语言、效果系统、宏(卫生)、OOP 泛型分发(+特化)、逻辑编程(子句/CLP/溯因/多解)、通道与加密、FRP 流、液态类型(Z3 验证)、类型族、多模式谓词、committed-choice、MPST 会话、验证(find-attack)、依赖线性类型、LLVM IR 文本生成
-⚠️ 部分实现:Search effect 续延搜索、HoTT/Cohesive 最小语义、符号等级 Z3 严格验证、LLVM 真编译链、真实 dlopen 全签名
-⬜ 设计阶段:详见 docs/spec.md(30 章状态内联)与 standard_doc/04-implementation-status.md(唯一事实源)
+✅ 全链路可用(30/32 章):核心语言、效果系统、宏(卫生)、OOP 泛型分发(+特化)、逻辑编程(子句/CLP/溯因/多解)、通道与加密、FRP 流、液态类型(Z3 验证)、类型族、多模式谓词、committed-choice、MPST 会话、验证(find-attack)、依赖线性类型、HoTT/Cohesive、时序类型、进程演算、Everything-as-ADT(12 类逻辑范式)、8 类编程范式 + AOP、LLVM IR 生成(inkwell 真实 IR + 文本回退)
+⚠️ 部分实现(2/32 章):§11 Graded Modal Types(完整可推断等级推导缺)、§19 Dependent Graded Types(符号等级不可判定时警告放行)
+⬜ 设计阶段:无(详见 standard_doc/04-implementation-status.md 唯一事实源)
 
 ### 示例程序
 
-`examples/` 下 18 个示例;12 个可运行输出正确(hello/fibonacci/adt/advanced/run/type-infer/state-effect/logic-test/liquid-types-test/remaining-gaps-demo/dependent-linear-test/partial-completion-demo),4 个为定义型(无入口,用 `--typecheck` 检查),1 个部分支持(logic-search),1 个预期报错(液态类型负面用例,`--typecheck` 演示违反与反例)。
+`examples/` 下 19 个示例;14 个可运行输出正确(hello/fibonacci/adt/advanced/run/type-infer/state-effect/logic-test/liquid-types-test/remaining-gaps-demo/dependent-linear-test/partial-completion-demo/finish-design-demo/finish-partial-demo),3 个为定义型(无入口,用 `--typecheck` 检查:frp-counter/phase5-test/_qtt-test),1 个部分支持(logic-search),1 个预期报错(液态类型负面用例,`--typecheck` 演示违反与反例)。
