@@ -1678,3 +1678,8 @@ See `examples/` directory:
 | `liquid-types-violations.tisp` | 预期报错(退出码非零) | 液态类型负面用例 |
 | `phase5-test.tisp` | 定义型(无入口) | 洞/确定性 |
 | `_qtt-test.tisp` | 定义型(无入口) | QTT |
+| `oop-around.tisp` | `100` | OOP around 方法组合经特化路径保持语义 |
+| `paradigm-matrix.tisp` | 范式矩阵输出 | 12 逻辑 + 8 编程 + AOP + FRP 端到端 |
+| `verify-user.tisp` | `--verify` 2 properties | 用户 defprop + model-check 可达性 |
+| `declarative-paradigms.tisp` | 8 范式输出 | 8 编程范式端到端(State/Signal 效应) |
+| `aop-mop.tisp` | `100` / `[]` | comptime MOP KB + defaspect 编译期编织 |

@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 tisp-core.workspace = true
+tisp-runtime.workspace = true
 im.workspace = true
 petgraph.workspace = true
 miette.workspace = true

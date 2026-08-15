@@ -5,12 +5,12 @@ use tisp_core::span::Span;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tisp_runtime::RegionStack;
-use tisp_runtime::region::RegionId;
+use tisp_runtime::region::{RegionBox, RegionId};
 use tisp_runtime::logic::ConstraintStore as LogicStore;
 use tisp_runtime::logic::LogicValue;
 use tisp_runtime::constraint::ConstraintStore as ClpStore;
 use tisp_runtime::abduction::AbductionEngine;
-use tisp_runtime::process::CryptoEngine;
+use tisp_runtime::process::{CryptoEngine, ChannelOp, AsyncOp, AppliedOp, RhoOp, AmbientCap, SKI};
 use tisp_runtime::frp::Signal;
 use crate::process::{ProcessRuntime, ModelChecker, DolevYaoAttacker};
 use crate::temporal::Stream;
@@ -24,13 +24,13 @@ pub struct Interpreter {
     pub regions: RegionStack,
     /// Current active region for allocations
     current_region: Option<RegionId>,
-    /// Logic programming state
-    pub logic_store: LogicStore,
+    /// Logic programming state(程序区域分配,区域退出即回收)
+    logic_store: Option<RegionBox<LogicStore>>,
     pub logic_vars: HashMap<u64, Value>,
     /// Session protocol state: channel_id → expected next op
     pub session_protocol: HashMap<String, String>,
-    /// CLP(FD) constraint store for constraint logic programming
-    pub clp_store: ClpStore,
+    /// CLP(FD) constraint store for constraint logic programming(程序区域分配,区域退出即回收)
+    clp_store: Option<RegionBox<ClpStore>>,
     /// ς-calculus OOP: generic function dispatch table
     pub generic_table: HashMap<Symbol, Vec<(MethodCategory, Vec<Pattern>, Closure)>>,
     /// Typeclass instance dictionary: class_name → [(实例类型列表, 方法表)]
@@ -57,6 +57,8 @@ pub struct Interpreter {
     direct_state: Option<Value>,
     /// π-calculus 通道运行时(§27):send/recv 经共享缓冲区
     process_runtime: Arc<Mutex<ProcessRuntime>>,
+    /// spawn 产生的子任务句柄(§27.2 结构化并发,join 等待并取结果)
+    spawn_handles: HashMap<String, std::thread::JoinHandle<Result<Value, String>>>,
     /// Applied π-calculus 加密引擎(§27.4/27.5)
     crypto: CryptoEngine,
     /// §7.2 非加密占位警告是否已输出(一次;crypto feature 下无用)
@@ -64,16 +66,20 @@ pub struct Interpreter {
     crypto_warned: bool,
     /// §26.4 Unsafe 门控警告是否已输出(一次)
     unsafe_warned: bool,
+    /// §26 默认构建模拟 C 函数表警告是否已输出(一次)
+    ffi_sim_warned: bool,
     /// §26.2 裸指针模拟内存:地址 → 值(线性指针读写;真实裸内存由 ffi 门控)
     ptr_mem: HashMap<u64, Value>,
     /// §26.3 区域分配地址计数器
     next_ptr_addr: u64,
     /// §26.3 已释放(悬垂)地址集合:PtrRead 读到悬垂指针时报错
     freed_addrs: std::collections::HashSet<u64>,
-    /// §31 MOP 知识库:GetKB/SetKB 效应的运行时状态(事实/规则集)
-    kb: tisp_core::evolp::Program,
-    /// 惰性数值流缓存(§18):stream_id → Stream<i64>
-    streams: HashMap<u64, Stream<i64>>,
+    /// §31 MOP 知识库:GetKB/SetKB 效应的运行时状态(事实/规则集;程序区域分配)
+    kb: Option<RegionBox<tisp_core::evolp::Program>>,
+    /// 惰性数值流缓存(§18):stream_id → Stream<i64>(程序区域分配)
+    streams: Option<RegionBox<HashMap<u64, Stream<i64>>>>,
+    /// §32 惰性流变换缓存:派生流 id → 变换描述(源流 id + 变换闭包)
+    stream_transforms: Option<RegionBox<HashMap<u64, StreamTransform>>>,
     next_stream_id: u64,
     /// §27 ambients:已注册的 ambient 名
     ambients: HashMap<Symbol, bool>,
@@ -81,8 +87,8 @@ pub struct Interpreter {
     properties: HashMap<Symbol, CoreExpr>,
     /// §23 构造器 → 所属 ADT 名(类型类实例分发用)
     ctor_to_adt: HashMap<Symbol, Symbol>,
-    /// FRP 信号缓存(§18.5):signal_id → Signal<Value>
-    signals: HashMap<u64, Signal<Value>>,
+    /// FRP 信号缓存(§18.5):signal_id → Signal<Value>(程序区域分配)
+    signals: Option<RegionBox<HashMap<u64, Signal<Value>>>>,
     next_signal_id: u64,
     /// CLP 变量 id → 符号名(§21.5 label 解回绑用)
     clp_var_names: HashMap<u64, Symbol>,
@@ -115,6 +121,15 @@ struct ActiveHandler {
     /// 状态槽(§12.3 State 等带状态 effect);None 表示未初始化
     state: Option<Value>,
     clauses: Vec<HandlerClause>,
+}
+
+/// §32 惰性流变换:派生流 id → 变换描述(源流 id + 变换闭包)
+#[derive(Clone)]
+enum StreamTransform {
+    /// stream-map:对源流逐元素应用闭包
+    Map(u64, Value),
+    /// stream-filter:保留源流中谓词为真的元素
+    Filter(u64, Value),
 }
 
 pub type BuiltinFn = Arc<dyn Fn(&mut Interpreter, &[Value]) -> Result<Value, EvalError> + Send + Sync>;
@@ -269,8 +284,8 @@ impl Interpreter {
     pub fn new() -> Self {
         Self { env: vec![HashMap::new()], next_chan_id: 0,
                regions: RegionStack::new(4096), current_region: None,
-               logic_store: LogicStore::new(), logic_vars: HashMap::new(),
-               session_protocol: HashMap::new(), clp_store: ClpStore::new(),
+               logic_store: None, logic_vars: HashMap::new(),
+               session_protocol: HashMap::new(), clp_store: None,
                generic_table: HashMap::new(),
                instance_dict: HashMap::new(),
                class_fun_deps: HashMap::new(),
@@ -284,20 +299,23 @@ impl Interpreter {
                handlers: Vec::new(),
                direct_state: None,
                process_runtime: Arc::new(Mutex::new(ProcessRuntime::new())),
+               spawn_handles: HashMap::new(),
                crypto: CryptoEngine::new(),
                #[cfg(not(feature = "crypto"))]
                crypto_warned: false,
                unsafe_warned: false,
+               ffi_sim_warned: false,
                ptr_mem: HashMap::new(),
                next_ptr_addr: 1,
                freed_addrs: std::collections::HashSet::new(),
-               kb: tisp_core::evolp::Program::new(),
-               streams: HashMap::new(),
+               kb: None,
+               streams: None,
+               stream_transforms: None,
                next_stream_id: 0,
                ambients: HashMap::new(),
                properties: HashMap::new(),
                ctor_to_adt: HashMap::new(),
-               signals: HashMap::new(),
+               signals: None,
                next_signal_id: 0,
                clp_var_names: HashMap::new(),
                def_sigs: HashMap::new(),
@@ -311,53 +329,77 @@ impl Interpreter {
                max_call_depth: 0 }
     }
 
-    /// §26 真实 dlopen:经 libloading 解析符号并构造可调用内置(i64 → i64 C ABI)
+    /// §26 真实 dlopen:按声明的 ABI 签名解析符号并构造可调用内置。
+    /// 不再「先试 i64」盲试——不同签名经 dlsym 均可解析,错配会导致错误结果/崩溃。
     #[cfg(feature = "ffi")]
-    fn load_extern(&mut self, lib_path: &str, sym: &str) -> Result<Value, String> {
+    fn load_extern(&mut self, lib_path: &str, sym: &str, abi: &str) -> Result<Value, String> {
         use libloading::Library;
         let lib = unsafe { Library::new(lib_path) }
             .map_err(|e| format!("无法加载动态库 {}: {}", lib_path, e))?;
-        // 按符号名尝试常见签名:i64→i64(整数)、f64→f64(浮点)
         let sym_name = sym.to_string();
-        // 尝试 int fn(int)
-        if let Ok(f) = unsafe { lib.get::<unsafe extern "C" fn(i64) -> i64>(sym_name.as_bytes()) } {
-            let f = *f; // 复制函数指针('static),闭包不借用 lib
-            let v = Value::Builtin(sym_name.clone().into(), Arc::new(move |_s, args| {
-                let a = match args.first() {
-                    Some(Value::Int(n)) => *n,
-                    Some(Value::Float(n)) => *n as i64,
-                    _ => 0,
-                };
-                Ok(Value::Int(unsafe { f(a) }))
-            }));
-            self.extern_libs.push(lib);
-            return Ok(v);
-        }
-        // 尝试 double fn(double)
-        if let Ok(f) = unsafe { lib.get::<unsafe extern "C" fn(f64) -> f64>(sym_name.as_bytes()) } {
-            let f = *f;
-            let v = Value::Builtin(sym_name.clone().into(), Arc::new(move |_s, args| {
-                let a = match args.first() {
-                    Some(Value::Int(n)) => *n as f64,
-                    Some(Value::Float(n)) => *n,
-                    _ => 0.0,
-                };
-                Ok(Value::Float(unsafe { f(a) }))
-            }));
-            self.extern_libs.push(lib);
-            return Ok(v);
-        }
-        // §26 字符串签名:fn(str) -> str(UTF-8 → CString → CStr → UTF-8)
-        {
-            use std::ffi::{CString, CStr};
-            if let Ok(f) = unsafe { lib.get::<unsafe extern "C" fn(*const i8) -> *const i8>(sym_name.as_bytes()) } {
-                let f = *f;
+        match abi {
+            "i64->i64" | "ptr->i64" => {
+                let f = unsafe { lib.get::<unsafe extern "C" fn(i64) -> i64>(sym_name.as_bytes()) }
+                    .map(|f| *f)
+                    .map_err(|_| format!("符号 {} 无匹配的 C ABI 签名 {}", sym, abi))?;
+                let v = Value::Builtin(sym_name.clone().into(), Arc::new(move |_s, args| {
+                    let a = match args.first() {
+                        Some(Value::Int(n)) => *n,
+                        other => return Err(EvalError { message: format!("FFI {} 期望 i64 实参,实际 {:?}", sym_name, other) }),
+                    };
+                    Ok(Value::Int(unsafe { f(a) }))
+                }));
+                self.extern_libs.push(lib);
+                Ok(v)
+            }
+            "f64->f64" => {
+                let f = unsafe { lib.get::<unsafe extern "C" fn(f64) -> f64>(sym_name.as_bytes()) }
+                    .map(|f| *f)
+                    .map_err(|_| format!("符号 {} 无匹配的 C ABI 签名 {}", sym, abi))?;
+                let v = Value::Builtin(sym_name.clone().into(), Arc::new(move |_s, args| {
+                    let a = match args.first() {
+                        Some(Value::Float(n)) => *n,
+                        Some(Value::Int(n)) => *n as f64,
+                        other => return Err(EvalError { message: format!("FFI {} 期望 f64 实参,实际 {:?}", sym_name, other) }),
+                    };
+                    Ok(Value::Float(unsafe { f(a) }))
+                }));
+                self.extern_libs.push(lib);
+                Ok(v)
+            }
+            "str->i64" => {
+                use std::ffi::CString;
+                let f = unsafe { lib.get::<unsafe extern "C" fn(*const std::os::raw::c_char) -> i64>(sym_name.as_bytes()) }
+                    .map(|f| *f)
+                    .map_err(|_| format!("符号 {} 无匹配的 C ABI 签名 {}", sym, abi))?;
                 let v = Value::Builtin(sym_name.clone().into(), Arc::new(move |_s, args| {
                     let a = match args.first() {
                         Some(Value::Str(s)) => s.clone(),
-                        _ => String::new(),
+                        other => return Err(EvalError { message: format!("FFI {} 期望字符串实参,实际 {:?}", sym_name, other) }),
                     };
-                    let c = match CString::new(a) { Ok(c) => c, Err(_) => return Ok(Value::Str(String::new())) };
+                    let c = match CString::new(a) {
+                        Ok(c) => c,
+                        Err(e) => return Err(EvalError { message: format!("FFI 字符串含空字节: {}", e) }),
+                    };
+                    Ok(Value::Int(unsafe { f(c.as_ptr()) }))
+                }));
+                self.extern_libs.push(lib);
+                Ok(v)
+            }
+            "str->str" => {
+                use std::ffi::{CString, CStr};
+                let f = unsafe { lib.get::<unsafe extern "C" fn(*const std::os::raw::c_char) -> *mut std::os::raw::c_char>(sym_name.as_bytes()) }
+                    .map(|f| *f)
+                    .map_err(|_| format!("符号 {} 无匹配的 C ABI 签名 {}", sym, abi))?;
+                let v = Value::Builtin(sym_name.clone().into(), Arc::new(move |_s, args| {
+                    let a = match args.first() {
+                        Some(Value::Str(s)) => s.clone(),
+                        other => return Err(EvalError { message: format!("FFI {} 期望字符串实参,实际 {:?}", sym_name, other) }),
+                    };
+                    let c = match CString::new(a) {
+                        Ok(c) => c,
+                        Err(e) => return Err(EvalError { message: format!("FFI 字符串含空字节: {}", e) }),
+                    };
                     let r = unsafe { f(c.as_ptr()) };
                     if r.is_null() {
                         Ok(Value::Str(String::new()))
@@ -367,10 +409,10 @@ impl Interpreter {
                     }
                 }));
                 self.extern_libs.push(lib);
-                return Ok(v);
+                Ok(v)
             }
+            other => Err(format!("不支持的 FFI ABI 签名: {}", other)),
         }
-        Err(format!("符号 {} 无匹配的 C ABI 签名", sym))
     }
 
     pub fn define(&mut self, name: Symbol, value: Value) {
@@ -397,6 +439,13 @@ impl Interpreter {
     pub fn leave_region(&mut self) {
         self.regions.pop_region();
         self.current_region = None;
+        // 范式状态随区域回收:清空 RegionBox 句柄,后续访问返回「region already deallocated」
+        self.logic_store = None;
+        self.clp_store = None;
+        self.streams = None;
+        self.stream_transforms = None;
+        self.signals = None;
+        self.kb = None;
     }
 
     /// Allocate a value in the current region (for @1 linear values → stack)
@@ -411,6 +460,97 @@ impl Interpreter {
     /// Get region statistics
     pub fn region_stats(&self) -> &tisp_runtime::region::RegionStats {
         &self.regions.stats
+    }
+
+    /// 在指定区域分配并写入值(§统一内存管理)
+    fn region_box<T: 'static>(&mut self, region: RegionId, value: T) -> Result<RegionBox<T>, EvalError> {
+        RegionBox::new_in(&mut self.regions, region, value)
+            .ok_or_else(|| EvalError { message: "程序区域分配失败".into() })
+    }
+
+    /// 进入程序区域并分配全部单线程范式状态(错误路径自动配对 leave_region)
+    pub(crate) fn enter_program_region(&mut self) -> Result<RegionId, EvalError> {
+        let region = self.enter_region("program");
+        let setup = (|| -> Result<(), EvalError> {
+            self.logic_store = Some(self.region_box(region, LogicStore::new())?);
+            self.clp_store = Some(self.region_box(region, ClpStore::new())?);
+            self.streams = Some(self.region_box(region, HashMap::new())?);
+            self.stream_transforms = Some(self.region_box(region, HashMap::new())?);
+            self.signals = Some(self.region_box(region, HashMap::new())?);
+            self.kb = Some(self.region_box(region, tisp_core::evolp::Program::new())?);
+            Ok(())
+        })();
+        if let Err(e) = setup {
+            self.leave_region();
+            return Err(e);
+        }
+        Ok(region)
+    }
+
+    /// 登记通道生命周期:程序区域 pop 时释放通道缓冲并从 ProcessRuntime 摘除
+    fn track_channel_lifecycle(&mut self, channel: Symbol) -> Result<(), EvalError> {
+        let region = self.current_region.ok_or_else(region_deallocated)?;
+        let rt = self.process_runtime.clone();
+        self.regions.register_drop(region, Box::new(move || {
+            if let Ok(mut pr) = rt.lock() {
+                pr.release_channel(&channel);
+            }
+        }));
+        Ok(())
+    }
+
+    /// 访问逻辑变量表/trail(程序区域已回收时报错)
+    fn logic_store(&self) -> Result<&LogicStore, EvalError> {
+        self.logic_store.as_ref().map(|rb| rb.get()).ok_or_else(region_deallocated)
+    }
+
+    fn logic_store_mut(&mut self) -> Result<&mut LogicStore, EvalError> {
+        self.logic_store.as_mut().map(|rb| rb.get_mut()).ok_or_else(region_deallocated)
+    }
+
+    /// 访问 CLP 域表(程序区域已回收时报错)
+    fn clp_store(&self) -> Result<&ClpStore, EvalError> {
+        self.clp_store.as_ref().map(|rb| rb.get()).ok_or_else(region_deallocated)
+    }
+
+    fn clp_store_mut(&mut self) -> Result<&mut ClpStore, EvalError> {
+        self.clp_store.as_mut().map(|rb| rb.get_mut()).ok_or_else(region_deallocated)
+    }
+
+    /// 访问流缓存(程序区域已回收时报错)
+    fn streams(&self) -> Result<&HashMap<u64, Stream<i64>>, EvalError> {
+        self.streams.as_ref().map(|rb| rb.get()).ok_or_else(region_deallocated)
+    }
+
+    fn streams_mut(&mut self) -> Result<&mut HashMap<u64, Stream<i64>>, EvalError> {
+        self.streams.as_mut().map(|rb| rb.get_mut()).ok_or_else(region_deallocated)
+    }
+
+    /// 访问惰性流变换缓存(程序区域已回收时报错)
+    fn stream_transforms(&self) -> Result<&HashMap<u64, StreamTransform>, EvalError> {
+        self.stream_transforms.as_ref().map(|rb| rb.get()).ok_or_else(region_deallocated)
+    }
+
+    fn stream_transforms_mut(&mut self) -> Result<&mut HashMap<u64, StreamTransform>, EvalError> {
+        self.stream_transforms.as_mut().map(|rb| rb.get_mut()).ok_or_else(region_deallocated)
+    }
+
+    /// 访问 FRP 信号缓存(程序区域已回收时报错)
+    fn signals(&self) -> Result<&HashMap<u64, Signal<Value>>, EvalError> {
+        self.signals.as_ref().map(|rb| rb.get()).ok_or_else(region_deallocated)
+    }
+
+    fn signals_mut(&mut self) -> Result<&mut HashMap<u64, Signal<Value>>, EvalError> {
+        self.signals.as_mut().map(|rb| rb.get_mut()).ok_or_else(region_deallocated)
+    }
+
+    /// 访问 MOP 知识库(程序区域已回收时报错)
+    fn kb(&self) -> Result<&tisp_core::evolp::Program, EvalError> {
+        self.kb.as_ref().map(|rb| rb.get()).ok_or_else(region_deallocated)
+    }
+
+    fn kb_mut(&mut self) -> Result<&mut tisp_core::evolp::Program, EvalError> {
+        self.kb.as_mut().map(|rb| rb.get_mut()).ok_or_else(region_deallocated)
     }
 
     /// Convert interpreter Value to LogicValue
@@ -1000,7 +1140,24 @@ impl Interpreter {
                         return Ok(Value::Type(ty.clone()));
                     }
                 }
-                if let Some(v) = args.first() { Ok(Value::Str(v.type_name().to_string())) } else { Ok(Value::Str("unknown".into())) }
+                // 字面量/标量:直接映射到静态类型(§29.7,替换运行时值标签)
+                if let Some(v) = args.first() {
+                    let ty = match v {
+                        Value::Int(_) => Some(tisp_core::types::Type::i64()),
+                        Value::Float(_) => Some(tisp_core::types::Type::f64()),
+                        Value::Bool(_) => Some(tisp_core::types::Type::bool()),
+                        Value::Str(_) => Some(tisp_core::types::Type::string()),
+                        Value::Unit => Some(tisp_core::types::Type::unit()),
+                        _ => None,
+                    };
+                    if let Some(t) = ty {
+                        Ok(Value::Type(t))
+                    } else {
+                        Ok(Value::Str(v.type_name().to_string()))
+                    }
+                } else {
+                    Ok(Value::Str("unknown".into()))
+                }
             }),
             bi("grade-of", |s, args| {
                 // §10:查询定义参数等级列表
@@ -1063,6 +1220,7 @@ impl Interpreter {
                 let id = s.next_chan_id; s.next_chan_id += 1;
                 let name = Symbol::new(&format!("chan-{}", id));
                 s.process_runtime.lock().unwrap().new_channel(name.clone());
+                s.track_channel_lifecycle(name.clone())?;
                 Ok(Value::Str(name.as_str().to_string()))
             }),
             bi("send", |s, args| {
@@ -1076,8 +1234,19 @@ impl Interpreter {
             bi("recv", |s, args| {
                 if let Some(ch) = args.first() {
                     let chan_name = Symbol::new(&channel_name(ch));
-                    return match s.process_runtime.lock().unwrap().recv(&chan_name) {
-                        Some(v) => Ok(from_proc_value(v)),
+                    let handle = { s.process_runtime.lock().unwrap().get_channel(&chan_name) };
+                    return match handle {
+                        Some(c) => match c.recv_blocking() {
+                            Some(v) => Ok(from_proc_value(v)),
+                            None => {
+                                let closed = { s.process_runtime.lock().unwrap().is_closed(&chan_name) };
+                                Err(EvalError { message: if closed {
+                                    format!("recv on closed channel {}", chan_name)
+                                } else {
+                                    format!("recv on empty channel {}", chan_name)
+                                }})
+                            }
+                        },
                         None => Err(EvalError { message: format!("recv on empty channel {}", chan_name) }),
                     };
                 }
@@ -1088,7 +1257,7 @@ impl Interpreter {
                 if let Some(Value::Int(start)) = args.first() {
                     let st = Stream::unfold(*start, |n| n + 1);
                     let id = s.next_stream_id; s.next_stream_id += 1;
-                    s.streams.insert(id, st);
+                    s.streams_mut()?.insert(id, st);
                     return Ok(Value::Data(Symbol::new("Stream"), vec![Value::Int(*start), Value::Int(id as i64)]));
                 }
                 Ok(Value::Int(0))
@@ -1097,7 +1266,7 @@ impl Interpreter {
                 if args.len() >= 2 {
                     if let Value::Int(n) = &args[1] {
                         if let Ok(id) = stream_id(&args[0]) {
-                            if let Some(st) = s.streams.get(&id).cloned() {
+                            if let Some(st) = s.streams()?.get(&id).cloned() {
                                 let items: Vec<Value> = st.take(*n as usize).into_iter().map(Value::Int).collect();
                                 return Ok(list_from_vec(items));
                             }
@@ -1110,11 +1279,11 @@ impl Interpreter {
             bi("advance", |s, args| {
                 if let Some(v) = args.first() {
                     let id = stream_id(v)?;
-                    let next = match s.streams.get(&id).and_then(|st| st.clone().next()) {
+                    let next = match s.streams()?.get(&id).and_then(|st| st.clone().next()) {
                         Some(ns) => ns,
                         None => return Err(EvalError { message: "stream exhausted".into() }),
                     };
-                    s.streams.insert(id, next.clone());
+                    s.streams_mut()?.insert(id, next.clone());
                     let head = *next.now();
                     return Ok(Value::Data(Symbol::new("Stream"), vec![Value::Int(head), Value::Int(id as i64)]));
                 }
@@ -1142,7 +1311,7 @@ impl Interpreter {
                 if args.len() >= 2 {
                     if let Ok(id) = stream_id(&args[0]) {
                         let rate = match &args[1] { Value::Int(n) => (*n).max(1) as usize, _ => 1 };
-                        if let Some(st) = s.streams.get(&id).cloned() {
+                        if let Some(st) = s.streams()?.get(&id).cloned() {
                             let vals: Vec<Value> = st.take(rate * 5).into_iter()
                                 .step_by(rate).map(Value::Int).collect();
                             return Ok(list_from_vec(vals));
@@ -1182,7 +1351,7 @@ impl Interpreter {
                     if let Ok(id) = stream_id(&args[0]) {
                         let window = match &args[2] { Value::Int(n) => *n as usize, _ => 10 };
                         let pred = args[1].clone();
-                        if let Some(st) = s.streams.get(&id).cloned() {
+                        if let Some(st) = s.streams()?.get(&id).cloned() {
                             let vals = st.take(window);
                             for v in vals {
                                 let pv = s.apply(pred.clone(), &[Value::Int(v)]).unwrap_or(Value::Bool(false));
@@ -1199,7 +1368,7 @@ impl Interpreter {
                     if let Ok(id) = stream_id(&args[0]) {
                         let window = match &args[2] { Value::Int(n) => *n as usize, _ => 10 };
                         let pred = args[1].clone();
-                        if let Some(st) = s.streams.get(&id).cloned() {
+                        if let Some(st) = s.streams()?.get(&id).cloned() {
                             let vals = st.take(window);
                             for v in vals {
                                 let pv = s.apply(pred.clone(), &[Value::Int(v)]).unwrap_or(Value::Bool(false));
@@ -1219,14 +1388,14 @@ impl Interpreter {
             bi("search", |s, args| {
                 // §21.3:(search thunk) 回溯边界:成功保留绑定,失败恢复 trail
                 if let Some(f) = args.first() {
-                    let depth = s.logic_store.trail_depth();
-                    let cp_len = s.logic_store.choice_points_len();
-                    s.logic_store.mark_choice_point();
+                    let depth = s.logic_store()?.trail_depth();
+                    let cp_len = s.logic_store()?.choice_points_len();
+                    s.logic_store_mut()?.mark_choice_point();
                     let r = s.apply(f.clone(), &[]);
                     if r.is_err() {
-                        s.logic_store.restore_to(depth);
+                        s.logic_store_mut()?.restore_to(depth);
                     }
-                    s.logic_store.truncate_choice_points(cp_len);
+                    s.logic_store_mut()?.truncate_choice_points(cp_len);
                     r.or_else(|_| Ok(Value::Bool(false)))
                 } else {
                     Ok(Value::Bool(false))
@@ -1237,7 +1406,7 @@ impl Interpreter {
                 if let Some(Value::Int(id)) = args.first() {
                     let id = *id as u64;
                     let mut results = Vec::new();
-                    if s.clp_store.label(&[id], &mut results) {
+                    if s.clp_store_mut()?.label(&[id], &mut results) {
                         let mut vals: Vec<Value> = results.iter()
                             .filter_map(|sol| sol.get(&id).map(|v| Value::Int(*v)))
                             .collect();
@@ -1257,7 +1426,7 @@ impl Interpreter {
                     let _ = s.apply(thunk.clone(), &[]);
                     // 无 Match 收集点时,取当前绑定快照作为唯一解(§21.4)
                     if s.collected_solutions.is_empty() {
-                        let sol: Vec<Value> = s.logic_store.bound_snapshot()
+                        let sol: Vec<Value> = s.logic_store()?.bound_snapshot()
                             .iter().map(|(_, lv)| logic_to_value(lv)).collect();
                         if !sol.is_empty() { s.collected_solutions.push(sol); }
                     }
@@ -1281,26 +1450,52 @@ impl Interpreter {
                 let n = s.gensym_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(Value::Str(format!("g{}", n)))
             }),
-            bi("find-attack", |_s, _args| {
-                // §28 dolev-yao:攻击者窃听传输 + 合成(拼接)后检查机密是否进入知识
-                let checker = ModelChecker::new(20);
-                let secret = "SECRET";
-                let init = DolevYaoAttacker::new();
-                let result = checker.find_attack(init,
-                    |a| a.knows(secret),
-                    |a| {
-                        let mut next = a.clone();
-                        // 教学级协议:步骤 0 泄漏前缀,步骤 1 泄漏机密(不安全通道)
-                        if next.knowledge.is_empty() {
-                            next.eavesdrop("pub");
-                        } else {
-                            next.eavesdrop(secret);
-                        }
-                        // dolev-yao 合成:拼接已知消息(重放/篡改基础)
-                        next.synthesize();
-                        vec![next]
-                    });
-                Ok(Value::Bool(result.property_holds))
+            bi("find-attack", |_s, args| {
+                // §28 dolev-yao:无参调用保留教学场景;有参调用接受用户协议模型
+                // (find-attack secret transmissions),逐条窃听+合成并检测机密泄漏。
+                // 源码零参调用 desugar 为 App(f, Unit):单参 Unit 等价无参(§6.2)
+                let args: &[Value] = if args.len() == 1 && matches!(&args[0], Value::Unit) {
+                    &[]
+                } else {
+                    args
+                };
+                if args.is_empty() {
+                    let checker = ModelChecker::new(20);
+                    let secret = "SECRET";
+                    let init = DolevYaoAttacker::new();
+                    let result = checker.find_attack(init,
+                        |a| a.knows(secret),
+                        |a| {
+                            let mut next = a.clone();
+                            if next.knowledge.is_empty() {
+                                next.eavesdrop("pub");
+                            } else {
+                                next.eavesdrop(secret);
+                            }
+                            next.synthesize();
+                            vec![next]
+                        });
+                    return Ok(Value::Bool(result.property_holds));
+                }
+                if args.len() < 2 {
+                    return Err(EvalError { message: "find-attack 需 (secret transmissions) 2 参".into() });
+                }
+                let secret = value_to_string(&args[0]);
+                let transmissions = list_to_vec(&args[1]);
+                let mut attacker = DolevYaoAttacker::new();
+                for (i, msg) in transmissions.iter().enumerate() {
+                    let m = value_to_string(msg);
+                    attacker.eavesdrop(&m);
+                    attacker.synthesize();
+                    if attacker.knows(&secret) {
+                        return Ok(Value::Data(Symbol::new("AttackFound"), vec![
+                            Value::Bool(true), Value::Int(i as i64), Value::Str(m),
+                        ]));
+                    }
+                }
+                Ok(Value::Data(Symbol::new("AttackFound"), vec![
+                    Value::Bool(false), Value::Int(-1), Value::Str("no attack".into()),
+                ]))
             }),
             bi("check-equivalence", |_s, args| {
                 // §28:比较两个列表的状态集(去重后元素相等)
@@ -1326,12 +1521,99 @@ impl Interpreter {
                 }
                 Ok(Value::Bool(false))
             }),
+            // §28.1 (model-check init goal next max-depth):用户程序可达性搜索
+            bi("model-check", |s, args| {
+                if args.len() < 4 {
+                    return Err(EvalError { message: "model-check 需 (init goal next max-depth) 4 参".into() });
+                }
+                let init = args[0].clone();
+                let goal = args[1].clone();
+                let next_fn = args[2].clone();
+                let max_depth = match &args[3] { Value::Int(n) => (*n).max(0) as usize, _ => 20 };
+                let mut queue: std::collections::VecDeque<(Value, usize)> = std::collections::VecDeque::new();
+                let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut parent: std::collections::HashMap<String, (String, usize)> = std::collections::HashMap::new();
+                let init_key = format!("{:?}", init);
+                queue.push_back((init.clone(), 0));
+                visited.insert(init_key.clone());
+                parent.insert(init_key, ("start".to_string(), 0));
+                while let Some((state, depth)) = queue.pop_front() {
+                    if depth > max_depth { continue; }
+                    let ok = s.apply(goal.clone(), &[state.clone()])?;
+                    if is_truthy(&ok) {
+                        // 重建 trace:start → ... → 命中状态
+                        let mut trace = vec![format!("{:?}", state)];
+                        let mut cur = format!("{:?}", state);
+                        while let Some((p, d)) = parent.get(&cur).cloned() {
+                            if p == "start" { break; }
+                            trace.push(format!("depth {}: {}", d, p));
+                            cur = p;
+                        }
+                        trace.reverse();
+                        let trace_val: im::Vector<Value> = trace.into_iter().map(Value::Str).collect();
+                        return Ok(Value::Data(Symbol::new("VerifyResult"), vec![
+                            Value::Bool(true), Value::Int(depth as i64), Value::Vector(trace_val),
+                        ]));
+                    }
+                    let nexts = s.apply(next_fn.clone(), &[state.clone()])?;
+                    for n in list_to_vec(&nexts) {
+                        let key = format!("{:?}", n);
+                        if !visited.contains(&key) {
+                            visited.insert(key.clone());
+                            parent.insert(key.clone(), (format!("{:?}", state), depth));
+                            queue.push_back((n, depth + 1));
+                        }
+                    }
+                }
+                Ok(Value::Data(Symbol::new("VerifyResult"), vec![
+                    Value::Bool(false), Value::Int(-1), Value::Vector(im::Vector::new()),
+                ]))
+            }),
             bi("commit!", |_s, _args| Ok(Value::Unit)),
             // §27 SKI 组合子(支持部分应用)
             bi("S", |s, args| ski_s_apply(s, args.to_vec())),
             bi("K", |s, args| ski_k_apply(s, args.to_vec())),
             bi("I", |_s, args| {
                 if let Some(x) = args.first() { Ok(x.clone()) } else { Ok(Value::Unit) }
+            }),
+            // §27.10 演算互编码:源码可调用、返回可执行/可观察的编码结果
+            bi("pi-to-ski", |_s, args| {
+                if args.is_empty() { return Err(EvalError { message: "pi-to-ski 需 (ops) 1 参".into() }); }
+                let ops = parse_channel_ops(&args[0]).map_err(|e| EvalError { message: e })?;
+                let reduced = SKI::reduce_all(SKI::encode_pi_to_ski(&ops));
+                Ok(Value::Vector(SKI::collect_nums(&reduced).into_iter().map(Value::Int).collect()))
+            }),
+            bi("async-to-pi", |_s, args| {
+                if args.is_empty() { return Err(EvalError { message: "async-to-pi 需 (ops) 1 参".into() }); }
+                let ops = parse_async_ops(&args[0]).map_err(|e| EvalError { message: e })?;
+                let encoded = tisp_runtime::process::encode_async_to_sync(&ops);
+                Ok(channel_ops_to_value(&encoded))
+            }),
+            bi("applied-to-pi", |_s, args| {
+                if args.is_empty() { return Err(EvalError { message: "applied-to-pi 需 (ops) 1 参".into() }); }
+                let ops = parse_applied_ops(&args[0]).map_err(|e| EvalError { message: e })?;
+                let encoded = tisp_runtime::process::encode_applied_to_pi(&ops);
+                Ok(channel_ops_to_value(&encoded))
+            }),
+            bi("rho-to-pi", |_s, args| {
+                if args.is_empty() { return Err(EvalError { message: "rho-to-pi 需 (ops) 1 参".into() }); }
+                let ops = parse_rho_ops(&args[0]).map_err(|e| EvalError { message: e })?;
+                let encoded = tisp_runtime::process::encode_rho_to_pi(&ops);
+                Ok(channel_ops_to_value(&encoded))
+            }),
+            bi("ambient-to-channel", |_s, args| {
+                if args.is_empty() { return Err(EvalError { message: "ambient-to-channel 需 (caps) 1 参".into() }); }
+                let caps = parse_ambient_caps(&args[0]).map_err(|e| EvalError { message: e })?;
+                let msgs: Vec<Value> = caps.iter()
+                    .map(|c| Value::Str(tisp_runtime::process::ambient_cap_to_channel_msg(c)))
+                    .collect();
+                Ok(Value::Vector(msgs.into_iter().collect()))
+            }),
+            bi("trace-equivalence", |_s, args| {
+                if args.len() < 2 { return Err(EvalError { message: "trace-equivalence 需 (ops-a ops-b) 2 参".into() }); }
+                let a = parse_channel_ops(&args[0]).map_err(|e| EvalError { message: e })?;
+                let b = parse_channel_ops(&args[1]).map_err(|e| EvalError { message: e })?;
+                Ok(Value::Bool(tisp_runtime::process::check_trace_equivalence(&a, &b)))
             }),
             // ── 内置 effect 操作(§12.3):get/put/ask/tell/throw/choose 等,
             //    经 handler 栈分发(perform_effect)──
@@ -1341,7 +1623,7 @@ impl Interpreter {
             bi("tell", |s, args| s.perform_effect("tell", args.to_vec())),
             bi("throw", |s, args| s.perform_effect("throw", args.to_vec())),
             bi("choose", |s, args| s.perform_effect("choose", args.to_vec())),
-            // ── 范式集成(§31/§32):24 范式经 ParadigmRegistry 全链路接入,从源码可调用 ──
+            // ── 12 逻辑范式 + EVOLP/DLP/MOP 设施(经 ParadigmRegistry) ──
             bi("pf-higher-order", |_s, args| paradigm_eval("higher-order", args)),
             bi("pf-induce", |_s, args| paradigm_eval("induce", args)),
             bi("pf-prob", |_s, args| paradigm_eval("prob", args)),
@@ -1357,15 +1639,52 @@ impl Interpreter {
             bi("pf-evolp", |_s, args| paradigm_eval("evolp", args)),
             bi("pf-dlp", |_s, args| paradigm_eval("dlp", args)),
             bi("pf-get-kb", |_s, args| paradigm_eval("get-kb", args)),
-            bi("pf-array-sum", |_s, args| paradigm_eval("array-sum", args)),
-            bi("pf-stack-top", |_s, args| paradigm_eval("stack-top", args)),
-            bi("pf-compose", |_s, args| paradigm_eval("compose", args)),
-            bi("pf-sym-eval", |_s, args| paradigm_eval("sym-eval", args)),
-            bi("pf-dfa-accept", |_s, args| paradigm_eval("dfa-accept", args)),
-            bi("pf-sm-drive", |_s, args| paradigm_eval("sm-drive", args)),
-            bi("pf-dispatch", |_s, args| paradigm_eval("dispatch", args)),
-            bi("pf-stream-take", |_s, args| paradigm_eval("stream-take", args)),
-            bi("pf-aop-weave", |_s, args| paradigm_eval("aop-weave", args)),
+            // ── 8 编程范式完整源码表面(§1,纯声明式副作用管理) ──
+            bi("array", |s, args| array_builtin(s, args)),
+            bi("array-dims", |s, args| array_dims_builtin(s, args)),
+            bi("array-index", |s, args| array_index_builtin(s, args)),
+            bi("array-slice", |s, args| array_slice_builtin(s, args)),
+            bi("array-map", |s, args| array_map_builtin(s, args)),
+            bi("array-reduce", |s, args| array_reduce_builtin(s, args)),
+            bi("array-sum-axis0", |s, args| array_sum_axis0_builtin(s, args)),
+            bi("stack-new", |s, args| stack_new_builtin(s, args)),
+            bi("stack-push", |s, args| stack_push_builtin(s, args)),
+            bi("stack-pop", |s, args| stack_pop_builtin(s, args)),
+            bi("stack-peek", |s, args| stack_peek_builtin(s, args)),
+            bi("stack-dup", |s, args| stack_dup_builtin(s, args)),
+            bi("stack-swap", |s, args| stack_swap_builtin(s, args)),
+            bi("stack-rotate", |s, args| stack_rotate_builtin(s, args)),
+            bi("stack-len", |s, args| stack_len_builtin(s, args)),
+            bi("concatenate", |s, args| concatenate_builtin(s, args)),
+            bi("point-apply", |s, args| point_apply_builtin(s, args)),
+            bi("branch", |s, args| branch_builtin(s, args)),
+            bi("sym-num", |s, args| sym_num_builtin(s, args)),
+            bi("sym-var", |s, args| sym_var_builtin(s, args)),
+            bi("sym-add", |s, args| sym_add_builtin(s, args)),
+            bi("sym-mul", |s, args| sym_mul_builtin(s, args)),
+            bi("sym-substitute", |s, args| sym_substitute_builtin(s, args)),
+            bi("sym-simplify", |s, args| sym_simplify_builtin(s, args)),
+            bi("sym-eval", |s, args| sym_eval_builtin(s, args)),
+            bi("dfa-union", |s, args| dfa_union_builtin(s, args)),
+            bi("dfa-concat", |s, args| dfa_concat_builtin(s, args)),
+            bi("sm-new", |s, args| sm_new_builtin(s, args)),
+            bi("sm-drive", |s, args| sm_drive_builtin(s, args)),
+            bi("sm-trace", |s, args| sm_trace_builtin(s, args)),
+            bi("table-new", |s, args| table_new_builtin(s, args)),
+            bi("table-dispatch", |s, args| table_dispatch_builtin(s, args)),
+            bi("stream-map", |s, args| stream_map_builtin(s, args)),
+            bi("stream-filter", |s, args| stream_filter_builtin(s, args)),
+            bi("stream-sink", |s, args| stream_sink_builtin(s, args)),
+            // pf-* 别名:与完整内置同一实现(§4)
+            bi("pf-array-sum", |_s, args| { let xs = value_to_int_list(&args[0])?; Ok(Value::Int(xs.iter().sum())) }),
+            bi("pf-stack-top", |_s, args| { let xs = value_to_int_list(&args[0])?; xs.last().map(|n| Value::Int(*n)).ok_or_else(|| EvalError { message: "stack-top on empty stack".into() }) }),
+            bi("pf-compose", |s, args| concatenate_builtin(s, args)),
+            bi("pf-sym-eval", |s, args| sym_eval_builtin(s, args)),
+            bi("pf-dfa-accept", |s, args| dfa_accept_builtin(s, args)),
+            bi("pf-sm-drive", |s, args| sm_drive_builtin(s, args)),
+            bi("pf-dispatch", |s, args| table_dispatch_builtin(s, args)),
+            bi("pf-stream-take", |s, args| { let stream = args[0].clone(); let n = args.get(1).cloned().unwrap_or(Value::Int(1)); let f = s.env.last().and_then(|e| e.get(&Symbol::new("stream-take"))).cloned(); match f { Some(f) => s.apply(f, &[stream, n]).map(|v| Value::Vector(list_to_vec(&v).into_iter().collect())), None => Err(EvalError { message: "stream-take 未注册".into() }) } }),
+            bi("pf-aop-weave", |_s, _args| Err(EvalError { message: "pf-aop-weave 已由 comptime MOP 编织替代;请使用 defaspect".into() })),
             // §32 真实自动机:DFA 识别(接线 tisp_runtime::programming::Dfa,替换 pf-dfa-accept 的 sum%2 占位)
             // (dfa-accept start accept-list transitions input):transitions 为扁平 [from char-code to ...] 三元组
             bi("dfa-accept", |_s, args| {
@@ -1394,7 +1713,9 @@ impl Interpreter {
                     _ => return Err(EvalError { message: "dfa-accept:input 应为字符串".into() }),
                 };
                 let dfa = tisp_runtime::programming::Dfa { start, accept, transitions };
-                Ok(Value::Bool(dfa.accepts(&input)))
+                dfa.accepts_checked(&input)
+                    .map(Value::Bool)
+                    .map_err(|e| EvalError { message: e })
             }),
             // §32 真实状态机:事件驱动转移(接线 tisp_runtime::programming::StateMachine,替换 sm-drive 占位)
             // (sm-drive current event transitions):transitions 为扁平 [from event to ...] 三元组
@@ -1417,7 +1738,7 @@ impl Interpreter {
                 let transitions: Vec<(String, String, String)> = triples.chunks(3)
                     .map(|c| (c[0].to_string(), c[1].to_string(), c[2].to_string()))
                     .collect();
-                let mut sm = tisp_runtime::programming::StateMachine { current, transitions, trace: Vec::new() };
+                let mut sm = tisp_runtime::programming::StateMachine { current, transitions, actions: Vec::new(), trace: Vec::new() };
                 match sm.drive(&event) {
                     Ok(()) => Ok(Value::Int(sm.current.parse::<i64>().unwrap_or(0))),
                     Err(e) => Err(EvalError { message: e }),
@@ -1469,34 +1790,6 @@ impl Interpreter {
                 };
                 let mut tabler = tisp_runtime::paradigms::Tabler::new(&facts, rules);
                 Ok(Value::Bool(tabler.prove(&goal)))
-            }),
-            // §32 真实符号编程:后序构造 SymExpr + 化简 + 求值(接线 programming::SymExpr,替换 sym-eval 占位)
-            // (sym-eval postfix):postfix 为扁平后序记号,n≥0 = Num(n),-1 = Add,-2 = Mul
-            bi("sym-eval", |_s, args| {
-                use tisp_runtime::programming::SymExpr;
-                if args.len() != 1 {
-                    return Err(EvalError { message: "sym-eval 需 (postfix) 1 参".into() });
-                }
-                let toks = value_to_int_list(&args[0])?;
-                let mut stack: Vec<SymExpr> = Vec::new();
-                for t in toks {
-                    match t {
-                        n if n >= 0 => stack.push(SymExpr::Num(n)),
-                        -1 => {
-                            let b = stack.pop().ok_or_else(|| EvalError { message: "sym-eval:Add 缺操作数".into() })?;
-                            let a = stack.pop().ok_or_else(|| EvalError { message: "sym-eval:Add 缺操作数".into() })?;
-                            stack.push(SymExpr::Add(Box::new(a), Box::new(b)));
-                        }
-                        -2 => {
-                            let b = stack.pop().ok_or_else(|| EvalError { message: "sym-eval:Mul 缺操作数".into() })?;
-                            let a = stack.pop().ok_or_else(|| EvalError { message: "sym-eval:Mul 缺操作数".into() })?;
-                            stack.push(SymExpr::Mul(Box::new(a), Box::new(b)));
-                        }
-                        _ => return Err(EvalError { message: format!("sym-eval:未知记号 {}", t) }),
-                    }
-                }
-                let expr = stack.pop().ok_or_else(|| EvalError { message: "sym-eval:空表达式".into() })?;
-                Ok(Value::Int(expr.simplify().eval().unwrap_or(0)))
             }),
             // §31 真实 EVOLP/ASP:命题稳定模型(接线 tisp_runtime::evolp::stable_models,替换 evolp 占位)
             // (evolp-stable facts rules):facts 为正原子列表,rules 为扁平 [head body ...](body<0 = not atom)
@@ -1616,7 +1909,7 @@ impl Interpreter {
             // §31 MOP:GetKB/SetKB 效应操作(运行时 KB 状态)
             bi("get-kb", |s, _args| {
                 use tisp_core::evolp::LTerm;
-                let atoms: im::Vector<Value> = s.kb.iter().filter_map(|r| match &r.head {
+                let atoms: im::Vector<Value> = s.kb()?.iter().filter_map(|r| match &r.head {
                     LTerm::Fun(n, _) => n.as_str().parse::<i64>().ok().map(Value::Int),
                     _ => None,
                 }).collect();
@@ -1632,7 +1925,7 @@ impl Interpreter {
                 for a in atoms {
                     kb.add(Rule::fact(&a.to_string(), LTerm::atom(&a.to_string())));
                 }
-                s.kb = kb;
+                *s.kb_mut()? = kb;
                 Ok(Value::Unit)
             }),
             // §统一内存管理:Ref a 分级值(State 效应,非 Unsafe)——ref/deref/set!
@@ -1717,7 +2010,7 @@ impl Interpreter {
             // (plp-marginal query facts):facts 为 [atom prob atom prob ...]
             bi("plp-marginal", |_s, args| {
                 use tisp_core::evolp::LTerm;
-                use tisp_runtime::paradigms::{marginal, ProbFact};
+                use tisp_runtime::paradigms::{marginal_checked, ProbFact};
                 if args.len() != 2 {
                     return Err(EvalError { message: "plp-marginal 需 (query facts) 2 参".into() });
                 }
@@ -1742,7 +2035,9 @@ impl Interpreter {
                     };
                     facts.push(ProbFact { atom, prob });
                 }
-                Ok(Value::Float(marginal(&query, &facts)))
+                marginal_checked(&query, &facts)
+                    .map(Value::Float)
+                    .map_err(|e| EvalError { message: e })
             }),
             // (ilp-induce pos neg):归纳假设
             bi("ilp-induce", |_s, args| {
@@ -1783,6 +2078,11 @@ impl Interpreter {
                         _ => return Err(EvalError { message: "fuzzy-eval:真值度应为浮点".into() }),
                     };
                     facts.push(FuzzyFact { atom, degree });
+                }
+                for f in &facts {
+                    if !(0.0..=1.0).contains(&f.degree) {
+                        return Err(EvalError { message: format!("fuzzy-eval:真值度 {} 越界(须在 [0,1])", f.degree) });
+                    }
                 }
                 let atoms: Vec<LTerm> = value_to_int_list(&args[1])?.into_iter().map(|n| LTerm::atom(&n.to_string())).collect();
                 Ok(Value::Float(fuzzy_and(&facts, &atoms)))
@@ -1959,7 +2259,8 @@ impl Interpreter {
         builtin_arity(name).or_else(|| self.ctor_arity.get(name).copied())
     }
 
-    pub fn run_program(&mut self, program: &CoreProgram) -> Result<Option<Value>, EvalError> {
+    /// 注册程序声明(内置/构造器/反射签名/定义闭包/声明节点),不执行入口
+    pub(crate) fn register_program(&mut self, program: &CoreProgram) -> Result<(), EvalError> {
         self.register_builtins();
         // 注册 ADT 构造函数:零参构造注册为返回 Data 的 0 参内置(经 (Nil) 调用形式),
         // 带参构造注册为构造函数内置
@@ -2003,69 +2304,111 @@ impl Interpreter {
 
         // (deriving 已由 desugar 生成 DerivingImpl 节点,解释器在 def 求值时注册结构内置)
 
-        // Enter a program-level region for stack-like allocation
-        self.enter_region("program");
-
-        for def in &program.defs {
-            // 声明类节点(defgeneric/defmethod/defclass/definstance/ns/ffi/宏)立即求值,
-            // 其余包装为闭包延迟到调用(§6.2 顶层声明语义)
-            match &def.body.node {
-                CoreExprNode::GenericDef(..) | CoreExprNode::MethodDef(..)
-                | CoreExprNode::ClassDef(..) | CoreExprNode::InstanceDef(..)
-                | CoreExprNode::NSDef(..) | CoreExprNode::ExternDef(..)
-                | CoreExprNode::MacroDef(..) | CoreExprNode::HitDef(..)
-                | CoreExprNode::TheoremDef(..) | CoreExprNode::CompilerMacroDef(..)
-                | CoreExprNode::DerivingImpl(..) => {
-                    self.eval_expr(&def.body)?;
-                }
-                _ => {
-                    let closure = Closure {
-                        params: vec![],
-                        zero_params: vec![],
-                        body: def.body.clone(),
-                        env: self.env.last().cloned().unwrap_or_default(),
-                    };
-                    self.define(def.name.clone(), Value::Closure(closure));
+        // Enter a program-level region for stack-like allocation.
+        // 程序区域存活期间,所有单线程范式状态(CLP 域表/逻辑 trail/流缓存/信号缓存/KB)
+        // 都经 RegionBox 真实分配在该区域内;区域 pop 时由 RegionStack 的析构钩子回收。
+        let _program_region = self.enter_program_region()?;
+        let setup = (|| -> Result<(), EvalError> {
+            for def in &program.defs {
+                // 声明类节点(defgeneric/defmethod/defclass/definstance/ns/ffi/宏)立即求值,
+                // 其余包装为闭包延迟到调用(§6.2 顶层声明语义)
+                match &def.body.node {
+                    CoreExprNode::GenericDef(..) | CoreExprNode::MethodDef(..)
+                    | CoreExprNode::ClassDef(..) | CoreExprNode::InstanceDef(..)
+                    | CoreExprNode::NSDef(..) | CoreExprNode::ExternDef(..)
+                    | CoreExprNode::MacroDef(..) | CoreExprNode::HitDef(..)
+                    | CoreExprNode::TheoremDef(..) | CoreExprNode::CompilerMacroDef(..)
+                    | CoreExprNode::DerivingImpl(..) => {
+                        self.eval_expr(&def.body)?;
+                    }
+                    _ => {
+                        let closure = Closure {
+                            params: vec![],
+                            zero_params: vec![],
+                            body: def.body.clone(),
+                            env: self.env.last().cloned().unwrap_or_default(),
+                        };
+                        self.define(def.name.clone(), Value::Closure(closure));
+                    }
                 }
             }
+            Ok(())
+        })();
+
+        // 错误路径也必须与 enter_region 配对:注册失败时立即弹出程序区域
+        if let Err(e) = setup {
+            self.leave_region();
+            return Err(e);
         }
+        Ok(())
+    }
+
+    pub fn run_program(&mut self, program: &CoreProgram) -> Result<Option<Value>, EvalError> {
+        self.register_program(program)?;
 
         // 入口优先 __top__(顶层表达式),其次 main(§6.3)
-        let result = if let Some(top) = self.env.last().and_then(|e| e.get(&Symbol::new("__top__")).cloned()) {
-            Ok(Some(self.apply(top, &[])?))
-        } else if let Some(main) = self.env.last().and_then(|e| e.get(&Symbol::new("main")).cloned()) {
-            Ok(Some(self.apply(main, &[])?))
-        } else {
-            Ok(None)
-        };
+        let result = (|| -> Result<Option<Value>, EvalError> {
+            if let Some(top) = self.env.last().and_then(|e| e.get(&Symbol::new("__top__")).cloned()) {
+                Ok(Some(self.apply(top, &[])?))
+            } else if let Some(main) = self.env.last().and_then(|e| e.get(&Symbol::new("main")).cloned()) {
+                Ok(Some(self.apply(main, &[])?))
+            } else {
+                Ok(None)
+            }
+        })();
 
-        // Leave program region (deallocate all)  
+        // Leave program region (deallocate all):成功/失败路径都必须配对
         self.leave_region();
         result
     }
 
+    /// §28 用户程序验证:注册声明后逐个求值 defprop 属性,不执行 main
+    pub fn verify_properties(&mut self, program: &CoreProgram) -> Result<Vec<(Symbol, Value)>, EvalError> {
+        self.register_program(program)?;
+        let result = (|| -> Result<Vec<(Symbol, Value)>, EvalError> {
+            let props: Vec<(Symbol, CoreExpr)> = self.properties.iter()
+                .map(|(k, v)| (k.clone(), v.clone())).collect();
+            let mut results = Vec::new();
+            for (name, expr) in props {
+                let value = self.eval_expr(&expr)?;
+                results.push((name, value));
+            }
+            Ok(results)
+        })();
+        self.leave_region();
+        result
+    }
+
+    /// §21.5:识别 CLP 变量(已入域表)或把常数提升为 singleton 变量
+    fn clp_var_or_singleton(&mut self, v: &Value) -> Result<Option<u64>, EvalError> {
+        match v {
+            Value::Int(n) => {
+                let known = self.clp_store()?.domain_of(*n as u64).is_some();
+                if known {
+                    Ok(Some(*n as u64))
+                } else {
+                    Ok(Some(self.clp_store_mut()?.new_int_var(*n, *n)))
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// §21.5:把 (op a b) 比较编译为 CLP 约束(常数自动提升为 singleton 变量,实现域传播)
-    fn clp_constraint(&mut self, op: &str, a: &Value, b: &Value) {
+    fn clp_constraint(&mut self, op: &str, a: &Value, b: &Value) -> Result<(), EvalError> {
         // 任意一侧可为常数(提升为 singleton 变量);至少一侧是 CLP 变量才有效
-        let lv = match a {
-            Value::Int(id) if self.clp_store.domain_of(*id as u64).is_some() => Some(*id as u64),
-            Value::Int(c) => Some(self.clp_store.new_int_var(*c, *c)),
-            _ => None,
-        };
-        let rv = match b {
-            Value::Int(id) if self.clp_store.domain_of(*id as u64).is_some() => Some(*id as u64),
-            Value::Int(c) => Some(self.clp_store.new_int_var(*c, *c)),
-            _ => None,
-        };
+        let lv = self.clp_var_or_singleton(a)?;
+        let rv = self.clp_var_or_singleton(b)?;
         if let (Some(l), Some(r)) = (lv, rv) {
             // (op X Y) 的 AST 中 a=Y、b=X:语义 X op Y
             match op {
-                "<" => self.clp_store.add_lt(r, l), // X < Y
-                ">" => self.clp_store.add_lt(l, r), // Y < X
-                "=" | "==" => self.clp_store.add_eq(l, r),
+                "<" => self.clp_store_mut()?.add_lt(r, l), // X < Y
+                ">" => self.clp_store_mut()?.add_lt(l, r), // Y < X
+                "=" | "==" => self.clp_store_mut()?.add_eq(l, r),
                 _ => {}
             }
         }
+        Ok(())
     }
 
     /// §21.5 识别 (all-different v1 v2 ...) 柯里化链:返回变量表达式列表
@@ -2087,24 +2430,21 @@ impl Interpreter {
     }
 
     /// §21.5 算术约束:识别变量/常数为 CLP 变量,分发乘/除/模传播器
-    fn clp_arith_constraint(&mut self, op: &str, x: &Value, y: &Value, z: &Value) {
-        let mut to_var = |v: &Value| -> Option<u64> {
-            match v {
-                Value::Int(id) if self.clp_store.domain_of(*id as u64).is_some() => Some(*id as u64),
-                Value::Int(c) => Some(self.clp_store.new_int_var(*c, *c)),
-                _ => None,
-            }
-        };
-        if let (Some(xv), Some(yv), Some(zv)) = (to_var(x), to_var(y), to_var(z)) {
+    fn clp_arith_constraint(&mut self, op: &str, x: &Value, y: &Value, z: &Value) -> Result<(), EvalError> {
+        let xv = self.clp_var_or_singleton(x)?;
+        let yv = self.clp_var_or_singleton(y)?;
+        let zv = self.clp_var_or_singleton(z)?;
+        if let (Some(xv), Some(yv), Some(zv)) = (xv, yv, zv) {
             match op {
-                "*" => self.clp_store.add_mul(xv, yv, zv),
-                "/" => self.clp_store.add_div(xv, yv, zv),
-                "%" => self.clp_store.add_mod(xv, yv, zv),
-                "+" => self.clp_store.add_plus(xv, yv, zv),
-                "-" => self.clp_store.add_minus(xv, yv, zv),
+                "*" => self.clp_store_mut()?.add_mul(xv, yv, zv),
+                "/" => self.clp_store_mut()?.add_div(xv, yv, zv),
+                "%" => self.clp_store_mut()?.add_mod(xv, yv, zv),
+                "+" => self.clp_store_mut()?.add_plus(xv, yv, zv),
+                "-" => self.clp_store_mut()?.add_minus(xv, yv, zv),
                 _ => {}
             }
         }
+        Ok(())
     }
 
     /// §12.2/12.3:执行 effect 操作,从 handler 栈顶向下分发到匹配的 clause
@@ -2196,11 +2536,11 @@ impl Interpreter {
                 if self.collect_mode {
                     // §21 多解收集:遍历所有 arm,每个 arm 从本 Match 入口的干净状态开始
                     // (分支隔离:局部 trail 快照,替换全局 collect_start_depth,避免嵌套 Match 泄漏)
-                    let arm_start = self.logic_store.trail_depth();
+                    let arm_start = self.logic_store()?.trail_depth();
                     let mut last = Value::Unit;
                     for arm in arms {
-                        self.logic_store.restore_to(arm_start);
-                        if let Some(bindings) = self.match_pattern(&arm.pattern, &s) {
+                        self.logic_store_mut()?.restore_to(arm_start);
+                        if let Some(bindings) = self.match_pattern(&arm.pattern, &s)? {
                             self.push_scope();
                             for (name, val) in bindings {
                                 if let Some(top) = self.env.last_mut() { top.insert(name, val); }
@@ -2216,7 +2556,7 @@ impl Interpreter {
                                 let v = self.eval_expr(&arm.body)?;
                                 last = v;
                                 // 收集解:逻辑变量绑定快照(值化)
-                                let sol: Vec<Value> = self.logic_store.bound_snapshot()
+                                let sol: Vec<Value> = self.logic_store()?.bound_snapshot()
                                     .iter().map(|(_, lv)| logic_to_value(lv)).collect();
                                 self.collected_solutions.push(sol);
                             }
@@ -2226,7 +2566,7 @@ impl Interpreter {
                     return Ok(last);
                 }
                 for arm in arms {
-                    if let Some(bindings) = self.match_pattern(&arm.pattern, &s) {
+                    if let Some(bindings) = self.match_pattern(&arm.pattern, &s)? {
                         self.push_scope();
                         for (name, val) in bindings {
                             if let Some(top) = self.env.last_mut() { top.insert(name, val); }
@@ -2370,23 +2710,59 @@ impl Interpreter {
                     b1,
                 ]))
             }
-            CoreExprNode::Session(op, e) => {
-                let ch_id = "default";
+            CoreExprNode::Session(op, operands) => {
+                // §20 会话语义:operands[0] = 通道,其余为负载;协议状态按通道隔离,
+                // 负载经真实通道读写(不再丢弃)。
+                if operands.is_empty() {
+                    return Err(EvalError { message: "session op requires a channel".into() });
+                }
+                let ch_val = self.eval_expr(&operands[0])?;
+                let ch_id = channel_name(&ch_val).to_string();
                 match op {
                     tisp_core::core_ast::SessionOp::Send => {
-                        self.session_protocol.insert(ch_id.to_string(), "recv".to_string());
+                        let state = self.session_protocol.get(&ch_id).cloned().unwrap_or_else(|| "send".into());
+                        if state != "send" {
+                            return Err(EvalError { message: format!("session protocol error: channel {} expected send, got {}", ch_id, state) });
+                        }
+                        if operands.len() < 2 {
+                            return Err(EvalError { message: "session send requires a payload".into() });
+                        }
+                        let payload = self.eval_expr(&operands[1])?;
+                        self.session_protocol.insert(ch_id.clone(), "recv".to_string());
+                        self.process_runtime.lock().unwrap().send(&Symbol::new(&ch_id), to_proc_value(&payload));
+                        Ok(Value::Unit)
                     }
                     tisp_core::core_ast::SessionOp::Recv => {
-                        let state = self.session_protocol.get(ch_id).cloned().unwrap_or("send".into());
-                        if state != "recv" { return Err(EvalError { message: format!("session protocol error: expected recv, got {}", state) }); }
-                        self.session_protocol.insert(ch_id.to_string(), "close".to_string());
+                        let state = self.session_protocol.get(&ch_id).cloned().unwrap_or_else(|| "send".into());
+                        if state != "recv" {
+                            return Err(EvalError { message: format!("session protocol error: channel {} expected recv, got {}", ch_id, state) });
+                        }
+                        self.session_protocol.insert(ch_id.clone(), "close".to_string());
+                        let handle = { self.process_runtime.lock().unwrap().get_channel(&Symbol::new(&ch_id)) };
+                        match handle {
+                            Some(c) => match c.recv_blocking() {
+                                Some(v) => Ok(from_proc_value(v)),
+                                None => {
+                                    let closed = { self.process_runtime.lock().unwrap().is_closed(&Symbol::new(&ch_id)) };
+                                    Err(EvalError { message: if closed {
+                                        format!("session recv on closed channel {}", ch_id)
+                                    } else {
+                                        format!("session recv on empty channel {}", ch_id)
+                                    }})
+                                }
+                            },
+                            None => Err(EvalError { message: format!("session recv on empty channel {}", ch_id) }),
+                        }
                     }
                     tisp_core::core_ast::SessionOp::Close => {
-                        self.session_protocol.insert(ch_id.to_string(), "end".to_string());
+                        self.session_protocol.insert(ch_id.clone(), "end".to_string());
+                        self.process_runtime.lock().unwrap().close(&Symbol::new(&ch_id));
+                        Ok(Value::Unit)
                     }
-                    _ => {}
+                    tisp_core::core_ast::SessionOp::Fork(_) => {
+                        self.eval_expr(&operands[0])
+                    }
                 }
-                self.eval_expr(e)
             },
             // ── Logic Programming ──
             CoreExprNode::PredDef(name, params, clauses) => {
@@ -2401,7 +2777,7 @@ impl Interpreter {
                 Ok(Value::Unit)
             }
             CoreExprNode::Fresh(name) => {
-                let lv = self.logic_store.fresh_var();
+                let lv = self.logic_store_mut()?.fresh_var();
                 let id = match &lv {
                     LogicValue::Var(id) => *id,
                     _ => 0,
@@ -2415,34 +2791,34 @@ impl Interpreter {
                 let bv = self.eval_expr(b)?;
                 let la = self.val_to_logic(&av);
                 let lb = self.val_to_logic(&bv);
-                let ok = self.logic_store.unify(&la, &lb);
+                let ok = self.logic_store_mut()?.unify(&la, &lb);
                 Ok(Value::Bool(ok))
             }
             CoreExprNode::Search(e) => {
                 // Execute with backtracking: save trail depth, evaluate, restore on failure
-                let depth = self.logic_store.trail_depth();
-                let cp_len = self.logic_store.choice_points_len();
-                self.logic_store.mark_choice_point();
+                let depth = self.logic_store()?.trail_depth();
+                let cp_len = self.logic_store()?.choice_points_len();
+                self.logic_store_mut()?.mark_choice_point();
                 if self.collect_mode {
                     // §21 多解收集:求值 e(Match 收集所有 arm 解),恢复 trail
                     self.collect_start_depth = depth;
                     let result = self.eval_expr(e);
-                    self.logic_store.restore_to(depth);
-                    self.logic_store.truncate_choice_points(cp_len);
+                    self.logic_store_mut()?.restore_to(depth);
+                    self.logic_store_mut()?.truncate_choice_points(cp_len);
                     return result.or_else(|_| Ok(Value::Bool(false)));
                 }
                 let result = self.eval_expr(e);
                 if result.is_err() {
-                    self.logic_store.restore_to(depth);
+                    self.logic_store_mut()?.restore_to(depth);
                 }
                 // 无论成败都清理本次标记的 choice point:Search 只返回第一解,
                 // 成功后保留的点无消费者且会污染后续 cut/backtrack
-                self.logic_store.truncate_choice_points(cp_len);
+                self.logic_store_mut()?.truncate_choice_points(cp_len);
                 result.or_else(|_| Ok(Value::Bool(false)))
             }
             CoreExprNode::Commit(e) => {
                 let result = self.eval_expr(e)?;
-                self.logic_store.cut();
+                self.logic_store_mut()?.cut();
                 Ok(result)
             }
             CoreExprNode::Abduce(e, abducibles) => {
@@ -2451,7 +2827,7 @@ impl Interpreter {
                 // §21.6 domain 感知:从 CLP 存储取已声明变量的域范围,约束假设生成
                 let mut doms = std::collections::HashMap::new();
                 for (id, name) in &self.clp_var_names {
-                    if let Some(dom) = self.clp_store.domain_of(*id) {
+                    if let Some(dom) = self.clp_store()?.domain_of(*id) {
                         if let (Some(lo), Some(hi)) = (dom.min(), dom.max()) {
                             doms.insert(name.as_str().to_string(), (lo, hi));
                         }
@@ -2465,7 +2841,7 @@ impl Interpreter {
                 let mut consistent_all: Vec<Vec<Value>> = Vec::new();
                 for exp in explanations {
                     // 快照 CLP 存储,绑定假设,验证目标;验证后恢复
-                    let snapshot = self.clp_store.clone();
+                    let snapshot = self.clp_store()?.clone();
                     let mut bound_ok = true;
                     for h in &exp.hypotheses {
                         let id = self.clp_var_names.iter()
@@ -2474,10 +2850,10 @@ impl Interpreter {
                         match id {
                             Some(id) => {
                                 // 单值赋值(值不是变量 id):域 {value},传播后检测冲突
-                                self.clp_store.assign(id, h.value);
-                                self.clp_store.propagate();
-                                if self.clp_store.domain_of(id).map(|d| d.is_empty()).unwrap_or(false)
-                                    || self.clp_store.has_empty_domain() {
+                                self.clp_store_mut()?.assign(id, h.value);
+                                self.clp_store_mut()?.propagate();
+                                if self.clp_store()?.domain_of(id).map(|d| d.is_empty()).unwrap_or(false)
+                                    || self.clp_store()?.has_empty_domain() {
                                     bound_ok = false;
                                     break;
                                 }
@@ -2489,9 +2865,9 @@ impl Interpreter {
                         match self.eval_expr(e) {
                             Ok(v) if is_truthy(&v) => {
                                 // 约束冲突检测:传播(eval 内 constrain 只 push)后查域空
-                                self.clp_store.propagate();
-                                if self.clp_store.has_empty_domain() {
-                                    self.clp_store = snapshot;
+                                self.clp_store_mut()?.propagate();
+                                if self.clp_store()?.has_empty_domain() {
+                                    *self.clp_store_mut()? = snapshot;
                                     continue;
                                 }
                                 let hyps: Vec<Value> = exp.hypotheses.iter().map(|h| {
@@ -2505,7 +2881,7 @@ impl Interpreter {
                             _ => {}
                         }
                     }
-                    self.clp_store = snapshot;
+                    *self.clp_store_mut()? = snapshot;
                 }
                 if !consistent_all.is_empty() {
                     // 全部一致解释列表
@@ -2531,7 +2907,7 @@ impl Interpreter {
                 let l = self.eval_expr(lo)?;
                 let h = self.eval_expr(hi)?;
                 if let (Value::Int(lo_val), Value::Int(hi_val)) = (&l, &h) {
-                    let id = self.clp_store.new_int_var(*lo_val, *hi_val);
+                    let id = self.clp_store_mut()?.new_int_var(*lo_val, *hi_val);
                     if let Some(sym) = &var_sym {
                         if let Some(top) = self.env.last_mut() {
                             top.insert(sym.clone(), Value::Int(id as i64));
@@ -2564,7 +2940,7 @@ impl Interpreter {
                                                 let xv = self.eval_expr(g2)?;
                                                 let yv = self.eval_expr(g4)?;
                                                 let zv = self.eval_expr(a)?;
-                                                self.clp_arith_constraint(arith.as_str(), &xv, &yv, &zv);
+                                                self.clp_arith_constraint(arith.as_str(), &xv, &yv, &zv)?;
                                                 return Ok(Value::Bool(true));
                                             }
                                         }
@@ -2572,7 +2948,7 @@ impl Interpreter {
                                 }
                                 let va = self.eval_expr(a)?;
                                 let vb = self.eval_expr(b)?;
-                                self.clp_constraint(op.as_str(), &va, &vb);
+                                self.clp_constraint(op.as_str(), &va, &vb)?;
                                 return Ok(Value::Bool(true));
                             }
                         }
@@ -2583,13 +2959,13 @@ impl Interpreter {
                     let mut ids = Vec::new();
                     for v in &vars {
                         if let Value::Int(id) = self.eval_expr(v)? {
-                            if self.clp_store.domain_of(id as u64).is_some() {
+                            if self.clp_store()?.domain_of(id as u64).is_some() {
                                 ids.push(id as u64);
                             }
                         }
                     }
                     if !ids.is_empty() {
-                        self.clp_store.add_all_different(&ids);
+                        self.clp_store_mut()?.add_all_different(&ids);
                         return Ok(Value::Bool(true));
                     }
                 }
@@ -2603,18 +2979,18 @@ impl Interpreter {
                 let mut vars: Vec<u64> = Vec::new();
                 collect_clp_vars(&av, &mut vars);
                 let mut results: Vec<std::collections::HashMap<u64, i64>> = Vec::new();
-                if self.clp_store.label(&vars, &mut results) {
+                if self.clp_store_mut()?.label(&vars, &mut results) {
                     if let Some(sol) = results.first() {
                         // 提交解:写回单值域并传播(保留约束一致性,供后续独立 label)
                         for (id, v) in sol {
-                            self.clp_store.assign(*id, *v);
+                            self.clp_store_mut()?.assign(*id, *v);
                             if let Some(sym) = self.clp_var_names.get(id).cloned() {
                                 if let Some(top) = self.env.last_mut() {
                                     top.insert(sym, Value::Int(*v));
                                 }
                             }
                         }
-                        self.clp_store.propagate();
+                        self.clp_store_mut()?.propagate();
                         return Ok(Value::Bool(true));
                     }
                 }
@@ -2625,31 +3001,61 @@ impl Interpreter {
                 for x in xs {
                     if let Value::Int(id) = self.eval_expr(x)? { ids.push(id as u64); }
                 }
-                if !ids.is_empty() { self.clp_store.add_all_different(&ids); }
+                if !ids.is_empty() { self.clp_store_mut()?.add_all_different(&ids); }
                 Ok(Value::Unit)
             },
             // Process
-            CoreExprNode::Spawn(e, _h) => {
-                // Structured concurrency:子解释器共享通道运行时,线程内执行
+            CoreExprNode::Spawn(e, h) => {
+                // Structured concurrency:子解释器共享通道运行时,线程内执行;
+                // 返回句柄键,join 等待并传播结果/错误(§27.2)
                 let body = e.clone();
                 let rt = self.process_runtime.clone();
-                let _handle = std::thread::spawn(move || {
+                let parent_env = self.env.last().cloned().unwrap_or_default();
+                let handle_var = match &h.node {
+                    CoreExprNode::Var(n) => Some(n.clone()),
+                    _ => None,
+                };
+                let key = match &handle_var {
+                    Some(n) => n.as_str().to_string(),
+                    None => format!("task-{}", self.gensym_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)),
+                };
+                let handle = std::thread::spawn(move || -> Result<Value, String> {
                     let mut child = Interpreter::new();
                     child.register_builtins();
                     child.process_runtime = rt;
-                    match child.eval_expr(&body) {
-                        Ok(v) => Some(v),
-                        Err(_) => None,
-                    }
+                    // 捕获父作用域绑定(通道名等),使 spawn 体可引用外层 let
+                    child.env.push(parent_env);
+                    child.eval_expr(&body).map_err(|e| e.to_string())
                 });
-                // Store handle for potential join
-                Ok(Value::Str("spawned".into()))
+                self.spawn_handles.insert(key.clone(), handle);
+                if let Some(n) = handle_var {
+                    self.define(n, Value::Str(key.clone()));
+                }
+                Ok(Value::Str(key))
+            }
+            CoreExprNode::Join(h) => {
+                let key = match self.eval_expr(h) {
+                    Ok(Value::Str(k)) => k,
+                    _ => match &h.node {
+                        CoreExprNode::Var(n) => n.as_str().to_string(),
+                        _ => return Err(EvalError { message: "join expects a spawn handle".into() }),
+                    },
+                };
+                let handle = self.spawn_handles.remove(&key)
+                    .ok_or_else(|| EvalError { message: format!("unknown spawn handle: {}", key) })?;
+                match handle.join() {
+                    Ok(Ok(v)) => Ok(v),
+                    Ok(Err(msg)) => Err(EvalError { message: format!("spawned task failed: {}", msg) }),
+                    Err(_) => Err(EvalError { message: format!("spawned task panicked: {}", key) }),
+                }
             }
             CoreExprNode::ChannelNew => {
-                // §27.2:创建新通道,返回通道名
+                // §27.2:创建新通道,返回通道名;通道缓冲保留 Arc<Mutex<...>>,
+                // 但通过 RegionStack 钩子登记生命周期,程序区域退出时释放缓冲
                 let id = self.next_chan_id; self.next_chan_id += 1;
                 let name = Symbol::new(&format!("chan-{}", id));
                 self.process_runtime.lock().unwrap().new_channel(name.clone());
+                self.track_channel_lifecycle(name.clone())?;
                 Ok(Value::Str(name.as_str().to_string()))
             },
             CoreExprNode::ChannelSend(a, b) => {
@@ -2662,8 +3068,19 @@ impl Interpreter {
             CoreExprNode::ChannelRecv(a) => {
                 let ch = self.eval_expr(a)?;
                 let chan_name = Symbol::new(&channel_name(&ch));
-                match self.process_runtime.lock().unwrap().recv(&chan_name) {
-                    Some(v) => Ok(from_proc_value(v)),
+                let handle = { self.process_runtime.lock().unwrap().get_channel(&chan_name) };
+                match handle {
+                    Some(c) => match c.recv_blocking() {
+                        Some(v) => Ok(from_proc_value(v)),
+                        None => {
+                            let closed = { self.process_runtime.lock().unwrap().is_closed(&chan_name) };
+                            Err(EvalError { message: if closed {
+                                format!("recv on closed channel {}", chan_name)
+                            } else {
+                                format!("recv on empty channel {}", chan_name)
+                            }})
+                        }
+                    },
                     None => Err(EvalError { message: format!("recv on empty channel {}", chan_name) }),
                 }
             }
@@ -2679,12 +3096,11 @@ impl Interpreter {
                 // §27.2 异步通道:非阻塞接收(FIFO)
                 let chan = self.eval_expr(a)?;
                 let name = Symbol::new(&channel_name(&chan));
-                Ok(match self.process_runtime.lock().unwrap().recv(&name) {
+                Ok(match self.process_runtime.lock().unwrap().try_recv(&name) {
                     Some(v) => from_proc_value(v),
                     None => Value::Unit,
                 })
             },
-            CoreExprNode::Join(_h) => Ok(Value::Unit),  // Wait for spawned thread
             CoreExprNode::AmbientNew(name) => {
                 // §27 ambients:注册 ambient 名并绑定到环境
                 self.ambients.insert(Symbol::new(&format!("ambient-{}", name)), true);
@@ -2897,24 +3313,24 @@ impl Interpreter {
             CoreExprNode::SignalNew(e) => {
                 let init = self.eval_expr(e)?;
                 let id = self.next_signal_id; self.next_signal_id += 1;
-                self.signals.insert(id, Signal::new(init));
+                self.signals_mut()?.insert(id, Signal::new(init));
                 Ok(Value::Data(Symbol::new("Signal"), vec![Value::Int(id as i64)]))
             },
             CoreExprNode::SignalMap(a, b) => {
                 let f = self.eval_expr(a)?;
                 let sig = self.eval_expr(b)?;
                 let id = signal_id(&sig)?;
-                let cur = self.signals.get(&id).map(|s| s.get()).unwrap_or(Value::Unit);
+                let cur = self.signals()?.get(&id).map(|s| s.get()).unwrap_or(Value::Unit);
                 let mapped = self.apply(f, &[cur])?;
                 let new_id = self.next_signal_id; self.next_signal_id += 1;
-                self.signals.insert(new_id, Signal::new(mapped));
+                self.signals_mut()?.insert(new_id, Signal::new(mapped));
                 Ok(Value::Data(Symbol::new("Signal"), vec![Value::Int(new_id as i64)]))
             },
             CoreExprNode::SignalFilter(a, b) => {
                 let pred = self.eval_expr(a)?;
                 let sig = self.eval_expr(b)?;
                 let id = signal_id(&sig)?;
-                let cur = self.signals.get(&id).map(|s| s.get()).unwrap_or(Value::Unit);
+                let cur = self.signals()?.get(&id).map(|s| s.get()).unwrap_or(Value::Unit);
                 let ok = is_truthy(&self.apply(pred, &[cur])?);
                 Ok(Value::Bool(ok))
             },
@@ -2923,7 +3339,7 @@ impl Interpreter {
                 let init = self.eval_expr(b)?;
                 let sig = self.eval_expr(c)?;
                 let id = signal_id(&sig)?;
-                let cur = self.signals.get(&id).map(|s| s.get()).unwrap_or(Value::Unit);
+                let cur = self.signals()?.get(&id).map(|s| s.get()).unwrap_or(Value::Unit);
                 self.apply(f, &[init, cur])
             },
             CoreExprNode::SignalMerge(a, b) => { self.eval_expr(a)?; self.eval_expr(b)?; self.eval_expr(a) },
@@ -2932,11 +3348,11 @@ impl Interpreter {
                 // §18.2:推进惰性流到下一时刻
                 let v = self.eval_expr(e)?;
                 let id = stream_id(&v)?;
-                let next = match self.streams.get(&id).and_then(|s| s.clone().next()) {
+                let next = match self.streams()?.get(&id).and_then(|s| s.clone().next()) {
                     Some(ns) => ns,
                     None => return Err(EvalError { message: "stream exhausted".into() }),
                 };
-                self.streams.insert(id, next.clone());
+                self.streams_mut()?.insert(id, next.clone());
                 let head = *next.now();
                 Ok(Value::Data(Symbol::new("Stream"), vec![Value::Int(head), Value::Int(id as i64)]))
             },
@@ -2956,7 +3372,7 @@ impl Interpreter {
                     None => Ok(Value::Str(format!("(未定义: {})", name))),
                 }
             }
-            CoreExprNode::AdviceDef(_, _, _) => Ok(Value::Unit),
+            CoreExprNode::AdviceDef(_, _, _, _) => Ok(Value::Unit),
             // Theorem
             CoreExprNode::TheoremDef(name, prop) => {
                 // §28:登记验证属性(verify 内置查询)
@@ -3166,44 +3582,69 @@ impl Interpreter {
             // Module namespace (stub)
             CoreExprNode::NSDef(_, _, _) => Ok(Value::Unit),
             // FFI (stub)
-            CoreExprNode::ExternDef(name, c_name, _, _, _) => {
-                // §26 FFI:注册外部函数;ffi feature 下经 libloading 真实 dlopen(符号缺失报错),
-                // 否则回退模拟 C 函数表
-                #[cfg(feature = "ffi")]
-                if let Some((lib_path, sym)) = c_name.as_str().split_once(':') {
-                    match self.load_extern(lib_path, sym) {
-                        Ok(f) => { self.define(name.clone(), f); return Ok(Value::Unit); }
-                        Err(msg) => {
-                            return Err(EvalError { message: format!("FFI 加载失败: {}", msg) });
+            CoreExprNode::ExternDef(name, c_name, _, _, _, abi) => {
+                let _declared_abi = &abi;
+                // §26 FFI:注册外部函数。ffi feature 下按声明 ABI 经 libloading 真实 dlopen;
+                // 默认构建对真实库路径报错,模拟表仅覆盖显式已知符号并警告,未知符号报错。
+                if c_name.contains(':') {
+                    #[cfg(feature = "ffi")]
+                    {
+                        if let Some((lib_path, sym)) = c_name.as_str().split_once(':') {
+                            match self.load_extern(lib_path, sym, abi) {
+                                Ok(f) => { self.define(name.clone(), f); return Ok(Value::Unit); }
+                                Err(msg) => {
+                                    return Err(EvalError { message: format!("FFI 加载失败: {}", msg) });
+                                }
+                            }
                         }
                     }
+                    #[cfg(not(feature = "ffi"))]
+                    {
+                        return Err(EvalError {
+                            message: format!("未启用 ffi feature,无法加载动态库符号 {} ({});请以 --features ffi 构建", name, c_name),
+                        });
+                    }
                 }
-                // 模拟 C 函数表(默认构建回退)
+                // 模拟 C 函数表(仅无库路径且符号已知;输出一次性警告)
+                if !self.ffi_sim_warned {
+                    eprintln!("; warning: 当前构建未启用 ffi feature,外部符号 {} 使用模拟实现(仅 abs/llabs/strlen/sqrt)", c_name);
+                    self.ffi_sim_warned = true;
+                }
                 let c = c_name.clone();
                 let n = name.clone();
                 let ext = Value::Builtin(name.as_str().to_string(), Arc::new(move |_s, args| {
-                    // 模拟 C 函数表:已知符号映射到内置语义
-                    let mapped = match c.as_str() {
+                    match c.as_str() {
                         "abs" | "llabs" => {
-                            if let Some(Value::Int(v)) = args.first() { Value::Int(v.abs()) } else { Value::Int(0) }
+                            if let Some(Value::Int(v)) = args.first() {
+                                Ok(Value::Int(v.abs()))
+                            } else {
+                                Err(EvalError { message: format!("FFI {} 期望 i64 实参", c) })
+                            }
                         }
                         "strlen" => {
-                            if let Some(Value::Str(v)) = args.first() { Value::Int(v.len() as i64) } else { Value::Int(0) }
+                            if let Some(Value::Str(v)) = args.first() {
+                                Ok(Value::Int(v.len() as i64))
+                            } else {
+                                Err(EvalError { message: format!("FFI {} 期望字符串实参", c) })
+                            }
                         }
                         "sqrt" => {
-                            if let Some(Value::Int(v)) = args.first() { Value::Float((*v as f64).sqrt()) } else { Value::Float(0.0) }
+                            match args.first() {
+                                Some(Value::Int(v)) => Ok(Value::Float((*v as f64).sqrt())),
+                                Some(Value::Float(v)) => Ok(Value::Float(v.sqrt())),
+                                _ => Err(EvalError { message: format!("FFI {} 期望数值实参", c) }),
+                            }
                         }
-                        // 未映射的 C 函数:返回恒等调用占位
-                        _ => {
-                            return Ok(args.first().cloned().unwrap_or(Value::Unit));
-                        }
-                    };
-                    Ok(mapped)
+                        _ => Err(EvalError {
+                            message: format!("未知外部符号 {}:当前构建无 ffi feature,且该符号不在模拟表中", c),
+                        }),
+                    }
                 }));
                 self.define(n, ext);
                 Ok(Value::Unit)
             },
-            // Dependent types (stub)
+            // Dependent types (runtime semantics):依赖参数按擦除规则处理,
+            // 求值为作用域内的体(§19.1 显式语义;不可表示的形态由 desugar/typecheck 拒绝)
             CoreExprNode::Pi(_, _, body) => self.eval_expr(body),
             // §5.9 类型标注:运行时无操作
             CoreExprNode::Ann(_ty, inner) => self.eval_expr(inner),
@@ -3221,13 +3662,12 @@ impl Interpreter {
                 }
                 Ok(Value::Unit)
             }
-            CoreExprNode::Sigma(_, _, body) => self.eval_expr(body),
-            // HoTT extended
+            CoreExprNode::Sigma(_, _, body) => self.eval_expr(body),            // HoTT extended
             CoreExprNode::FunExt(e) => self.eval_expr(e),
         }
     }
 
-    fn apply(&mut self, func: Value, args: &[Value]) -> Result<Value, EvalError> {
+    pub(crate) fn apply(&mut self, func: Value, args: &[Value]) -> Result<Value, EvalError> {
         // §8.1 TCO 蹦床:尾调用在循环内复用栈帧(替换 apply→apply_inner→eval_expr→apply 的递归)
         let mut func = func;
         let mut args: Vec<Value> = args.to_vec();
@@ -3587,6 +4027,742 @@ fn value_to_int_list(v: &Value) -> Result<Vec<i64>, EvalError> {
         .collect()
 }
 
+// ═══════════════════════════════════════════════════════════════
+// §32 完整范式内置实现(数组/栈/连接式/符号/自动机/状态机/数据驱动/流)
+// 全部非法输入返回 EvalError,不返回默认值。
+// ═══════════════════════════════════════════════════════════════
+
+/// 从列表类值(Data Vec / Data Nil / Cons 链 / 持久化 Vector)取出元素;非法输入报错
+fn value_items(v: &Value, what: &str) -> Result<Vec<Value>, EvalError> {
+    match v {
+        Value::Data(name, fields) if name.as_str() == "Vec" => Ok(fields.clone()),
+        Value::Data(name, _) if name.as_str() == "Nil" => Ok(Vec::new()),
+        Value::Data(name, _) if name.as_str() == "Cons" => Ok(list_to_vec(v)),
+        Value::Vector(vs) => Ok(vs.iter().cloned().collect()),
+        _ => Err(EvalError { message: format!("{}:期望列表参数", what) }),
+    }
+}
+
+/// 取单个 i64 实参(带错误上下文)
+fn expect_int_arg(args: &[Value], pos: usize, what: &str) -> Result<i64, EvalError> {
+    match args.get(pos) {
+        Some(Value::Int(n)) => Ok(*n),
+        other => Err(EvalError { message: format!("{}:第 {} 个参数应为整数,实际 {:?}", what, pos + 1, other) }),
+    }
+}
+
+/// 取单个字符串实参(带错误上下文)
+fn expect_str_arg(args: &[Value], pos: usize, what: &str) -> Result<String, EvalError> {
+    match args.get(pos) {
+        Some(Value::Str(s)) => Ok(s.clone()),
+        other => Err(EvalError { message: format!("{}:第 {} 个参数应为字符串,实际 {:?}", what, pos + 1, other) }),
+    }
+}
+
+/// 取单个布尔实参(带错误上下文)
+fn expect_bool_arg(args: &[Value], pos: usize, what: &str) -> Result<bool, EvalError> {
+    match args.get(pos) {
+        Some(Value::Bool(b)) => Ok(*b),
+        other => Err(EvalError { message: format!("{}:第 {} 个参数应为布尔值,实际 {:?}", what, pos + 1, other) }),
+    }
+}
+
+/// i64 列表 → usize 列表(索引/形状用,负数拒绝)
+fn to_usize_list(xs: &[i64], what: &str) -> Result<Vec<usize>, EvalError> {
+    xs.iter().map(|n| {
+        if *n < 0 {
+            Err(EvalError { message: format!("{}:负数 {} 不能作为索引/形状", what, n) })
+        } else {
+            Ok(*n as usize)
+        }
+    }).collect()
+}
+
+// ── 数组编程 ──
+
+/// 从解释器值解析 Array<i64>(Data("Array",[Vector shape, Vector data]))
+fn array_from_value(v: &Value, what: &str) -> Result<tisp_runtime::programming::Array<i64>, EvalError> {
+    if let Value::Data(name, fields) = v {
+        if name.as_str() == "Array" && fields.len() == 2 {
+            let shape = to_usize_list(&value_to_int_list(&fields[0])?, what)?;
+            let data = value_to_int_list(&fields[1])?;
+            return tisp_runtime::programming::Array::new_checked(shape, data)
+                .map_err(|e| EvalError { message: format!("{}:{}", what, e) });
+        }
+    }
+    Err(EvalError { message: format!("{}:期望 Array 值", what) })
+}
+
+/// 把 Array<i64> 编码为 Data("Array",[Vector shape, Vector data])
+fn array_to_value(a: &tisp_runtime::programming::Array<i64>) -> Value {
+    Value::Data(Symbol::new("Array"), vec![
+        Value::Vector(a.shape.iter().map(|n| Value::Int(*n as i64)).collect()),
+        Value::Vector(a.data.iter().map(|n| Value::Int(*n)).collect()),
+    ])
+}
+
+fn array_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError { message: "array 需 (shape-list data-list) 2 参".into() });
+    }
+    let shape = to_usize_list(&value_to_int_list(&args[0])?, "array")?;
+    let data = value_to_int_list(&args[1])?;
+    let a = tisp_runtime::programming::Array::new_checked(shape, data)
+        .map_err(|e| EvalError { message: format!("array:{}", e) })?;
+    Ok(array_to_value(&a))
+}
+
+fn array_dims_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError { message: "array-dims 需 (array) 1 参".into() });
+    }
+    let a = array_from_value(&args[0], "array-dims")?;
+    Ok(Value::Vector(a.dims().iter().map(|n| Value::Int(*n as i64)).collect()))
+}
+
+fn array_index_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError { message: "array-index 需 (array idx-list) 2 参".into() });
+    }
+    let a = array_from_value(&args[0], "array-index")?;
+    let idx = to_usize_list(&value_to_int_list(&args[1])?, "array-index")?;
+    let v = a.index_checked(&idx).map_err(|e| EvalError { message: format!("array-index:{}", e) })?;
+    Ok(Value::Int(*v))
+}
+
+fn array_slice_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError { message: "array-slice 需 (array lo hi) 3 参".into() });
+    }
+    let a = array_from_value(&args[0], "array-slice")?;
+    let lo = expect_int_arg(args, 1, "array-slice")?;
+    let hi = expect_int_arg(args, 2, "array-slice")?;
+    if lo < 0 || hi < 0 {
+        return Err(EvalError { message: "array-slice:lo/hi 不能为负".into() });
+    }
+    let b = a.slice(lo as usize, hi as usize)
+        .map_err(|e| EvalError { message: format!("array-slice:{}", e) })?;
+    Ok(array_to_value(&b))
+}
+
+fn array_map_builtin(s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError { message: "array-map 需 (array fn) 2 参".into() });
+    }
+    let a = array_from_value(&args[0], "array-map")?;
+    let f = args[1].clone();
+    if !is_callable(&f) {
+        return Err(EvalError { message: "array-map:fn 应为函数".into() });
+    }
+    let mut out = Vec::with_capacity(a.data.len());
+    for x in &a.data {
+        match s.apply(f.clone(), &[Value::Int(*x)])? {
+            Value::Int(n) => out.push(n),
+            other => return Err(EvalError { message: format!("array-map:fn 返回 {:?},需整数", other) }),
+        }
+    }
+    Ok(array_to_value(&tisp_runtime::programming::Array { shape: a.shape.clone(), data: out }))
+}
+
+fn array_reduce_builtin(s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError { message: "array-reduce 需 (array init fn) 3 参".into() });
+    }
+    let a = array_from_value(&args[0], "array-reduce")?;
+    let init = expect_int_arg(args, 1, "array-reduce")?;
+    let f = args[2].clone();
+    if !is_callable(&f) {
+        return Err(EvalError { message: "array-reduce:fn 应为函数".into() });
+    }
+    let mut acc = init;
+    for x in &a.data {
+        acc = match s.apply(f.clone(), &[Value::Int(acc), Value::Int(*x)])? {
+            Value::Int(n) => n,
+            other => return Err(EvalError { message: format!("array-reduce:fn 返回 {:?},需整数", other) }),
+        };
+    }
+    Ok(Value::Int(acc))
+}
+
+fn array_sum_axis0_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError { message: "array-sum-axis0 需 (array) 1 参".into() });
+    }
+    let a = array_from_value(&args[0], "array-sum-axis0")?;
+    Ok(Value::Vector(a.sum_axis0().into_iter().map(Value::Int).collect()))
+}
+
+// ── 栈编程(句柄 = Value::Vector<Value>,栈顶在末位)──
+
+/// 把栈句柄解包为元素序列;非 Vector 报错
+fn stack_to_vec(v: &Value, what: &str) -> Result<Vec<Value>, EvalError> {
+    match v {
+        Value::Vector(vs) => Ok(vs.iter().cloned().collect()),
+        _ => Err(EvalError { message: format!("{}:期望栈句柄(Stack)", what) }),
+    }
+}
+
+/// 把元素序列打包为栈句柄
+fn stack_from_vec(vs: Vec<Value>) -> Value {
+    Value::Vector(vs.into_iter().collect())
+}
+
+fn stack_new_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    // (stack-new) 零参调用会额外收到 Unit 实参,允许并忽略
+    if !args.is_empty() && !matches!(args[0], Value::Unit) {
+        return Err(EvalError { message: "stack-new 需 0 参".into() });
+    }
+    Ok(Value::Vector(im::Vector::new()))
+}
+
+fn stack_push_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError { message: "stack-push 需 (stack v) 2 参".into() });
+    }
+    let mut vs = stack_to_vec(&args[0], "stack-push")?;
+    vs.push(args[1].clone());
+    Ok(stack_from_vec(vs))
+}
+
+fn stack_pop_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError { message: "stack-pop 需 (stack) 1 参".into() });
+    }
+    let mut vs = stack_to_vec(&args[0], "stack-pop")?;
+    match vs.pop() {
+        Some(top) => Ok(Value::Vector(im::vector![stack_from_vec(vs), top])),
+        None => Err(EvalError { message: "stack-pop:空栈不可弹出".into() }),
+    }
+}
+
+fn stack_peek_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError { message: "stack-peek 需 (stack) 1 参".into() });
+    }
+    let vs = stack_to_vec(&args[0], "stack-peek")?;
+    match vs.last() {
+        Some(top) => Ok(top.clone()),
+        None => Err(EvalError { message: "stack-peek:空栈不可查看".into() }),
+    }
+}
+
+fn stack_dup_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError { message: "stack-dup 需 (stack) 1 参".into() });
+    }
+    let mut vs = stack_to_vec(&args[0], "stack-dup")?;
+    if let Some(top) = vs.last().cloned() {
+        vs.push(top);
+    }
+    Ok(stack_from_vec(vs))
+}
+
+fn stack_swap_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError { message: "stack-swap 需 (stack) 1 参".into() });
+    }
+    let mut vs = stack_to_vec(&args[0], "stack-swap")?;
+    let n = vs.len();
+    if n >= 2 {
+        vs.swap(n - 1, n - 2);
+    }
+    Ok(stack_from_vec(vs))
+}
+
+fn stack_rotate_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError { message: "stack-rotate 需 (stack n) 2 参".into() });
+    }
+    let vs = stack_to_vec(&args[0], "stack-rotate")?;
+    let n = expect_int_arg(args, 1, "stack-rotate")?;
+    if n < 0 {
+        return Err(EvalError { message: "stack-rotate:n 不能为负".into() });
+    }
+    let len = vs.len();
+    if len == 0 {
+        return Err(EvalError { message: "stack-rotate:空栈不可旋转".into() });
+    }
+    let n = (n as usize) % len;
+    let mut vs = vs;
+    if n > 0 {
+        let v = vs.remove(len - 1 - n);
+        vs.push(v);
+    }
+    Ok(stack_from_vec(vs))
+}
+
+fn stack_len_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError { message: "stack-len 需 (stack) 1 参".into() });
+    }
+    Ok(Value::Int(stack_to_vec(&args[0], "stack-len")?.len() as i64))
+}
+
+// ── 连接式编程 ──
+
+fn is_callable(v: &Value) -> bool {
+    matches!(v, Value::Closure(_) | Value::Builtin(_, _))
+}
+
+fn concatenate_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError { message: "concatenate 需 (f g) 2 参".into() });
+    }
+    let f = args[0].clone();
+    let g = args[1].clone();
+    if !is_callable(&f) || !is_callable(&g) {
+        return Err(EvalError { message: "concatenate:f/g 应为函数".into() });
+    }
+    // 组合语义:compose(f, g) = g ∘ f,即先 f 后 g
+    Ok(Value::Builtin("__composed".into(), Arc::new(move |s, xs| {
+        if xs.is_empty() {
+            return Err(EvalError { message: "concatenate 组合函数需 1 参".into() });
+        }
+        let y = s.apply(f.clone(), &xs[0..1])?;
+        s.apply(g.clone(), &[y])
+    })))
+}
+
+fn point_apply_builtin(s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError { message: "point-apply 需 (f x) 2 参".into() });
+    }
+    let f = args[0].clone();
+    if !is_callable(&f) {
+        return Err(EvalError { message: "point-apply:f 应为函数".into() });
+    }
+    s.apply(f, &[args[1].clone()])
+}
+
+fn branch_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError { message: "branch 需 (cond then else) 3 参".into() });
+    }
+    let cond = expect_bool_arg(args, 0, "branch")?;
+    Ok(if cond { args[1].clone() } else { args[2].clone() })
+}
+
+// ── 符号编程 ──
+
+fn value_to_sym_expr(v: &Value) -> Result<tisp_runtime::programming::SymExpr, EvalError> {
+    use tisp_runtime::programming::SymExpr;
+    match v {
+        Value::Data(name, fields) => match (name.as_str(), fields.as_slice()) {
+            ("SymNum", [Value::Int(n)]) => Ok(SymExpr::Num(*n)),
+            ("SymVar", [Value::Str(s)]) => Ok(SymExpr::Var(s.clone())),
+            ("SymAdd", [a, b]) => Ok(SymExpr::Add(
+                Box::new(value_to_sym_expr(a)?), Box::new(value_to_sym_expr(b)?))),
+            ("SymMul", [a, b]) => Ok(SymExpr::Mul(
+                Box::new(value_to_sym_expr(a)?), Box::new(value_to_sym_expr(b)?))),
+            _ => Err(EvalError { message: "sym:未知符号表达式".into() }),
+        },
+        _ => Err(EvalError { message: "sym:期望 SymNum/SymVar/SymAdd/SymMul 值".into() }),
+    }
+}
+
+fn sym_expr_to_value(e: &tisp_runtime::programming::SymExpr) -> Value {
+    use tisp_runtime::programming::SymExpr;
+    match e {
+        SymExpr::Num(n) => Value::Data(Symbol::new("SymNum"), vec![Value::Int(*n)]),
+        SymExpr::Var(v) => Value::Data(Symbol::new("SymVar"), vec![Value::Str(v.clone())]),
+        SymExpr::Add(a, b) => Value::Data(Symbol::new("SymAdd"), vec![sym_expr_to_value(a), sym_expr_to_value(b)]),
+        SymExpr::Mul(a, b) => Value::Data(Symbol::new("SymMul"), vec![sym_expr_to_value(a), sym_expr_to_value(b)]),
+    }
+}
+
+fn sym_num_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError { message: "sym-num 需 (n) 1 参".into() });
+    }
+    Ok(sym_expr_to_value(&tisp_runtime::programming::SymExpr::Num(expect_int_arg(args, 0, "sym-num")?)))
+}
+
+fn sym_var_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError { message: "sym-var 需 (s) 1 参".into() });
+    }
+    Ok(sym_expr_to_value(&tisp_runtime::programming::SymExpr::Var(expect_str_arg(args, 0, "sym-var")?)))
+}
+
+fn sym_add_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError { message: "sym-add 需 (a b) 2 参".into() });
+    }
+    Ok(sym_expr_to_value(&tisp_runtime::programming::SymExpr::Add(
+        Box::new(value_to_sym_expr(&args[0])?), Box::new(value_to_sym_expr(&args[1])?))))
+}
+
+fn sym_mul_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError { message: "sym-mul 需 (a b) 2 参".into() });
+    }
+    Ok(sym_expr_to_value(&tisp_runtime::programming::SymExpr::Mul(
+        Box::new(value_to_sym_expr(&args[0])?), Box::new(value_to_sym_expr(&args[1])?))))
+}
+
+fn sym_substitute_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError { message: "sym-substitute 需 (expr var-str val) 3 参".into() });
+    }
+    let expr = value_to_sym_expr(&args[0])?;
+    let var = expect_str_arg(args, 1, "sym-substitute")?;
+    let val = expect_int_arg(args, 2, "sym-substitute")?;
+    Ok(sym_expr_to_value(&expr.substitute(&var, val)))
+}
+
+fn sym_simplify_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError { message: "sym-simplify 需 (expr) 1 参".into() });
+    }
+    Ok(sym_expr_to_value(&value_to_sym_expr(&args[0])?.simplify()))
+}
+
+fn sym_eval_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError { message: "sym-eval 需 (expr) 1 参".into() });
+    }
+    let expr = value_to_sym_expr(&args[0])?;
+    expr.eval_checked().map(Value::Int).map_err(|e| EvalError { message: format!("sym-eval:{}", e) })
+}
+
+// ── 自动机编程 ──
+
+/// 从 Value 构造 Dfa(start/accept/transitions 均按字符串状态)
+fn dfa_from_value(v: &Value, what: &str) -> Result<tisp_runtime::programming::Dfa, EvalError> {
+    let items = value_items(v, what)?;
+    if items.len() != 3 {
+        return Err(EvalError { message: format!("{}:dfa 描述应为 [start accepts transitions] 3 元", what) });
+    }
+    let start = match &items[0] {
+        Value::Int(n) => n.to_string(),
+        Value::Str(s) => s.clone(),
+        other => return Err(EvalError { message: format!("{}:start 应为整数或字符串,实际 {:?}", what, other) }),
+    };
+    let accept: im::HashSet<String> = value_to_int_list(&items[1])?
+        .into_iter().map(|n| n.to_string()).collect();
+    let triples = value_to_int_list(&items[2])?;
+    if triples.len() % 3 != 0 {
+        return Err(EvalError { message: format!("{}:transitions 长度须为 3 的倍数", what) });
+    }
+    let mut transitions = Vec::new();
+    for chunk in triples.chunks(3) {
+        let ch = char::from_u32(chunk[1] as u32)
+            .ok_or_else(|| EvalError { message: format!("{}:非法字符码 {}", what, chunk[1]) })?;
+        transitions.push((chunk[0].to_string(), ch, chunk[2].to_string()));
+    }
+    Ok(tisp_runtime::programming::Dfa { start, accept, transitions })
+}
+
+fn dfa_accept_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 4 {
+        return Err(EvalError { message: "dfa-accept 需 (start accept-list transitions input) 4 参".into() });
+    }
+    let dfa = dfa_from_value(
+        &Value::Vector(im::vector![args[0].clone(), args[1].clone(), args[2].clone()]),
+        "dfa-accept",
+    )?;
+    let input = match &args[3] {
+        Value::Str(s) => s.clone(),
+        other => return Err(EvalError { message: format!("dfa-accept:input 应为字符串,实际 {:?}", other) }),
+    };
+    dfa.accepts_checked(&input).map(Value::Bool).map_err(|e| EvalError { message: e })
+}
+
+fn dfa_union_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError { message: "dfa-union 需 (dfa-a dfa-b input) 3 参".into() });
+    }
+    let a = dfa_from_value(&args[0], "dfa-union:a")?;
+    let b = dfa_from_value(&args[1], "dfa-union:b")?;
+    let input = match &args[2] {
+        Value::Str(s) => s.clone(),
+        other => return Err(EvalError { message: format!("dfa-union:input 应为字符串,实际 {:?}", other) }),
+    };
+    let dfa = a.union(&b);
+    dfa.accepts_checked(&input).map(Value::Bool).map_err(|e| EvalError { message: e })
+}
+
+fn dfa_concat_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError { message: "dfa-concat 需 (dfa-a dfa-b input) 3 参".into() });
+    }
+    let a = dfa_from_value(&args[0], "dfa-concat:a")?;
+    let b = dfa_from_value(&args[1], "dfa-concat:b")?;
+    let input = match &args[2] {
+        Value::Str(s) => s.clone(),
+        other => return Err(EvalError { message: format!("dfa-concat:input 应为字符串,实际 {:?}", other) }),
+    };
+    let dfa = a.concat(&b);
+    dfa.accepts_checked(&input).map(Value::Bool).map_err(|e| EvalError { message: e })
+}
+
+// ── 状态机编程 ──
+
+/// 解析 SM 句柄 Data("SM",[Vector 状态, Vector transitions, Vector actions, Vector trace])
+fn sm_from_value(v: &Value, what: &str) -> Result<tisp_runtime::programming::StateMachine, EvalError> {
+    if let Value::Data(name, fields) = v {
+        if name.as_str() == "SM" && fields.len() == 4 {
+            let states = value_items(&fields[0], what)?;
+            let current = match states.first() {
+                Some(Value::Int(n)) => n.to_string(),
+                Some(Value::Str(s)) => s.clone(),
+                _ => return Err(EvalError { message: format!("{}:states 首元素应为当前状态", what) }),
+            };
+            let triples = value_to_int_list(&fields[1])?;
+            if triples.len() % 3 != 0 {
+                return Err(EvalError { message: format!("{}:transitions 长度须为 3 的倍数", what) });
+            }
+            let transitions: Vec<(String, String, String)> = triples.chunks(3)
+                .map(|c| (c[0].to_string(), c[1].to_string(), c[2].to_string()))
+                .collect();
+            let action_items = value_items(&fields[2], what)?;
+            if action_items.len() % 3 != 0 {
+                return Err(EvalError { message: format!("{}:actions 长度须为 3 的倍数", what) });
+            }
+            let mut actions = Vec::new();
+            for chunk in action_items.chunks(3) {
+                let state = match &chunk[0] {
+                    Value::Int(n) => n.to_string(),
+                    Value::Str(s) => s.clone(),
+                    other => return Err(EvalError { message: format!("{}:action 状态应为整数或字符串,实际 {:?}", what, other) }),
+                };
+                let event = match &chunk[1] {
+                    Value::Int(n) => n.to_string(),
+                    Value::Str(s) => s.clone(),
+                    other => return Err(EvalError { message: format!("{}:action 事件应为整数或字符串,实际 {:?}", what, other) }),
+                };
+                let action = match &chunk[2] {
+                    Value::Int(n) => n.to_string(),
+                    Value::Str(s) => s.clone(),
+                    other => return Err(EvalError { message: format!("{}:action 应为整数或字符串,实际 {:?}", what, other) }),
+                };
+                actions.push((state, event, action));
+            }
+            let trace: Vec<String> = value_items(&fields[3], what)?
+                .into_iter().map(|v| -> Result<String, EvalError> {
+                    match v {
+                        Value::Int(n) => Ok(n.to_string()),
+                        Value::Str(s) => Ok(s),
+                        other => Err(EvalError { message: format!("{}:trace 元素应为字符串,实际 {:?}", what, other) }),
+                    }
+                }).collect::<Result<_, _>>()?;
+            return Ok(tisp_runtime::programming::StateMachine { current, transitions, actions, trace });
+        }
+    }
+    Err(EvalError { message: format!("{}:期望 SM 句柄", what) })
+}
+
+/// 把 StateMachine 编码为 SM 句柄
+fn sm_to_value(sm: &tisp_runtime::programming::StateMachine) -> Value {
+    let state_val = |s: &str| -> Value {
+        s.parse::<i64>().map(Value::Int).unwrap_or_else(|_| Value::Str(s.to_string()))
+    };
+    let states: im::Vector<Value> = im::vector![state_val(&sm.current)];
+    let transitions: im::Vector<Value> = sm.transitions.iter().flat_map(|(f, e, t)| {
+        vec![state_val(f), state_val(e), state_val(t)]
+    }).collect();
+    let actions: im::Vector<Value> = sm.actions.iter().flat_map(|(s, e, a)| {
+        vec![state_val(s), state_val(e), Value::Str(a.clone())]
+    }).collect();
+    let trace: im::Vector<Value> = sm.trace.iter().map(|t| Value::Str(t.clone())).collect();
+    Value::Data(Symbol::new("SM"), vec![
+        Value::Vector(states), Value::Vector(transitions), Value::Vector(actions), Value::Vector(trace),
+    ])
+}
+
+fn sm_new_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError { message: "sm-new 需 (initial) 1 参".into() });
+    }
+    let initial = match &args[0] {
+        Value::Int(n) => n.to_string(),
+        Value::Str(s) => s.clone(),
+        other => return Err(EvalError { message: format!("sm-new:initial 应为整数或字符串,实际 {:?}", other) }),
+    };
+    let sm = tisp_runtime::programming::StateMachine::new(&initial);
+    Ok(sm_to_value(&sm))
+}
+
+fn sm_drive_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    // 2 参:(sm-handle event);3 参旧签名:(current event transitions)
+    if args.len() == 2 {
+        let mut sm = sm_from_value(&args[0], "sm-drive")?;
+        let event = match &args[1] {
+            Value::Int(n) => n.to_string(),
+            Value::Str(s) => s.clone(),
+            other => return Err(EvalError { message: format!("sm-drive:event 应为整数或字符串,实际 {:?}", other) }),
+        };
+        // handle 内已有 transitions/actions
+        let _ = sm.transitions.clone();
+        sm.drive(&event).map_err(|e| EvalError { message: e })?;
+        Ok(sm_to_value(&sm))
+    } else if args.len() == 3 {
+        let current = match &args[0] {
+            Value::Int(n) => n.to_string(),
+            Value::Str(s) => s.clone(),
+            other => return Err(EvalError { message: format!("sm-drive:current 应为整数或字符串,实际 {:?}", other) }),
+        };
+        let event = match &args[1] {
+            Value::Int(n) => n.to_string(),
+            Value::Str(s) => s.clone(),
+            other => return Err(EvalError { message: format!("sm-drive:event 应为整数或字符串,实际 {:?}", other) }),
+        };
+        let triples = value_to_int_list(&args[2])?;
+        if triples.len() % 3 != 0 {
+            return Err(EvalError { message: "sm-drive:transitions 长度须为 3 的倍数".into() });
+        }
+        let transitions: Vec<(String, String, String)> = triples.chunks(3)
+            .map(|c| (c[0].to_string(), c[1].to_string(), c[2].to_string()))
+            .collect();
+        let mut sm = tisp_runtime::programming::StateMachine { current, transitions, actions: Vec::new(), trace: Vec::new() };
+        match sm.drive(&event) {
+            Ok(()) => Ok(Value::Int(sm.current.parse::<i64>().unwrap_or(0))),
+            Err(e) => Err(EvalError { message: e }),
+        }
+    } else {
+        Err(EvalError { message: "sm-drive 需 (current event transitions) 3 参或 (sm-handle event) 2 参".into() })
+    }
+}
+
+fn sm_trace_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError { message: "sm-trace 需 (sm) 1 参".into() });
+    }
+    let sm = sm_from_value(&args[0], "sm-trace")?;
+    Ok(Value::Vector(sm.trace.iter().map(|t| Value::Str(t.clone())).collect()))
+}
+
+// ── 数据驱动编程 ──
+
+fn table_new_builtin(_s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError { message: "table-new 需 (keys-list handlers-list) 2 参".into() });
+    }
+    let keys = value_items(&args[0], "table-new:keys")?;
+    let handlers = value_items(&args[1], "table-new:handlers")?;
+    if keys.len() != handlers.len() {
+        return Err(EvalError { message: format!("table-new:键 {} 个与处理器 {} 个不一致", keys.len(), handlers.len()) });
+    }
+    if handlers.iter().any(|h| !is_callable(h)) {
+        return Err(EvalError { message: "table-new:handlers 应全部为函数".into() });
+    }
+    Ok(Value::Data(Symbol::new("Table"), vec![
+        Value::Vector(keys.into_iter().collect()),
+        Value::Vector(handlers.into_iter().collect()),
+    ]))
+}
+
+fn table_dispatch_builtin(s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError { message: "table-dispatch 需 (table key arg) 3 参".into() });
+    }
+    if let Value::Data(name, fields) = &args[0] {
+        if name.as_str() == "Table" && fields.len() == 2 {
+            let keys = value_items(&fields[0], "table-dispatch:keys")?;
+            let handlers = value_items(&fields[1], "table-dispatch:handlers")?;
+            if keys.len() != handlers.len() {
+                return Err(EvalError { message: "table-dispatch:键与处理器数量不一致".into() });
+            }
+            if let Some(pos) = keys.iter().position(|k| k == &args[1]) {
+                let handler = handlers[pos].clone();
+                if !is_callable(&handler) {
+                    return Err(EvalError { message: "table-dispatch:处理器应为函数".into() });
+                }
+                return s.apply(handler, &[args[2].clone()]);
+            }
+            return Err(EvalError { message: format!("table-dispatch:缺失键 {:?}", args[1]) });
+        }
+    }
+    Err(EvalError { message: "table-dispatch:期望 Table 句柄".into() })
+}
+
+// ── 基于流编程 ──
+
+impl Interpreter {
+    /// 取流的前 n 个元素(识别普通流与 Map/Filter 派生流,惰性逐元素变换)
+    fn stream_values_by_id(&mut self, id: u64, n: usize) -> Result<Vec<Value>, EvalError> {
+        if let Some(transform) = self.stream_transforms()?.get(&id).cloned() {
+            match transform {
+                StreamTransform::Map(src, f) => {
+                    let src_items = self.stream_values_by_id(src, n)?;
+                    src_items.into_iter().map(|x| {
+                        match self.apply(f.clone(), &[x])? {
+                            Value::Int(v) => Ok(Value::Int(v)),
+                            other => Err(EvalError { message: format!("stream-map:变换函数返回 {:?},需整数", other) }),
+                        }
+                    }).collect()
+                }
+                StreamTransform::Filter(src, pred) => {
+                    let mut out = Vec::with_capacity(n);
+                    let mut i = 0usize;
+                    while out.len() < n {
+                        let batch = self.stream_values_by_id(src, i + 1)?;
+                        if batch.len() <= i { break; }
+                        let x = batch[i].clone();
+                        i += 1;
+                        let keep = self.apply(pred.clone(), &[x.clone()])?;
+                        if is_truthy(&keep) { out.push(x); }
+                    }
+                    Ok(out)
+                }
+            }
+        } else if let Some(st) = self.streams()?.get(&id).cloned() {
+            Ok(st.take(n).into_iter().map(Value::Int).collect())
+        } else {
+            Err(EvalError { message: format!("stream {} 不存在或已回收", id) })
+        }
+    }
+}
+
+fn stream_map_builtin(s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError { message: "stream-map 需 (stream fn) 2 参".into() });
+    }
+    let src = stream_id(&args[0])?;
+    let f = args[1].clone();
+    if !is_callable(&f) {
+        return Err(EvalError { message: "stream-map:fn 应为函数".into() });
+    }
+    let id = s.next_stream_id; s.next_stream_id += 1;
+    s.stream_transforms_mut()?.insert(id, StreamTransform::Map(src, f));
+    let first = s.stream_values_by_id(id, 1)?;
+    match first.first() {
+        Some(v) => Ok(Value::Data(Symbol::new("Stream"), vec![v.clone(), Value::Int(id as i64)])),
+        None => Err(EvalError { message: "stream-map:源流为空,无法构造派生流".into() }),
+    }
+}
+
+fn stream_filter_builtin(s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError { message: "stream-filter 需 (stream pred) 2 参".into() });
+    }
+    let src = stream_id(&args[0])?;
+    let pred = args[1].clone();
+    if !is_callable(&pred) {
+        return Err(EvalError { message: "stream-filter:pred 应为函数".into() });
+    }
+    let id = s.next_stream_id; s.next_stream_id += 1;
+    s.stream_transforms_mut()?.insert(id, StreamTransform::Filter(src, pred));
+    let first = s.stream_values_by_id(id, 1)?;
+    match first.first() {
+        Some(v) => Ok(Value::Data(Symbol::new("Stream"), vec![v.clone(), Value::Int(id as i64)])),
+        None => Err(EvalError { message: "stream-filter:没有元素通过谓词,无法构造派生流".into() }),
+    }
+}
+
+fn stream_sink_builtin(s: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError { message: "stream-sink 需 (stream n) 2 参".into() });
+    }
+    let id = stream_id(&args[0])?;
+    let n = expect_int_arg(args, 1, "stream-sink")?;
+    if n < 0 {
+        return Err(EvalError { message: "stream-sink:n 不能为负".into() });
+    }
+    let values = s.stream_values_by_id(id, n as usize)?;
+    Ok(Value::Vector(values.into_iter().collect()))
+}
+
 /// 范式统一值 → 解释器 `Value`
 fn paradigm_to_value(pv: &tisp_runtime::facility::ParadigmValue) -> Value {
     use tisp_runtime::facility::ParadigmValue as PV;
@@ -3599,8 +4775,125 @@ fn paradigm_to_value(pv: &tisp_runtime::facility::ParadigmValue) -> Value {
     }
 }
 
+/// 解析源码侧的通道操作列表:元素形如 (send 42) / (recv)
+fn parse_channel_ops(v: &Value) -> Result<Vec<ChannelOp>, String> {
+    list_to_vec(v).iter().map(|x| match x {
+        Value::Data(c, fs) if c.as_str() == "Send" => match fs.first() {
+            Some(Value::Int(n)) => Ok(ChannelOp::Send(*n)),
+            _ => Err("Send 操作需整数负载".into()),
+        },
+        Value::Data(c, _) if c.as_str() == "Recv" => Ok(ChannelOp::Recv),
+        Value::Str(s) if let Some(n) = s.strip_prefix("send:") => {
+            n.parse::<i64>().map(ChannelOp::Send).map_err(|_| format!("Send 负载不是整数: {}", s))
+        }
+        Value::Str(s) if s == "recv" => Ok(ChannelOp::Recv),
+        other => Err(format!("未知通道操作 {:?}", other)),
+    }).collect()
+}
+
+fn parse_async_ops(v: &Value) -> Result<Vec<AsyncOp>, String> {
+    list_to_vec(v).iter().map(|x| match x {
+        Value::Data(c, fs) if c.as_str() == "Send" => match fs.first() {
+            Some(Value::Int(n)) => Ok(AsyncOp::Send(*n)),
+            _ => Err("Send 操作需整数负载".into()),
+        },
+        Value::Data(c, _) if c.as_str() == "Recv" => Ok(AsyncOp::Recv),
+        Value::Str(s) if let Some(n) = s.strip_prefix("send:") => {
+            n.parse::<i64>().map(AsyncOp::Send).map_err(|_| format!("Send 负载不是整数: {}", s))
+        }
+        Value::Str(s) if s == "recv" => Ok(AsyncOp::Recv),
+        other => Err(format!("未知异步操作 {:?}", other)),
+    }).collect()
+}
+
+fn parse_applied_ops(v: &Value) -> Result<Vec<AppliedOp>, String> {
+    list_to_vec(v).iter().map(|x| {
+        if let Value::Str(s) = x {
+            let (tag, n) = s.split_once(':').ok_or_else(|| format!("applied-π 操作需 tag:n 形式: {}", s))?;
+            let n = n.parse::<i64>().map_err(|_| format!("applied-π 负载不是整数: {}", s))?;
+            return Ok(match tag {
+                "enc" => AppliedOp::Encrypt(n),
+                "dec" => AppliedOp::Decrypt(n),
+                "sign" => AppliedOp::Sign(n),
+                "verify" => AppliedOp::Verify(n),
+                _ => return Err(format!("未知 applied-π 操作 {}", s)),
+            });
+        }
+        let (tag, n) = match x {
+            Value::Data(c, fs) if c.as_str() == "Encrypt" => ("enc", fs.first()),
+            Value::Data(c, fs) if c.as_str() == "Decrypt" => ("dec", fs.first()),
+            Value::Data(c, fs) if c.as_str() == "Sign" => ("sign", fs.first()),
+            Value::Data(c, fs) if c.as_str() == "Verify" => ("verify", fs.first()),
+            other => return Err(format!("未知 applied-π 操作 {:?}", other)),
+        };
+        let n = match n { Some(Value::Int(n)) => *n, _ => return Err("applied-π 操作需整数负载".into()) };
+        Ok(match tag {
+            "enc" => AppliedOp::Encrypt(n),
+            "dec" => AppliedOp::Decrypt(n),
+            "sign" => AppliedOp::Sign(n),
+            _ => AppliedOp::Verify(n),
+        })
+    }).collect()
+}
+
+fn parse_rho_ops(v: &Value) -> Result<Vec<RhoOp>, String> {
+    list_to_vec(v).iter().map(|x| match x {
+        Value::Data(c, fs) if c.as_str() == "Quote" => match fs.first() {
+            Some(Value::Int(n)) => Ok(RhoOp::Quote(*n)),
+            _ => Err("Quote 操作需整数负载".into()),
+        },
+        Value::Data(c, fs) if c.as_str() == "Lift" => match fs.first() {
+            Some(Value::Int(n)) => Ok(RhoOp::Lift(*n)),
+            _ => Err("Lift 操作需整数负载".into()),
+        },
+        Value::Data(c, _) if c.as_str() == "Drop" => Ok(RhoOp::Drop),
+        Value::Str(s) if let Some(n) = s.strip_prefix("quote:") => {
+            n.parse::<i64>().map(RhoOp::Quote).map_err(|_| format!("quote 负载不是整数: {}", s))
+        }
+        Value::Str(s) if let Some(n) = s.strip_prefix("lift:") => {
+            n.parse::<i64>().map(RhoOp::Lift).map_err(|_| format!("lift 负载不是整数: {}", s))
+        }
+        Value::Str(s) if s == "drop" => Ok(RhoOp::Drop),
+        other => Err(format!("未知 ρ 操作 {:?}", other)),
+    }).collect()
+}
+
+fn parse_ambient_caps(v: &Value) -> Result<Vec<AmbientCap>, String> {
+    list_to_vec(v).iter().map(|x| {
+        if let Value::Str(s) = x {
+            let (tag, name) = s.split_once(':').ok_or_else(|| format!("ambient 能力需 tag:name 形式: {}", s))?;
+            return Ok(match tag {
+                "enter" => AmbientCap::Enter(name.to_string()),
+                "exit" => AmbientCap::Exit(name.to_string()),
+                "open" => AmbientCap::Open(name.to_string()),
+                _ => return Err(format!("未知 ambient 能力 {}", s)),
+            });
+        }
+        let (tag, name) = match x {
+            Value::Data(c, fs) if c.as_str() == "Enter" => ("enter", fs.first()),
+            Value::Data(c, fs) if c.as_str() == "Exit" => ("exit", fs.first()),
+            Value::Data(c, fs) if c.as_str() == "Open" => ("open", fs.first()),
+            other => return Err(format!("未知 ambient 能力 {:?}", other)),
+        };
+        let name = match name { Some(Value::Str(s)) => s.clone(), _ => return Err("ambient 能力需字符串参数".into()) };
+        Ok(match tag {
+            "enter" => AmbientCap::Enter(name),
+            "exit" => AmbientCap::Exit(name),
+            _ => AmbientCap::Open(name),
+        })
+    }).collect()
+}
+
+/// 通道操作编码结果 → 源码可读的列表值
+fn channel_ops_to_value(ops: &[ChannelOp]) -> Value {    let items: Vec<Value> = ops.iter().map(|op| match op {
+        ChannelOp::Send(n) => Value::Data(Symbol::new("Send"), vec![Value::Int(*n)]),
+        ChannelOp::Recv => Value::Data(Symbol::new("Recv"), vec![]),
+    }).collect();
+    Value::Vector(items.into_iter().collect())
+}
+
 /// 把 Cons 链列表或持久化 Vector 展开为 Vec
-fn list_to_vec(val: &Value) -> Vec<Value> {
+pub(crate) fn list_to_vec(val: &Value) -> Vec<Value> {
     let mut items = Vec::new();
     let mut cur = val.clone();
     loop {
@@ -3906,6 +5199,11 @@ impl std::fmt::Display for EvalError {
 }
 impl std::error::Error for EvalError {}
 
+/// 已回收程序区域访问错误(§统一内存管理)
+fn region_deallocated() -> EvalError {
+    EvalError { message: "region already deallocated".into() }
+}
+
 fn expect_two_ints(args: &[Value]) -> Result<(i64, i64), EvalError> {
     if args.len() != 2 { return Err(EvalError { message: "expected 2 args".into() }); }
     match (&args[0], &args[1]) {
@@ -3940,7 +5238,24 @@ fn show_value(val: &Value) -> String {
         Value::Char(c) => c.to_string(),
         Value::Unit => "()".into(),
         Value::Data(name, fields) => {
-            if fields.is_empty() {
+            if name.as_str() == "Nil" {
+                "[]".into()
+            } else if name.as_str() == "Cons" {
+                // Cons 链显示为列表字面量(§4/§18,与源码 [..] 一致)
+                let mut items: Vec<String> = Vec::new();
+                let mut cur = val;
+                loop {
+                    match cur {
+                        Value::Data(c, f) if c.as_str() == "Cons" && f.len() == 2 => {
+                            items.push(show_value(&f[0]));
+                            cur = &f[1];
+                        }
+                        Value::Data(c, _) if c.as_str() == "Nil" => break,
+                        other => { items.push(show_value(other)); break; }
+                    }
+                }
+                format!("[{}]", items.join(" "))
+            } else if fields.is_empty() {
                 name.as_str().to_string()
             } else {
                 let inner: Vec<String> = fields.iter().map(show_value).collect();
@@ -4027,70 +5342,71 @@ fn value_to_string(val: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Str(s) => s.clone(),
         Value::Unit => "()".into(),
-        Value::Data(name, _) => format!("<{}>", name),
         Value::Type(ty) => ty.to_string(),
+        // 集合/结构:复用 show_value 的可读表示(§4/§18,替换 <Cons>/... 占位)
+        Value::Data(_, _) | Value::Vector(_) | Value::Map(_) | Value::Set(_) => show_value(val),
         _ => "...".into(),
     }
 }
 
 impl Interpreter {
     /// 模式匹配(§8):同名变量重复出现要求绑定值一致;逻辑变量经统一
-    fn match_pattern(&mut self, pat: &Pattern, val: &Value) -> Option<Vec<(Symbol, Value)>> {
+    fn match_pattern(&mut self, pat: &Pattern, val: &Value) -> Result<Option<Vec<(Symbol, Value)>>, EvalError> {
         let mut bindings = Vec::new();
-        if self.match_pattern_into(pat, val, &mut bindings) {
-            Some(bindings)
+        if self.match_pattern_into(pat, val, &mut bindings)? {
+            Ok(Some(bindings))
         } else {
-            None
+            Ok(None)
         }
     }
 
     /// 模式匹配(§8):同名变量重复出现要求绑定值一致(逻辑变量经统一,§21)
-    fn match_pattern_into(&mut self, pat: &Pattern, val: &Value, bindings: &mut Vec<(Symbol, Value)>) -> bool {
+    fn match_pattern_into(&mut self, pat: &Pattern, val: &Value, bindings: &mut Vec<(Symbol, Value)>) -> Result<bool, EvalError> {
         match (pat, val) {
-            (Pattern::Wildcard, _) => true,
+            (Pattern::Wildcard, _) => Ok(true),
             (Pattern::Var(name), v) => {
                 if let Some((_, prev)) = bindings.iter().find(|(n, _)| n == name) {
                     self.unify_or_eq(prev, v)
                 } else {
                     bindings.push((name.clone(), v.clone()));
-                    true
+                    Ok(true)
                 }
             }
-            (Pattern::Lit(lit), v) => values_eq(&eval_literal(lit), v),
+            (Pattern::Lit(lit), v) => Ok(values_eq(&eval_literal(lit), v)),
             (Pattern::Or(pats), v) => {
                 // (or p1 p2 ...)(§8.2):任一子模式匹配成功(用 bindings 副本尝试)
                 for p in pats {
                     let mut trial = bindings.clone();
-                    if self.match_pattern_into(p, v, &mut trial) {
+                    if self.match_pattern_into(p, v, &mut trial)? {
                         *bindings = trial;
-                        return true;
+                        return Ok(true);
                     }
                 }
-                false
+                Ok(false)
             }
             (Pattern::Con(c_name, subpats), Value::Vector(v)) => {
                 // §4 持久化 Vector 与 Cons 模式兼容(头+尾)
                 if c_name.as_str() == "Cons" {
-                    if subpats.len() != 2 || v.is_empty() { return false; }
-                    if !self.match_pattern_into(&subpats[0], &v[0], bindings) { return false; }
+                    if subpats.len() != 2 || v.is_empty() { return Ok(false); }
+                    if !self.match_pattern_into(&subpats[0], &v[0], bindings)? { return Ok(false); }
                     let rest = Value::Vector(v.skip(1));
                     return self.match_pattern_into(&subpats[1], &rest, bindings);
                 }
                 if c_name.as_str() == "Vec" {
                     let sub_vals: Vec<Value> = v.iter().cloned().collect();
-                    if subpats.len() != sub_vals.len() { return false; }
+                    if subpats.len() != sub_vals.len() { return Ok(false); }
                     for (sp, dv) in subpats.iter().zip(sub_vals.iter()) {
-                        if !self.match_pattern_into(sp, dv, bindings) { return false; }
+                        if !self.match_pattern_into(sp, dv, bindings)? { return Ok(false); }
                     }
-                    return true;
+                    return Ok(true);
                 }
-                false
+                Ok(false)
             }
             (Pattern::Con(c_name, subpats), Value::Data(d_name, d_args)) => {
                 // Vec 字面量与 Cons 模式兼容(§21.2 谓词调用传向量列表)
                 if c_name.as_str() == "Cons" && d_name.as_str() == "Vec" {
-                    if subpats.len() != 2 || d_args.is_empty() { return false; }
-                    if !self.match_pattern_into(&subpats[0], &d_args[0], bindings) { return false; }
+                    if subpats.len() != 2 || d_args.is_empty() { return Ok(false); }
+                    if !self.match_pattern_into(&subpats[0], &d_args[0], bindings)? { return Ok(false); }
                     let rest = if d_args.len() <= 1 {
                         Value::Data(Symbol::new("Nil"), vec![])
                     } else {
@@ -4099,39 +5415,39 @@ impl Interpreter {
                     self.match_pattern_into(&subpats[1], &rest, bindings)
                 } else if c_name == d_name && subpats.len() == d_args.len() {
                     for (sp, dv) in subpats.iter().zip(d_args) {
-                        if !self.match_pattern_into(sp, dv, bindings) { return false; }
+                        if !self.match_pattern_into(sp, dv, bindings)? { return Ok(false); }
                     }
-                    true
+                    Ok(true)
                 } else {
-                    false
+                    Ok(false)
                 }
             }
             // §9 类型一等值:类型值模式匹配(Int 匹配 Con(Int);(List a) 匹配 App(Con(List), a))
             (Pattern::Con(c_name, subpats), Value::Type(ty)) => {
                 if let Some((name, args)) = flatten_type_app(ty) {
-                    if name != *c_name || subpats.len() != args.len() { return false; }
+                    if name != *c_name || subpats.len() != args.len() { return Ok(false); }
                     for (sp, arg) in subpats.iter().zip(args) {
-                        if !self.match_pattern_into(sp, &Value::Type(arg), bindings) { return false; }
+                        if !self.match_pattern_into(sp, &Value::Type(arg), bindings)? { return Ok(false); }
                     }
-                    true
+                    Ok(true)
                 } else {
-                    false
+                    Ok(false)
                 }
             }
-            _ => false,
+            _ => Ok(false),
         }
     }
 
     /// §21 同名变量一致性:若既有绑定是逻辑变量,统一;否则值比较
-    fn unify_or_eq(&mut self, prev: &Value, v: &Value) -> bool {
+    fn unify_or_eq(&mut self, prev: &Value, v: &Value) -> Result<bool, EvalError> {
         if let Value::Int(id) = prev {
             if self.logic_vars.contains_key(&(*id as u64)) {
                 let lv = self.val_to_logic(prev);
                 let rv = self.val_to_logic(v);
-                return self.logic_store.unify(&lv, &rv);
+                return Ok(self.logic_store_mut()?.unify(&lv, &rv));
             }
         }
-        values_eq(prev, v)
+        Ok(values_eq(prev, v))
     }
 }
 
@@ -4210,6 +5526,32 @@ mod tests {
         assert!(interp.eval_expr(&read).is_err(), "with-region 退出后读到悬垂指针应报错");
     }
 
+    /// §7.7/7.8 范式状态区域生命周期:重复运行配对无泄漏,退出后访问报错
+    #[test]
+    fn test_paradigm_state_region_lifecycle() {
+        use tisp_frontend::desugar::Desugarer;
+        use tisp_frontend::reader::read;
+        let src = "(defn main [] (stream-take (stream 1) 3))";
+        let forms = read(src).unwrap();
+        let prog = Desugarer::new().desugar_program(forms).unwrap();
+
+        let mut interp = Interpreter::new();
+        let s0 = interp.region_stats().clone();
+        assert!(interp.run_program(&prog).is_ok());
+        let s1 = interp.region_stats().clone();
+        assert_eq!(s1.regions_allocated, s1.regions_deallocated, "第一次运行分配/回收应配对");
+        assert!(s1.regions_allocated > s0.regions_allocated, "程序区域应产生分配统计");
+        // 退出后范式状态句柄已清空 → 访问报 region already deallocated
+        assert!(interp.streams().is_err(), "区域退出后流缓存访问应报错");
+        assert!(interp.clp_store().is_err(), "区域退出后 CLP 存储访问应报错");
+
+        assert!(interp.run_program(&prog).is_ok());
+        let s2 = interp.region_stats().clone();
+        assert_eq!(s2.regions_allocated, s2.regions_deallocated, "第二次运行分配/回收应配对");
+        assert_eq!(s2.regions_allocated - s1.regions_allocated, 1, "每次运行恰好一个程序区域");
+        assert_eq!(s2.regions_deallocated - s1.regions_deallocated, 1, "每次运行恰好回收一个程序区域");
+    }
+
     fn as_int(v: Value) -> i64 {
         match v {
             Value::Int(n) => n,
@@ -4250,6 +5592,11 @@ mod tests {
         let program = CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![],
             resource_algebras: vec![], defs: vec![def("main", body)], pragmas: vec![] };
         interp.run_program(&program).map(|r| r.unwrap())
+    }
+
+    /// 直接 eval_expr 测试用的程序区域初始化(等价 register_program 中的区域分配)
+    fn setup_program_region(interp: &mut Interpreter) {
+        interp.enter_program_region().unwrap();
     }
 
     #[test]
@@ -4473,6 +5820,7 @@ mod tests {
         // §27.2/27.3:chan → send 42 → recv 42
         let mut interp = Interpreter::new();
         interp.register_builtins();
+        setup_program_region(&mut interp);
         let c = interp.apply(interp.env.last().unwrap().get(&Symbol::new("chan")).cloned().unwrap(), &[]).unwrap();
         let send = interp.env.last().unwrap().get(&Symbol::new("send")).cloned().unwrap();
         let recv = interp.env.last().unwrap().get(&Symbol::new("recv")).cloned().unwrap();
@@ -4485,6 +5833,7 @@ mod tests {
         // §18:(stream-take (stream 1) 3) = [1,2,3]
         let mut interp = Interpreter::new();
         interp.register_builtins();
+        setup_program_region(&mut interp);
         let stream = interp.env.last().unwrap().get(&Symbol::new("stream")).cloned().unwrap();
         let take = interp.env.last().unwrap().get(&Symbol::new("stream-take")).cloned().unwrap();
         let s = interp.apply(stream.clone(), &[Value::Int(1)]).unwrap();
@@ -4557,6 +5906,7 @@ mod tests {
         // §21.5:(domain x 1 5) → (label x 1) → x = 1(域升序第一个解)
         let mut interp = Interpreter::new();
         interp.register_builtins();
+        setup_program_region(&mut interp);
         let dom = e(CoreExprNode::Domain(Box::new(var("x")), Box::new(int(1)), Box::new(int(5))));
         interp.eval_expr(&dom).unwrap();
         let lbl = e(CoreExprNode::Label(Box::new(var("x")), Box::new(int(1))));
@@ -4570,6 +5920,7 @@ mod tests {
         // §21.5:(constrain (> x 2)) 真实传播:x ∈ [1,5] 且 x > 2 → label 得 3
         let mut interp = Interpreter::new();
         interp.register_builtins();
+        setup_program_region(&mut interp);
         let dom = e(CoreExprNode::Domain(Box::new(var("x")), Box::new(int(1)), Box::new(int(5))));
         interp.eval_expr(&dom).unwrap();
         // (constrain (> x 2)):e = App(App(Var(">"), x), Lit(2))
@@ -4590,6 +5941,7 @@ mod tests {
         // §21.5:(solve-all x) 枚举域中全部解(升序);约束 (< z 4) 后只剩 [1,2,3]
         let mut interp = Interpreter::new();
         interp.register_builtins();
+        setup_program_region(&mut interp);
         let dom = e(CoreExprNode::Domain(Box::new(var("z")), Box::new(int(1)), Box::new(int(6))));
         interp.eval_expr(&dom).unwrap();
         let cmp = e(CoreExprNode::App(
@@ -4609,6 +5961,7 @@ mod tests {
         // §21:(find-all thunk) 收集 thunk 中 Search/Match 的全部解(逻辑变量绑定)
         let mut interp = Interpreter::new();
         interp.register_builtins();
+        setup_program_region(&mut interp);
         interp.env.push(HashMap::new());
         // 构造 thunk:(fn [] (fresh n (== n 2)))?——直接用 Unify 节点 + 快照路径:
         // find-all 在无 Match 收集点时取当前绑定快照作为唯一解
@@ -4962,6 +6315,11 @@ mod ski_tests {
         if let Value::Int(n) = v { n } else { panic!("not int: {:?}", v) }
     }
 
+    /// 直接 eval_expr 测试用的程序区域初始化(等价 register_program 中的区域分配)
+    fn setup_program_region(interp: &mut Interpreter) {
+        interp.enter_program_region().unwrap();
+    }
+
     #[test]
     fn test_ski_combinators() {
         // §27 SKI:S K K x = x;K x y = x;I x = x
@@ -4987,6 +6345,7 @@ mod ski_tests {
         // §27.2 async 通道:FIFO 语义
         let mut interp = Interpreter::new();
         interp.register_builtins();
+        setup_program_region(&mut interp);
         interp.env.push(HashMap::new());
         // (chan) → 通道;async-send 两个值;async-recv 先收先发
         let chan = interp.eval_expr(&e(CoreExprNode::ChannelNew)).unwrap();
@@ -5090,6 +6449,7 @@ mod ski_tests {
         // §21.5:两变量 (constrain (< x y)) 域间传播:label 解不违反约束
         let mut interp = Interpreter::new();
         interp.register_builtins();
+        setup_program_region(&mut interp);
         let dom = e(CoreExprNode::Domain(Box::new(var("x")), Box::new(int(1)), Box::new(int(10))));
         interp.eval_expr(&dom).unwrap();
         let dom2 = e(CoreExprNode::Domain(Box::new(var("y")), Box::new(int(1)), Box::new(int(10))));
@@ -5117,6 +6477,7 @@ mod ski_tests {
         // §21.5:冲突约束 (< x y) ∧ (> x y) → 搜索失败(无解)
         let mut interp = Interpreter::new();
         interp.register_builtins();
+        setup_program_region(&mut interp);
         let dom = e(CoreExprNode::Domain(Box::new(var("x")), Box::new(int(1)), Box::new(int(3))));
         interp.eval_expr(&dom).unwrap();
         let dom2 = e(CoreExprNode::Domain(Box::new(var("y")), Box::new(int(1)), Box::new(int(3))));
@@ -5215,11 +6576,118 @@ mod ski_tests {
         let err = ti.infer_program(&prog).unwrap_err();
         assert!(err.message.contains("会话协议"), "应报协议顺序错误,实际: {}", err.message);
 
-        // 合法顺序 send→recv 通过
-        let ok_src = "(defn main [] (send (recv 1)))";
+        // 合法顺序 send→recv 通过(同一通道)
+        let ok_src = "(defn main [] (let [c (chan)] (do (send c 1) (recv c))))";
         let prog2 = desugar(ok_src);
         let mut ti2 = tisp_middle::type_infer::TypeInfer::new();
         assert!(ti2.infer_program(&prog2).is_ok(), "send→recv 应通过");
+    }
+
+    #[test]
+    fn test_session_payload_and_structured_concurrency() {
+        // §20/§27.2 会话语法保留负载;spawn+join 结构化并发
+        let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (let [c (chan)] (send c 42) (recv c)))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert_eq!(as_int(r), 42, "会话 send/recv 应保留负载 42");
+
+        let r2 = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (let [h (spawn (+ 1 41))] (join h)))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert_eq!(as_int(r2), 42, "join 应返回子任务结果 42");
+
+        let r3 = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (let [c (chan) h (spawn (send! c 42))] (recv! c)))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert_eq!(as_int(r3), 42, "spawn 发送后 recv! 应等待并收到 42");
+    }
+
+    #[test]
+    fn test_user_verification_model_check() {
+        // §28 用户程序验证:defprop + model-check 驱动真实可达性搜索
+        let src = "(defprop reachable-5 (model-check 0 (fn [n] (= n 5)) (fn [n] [(+ n 1) (+ n 2)]) 20))\n\
+                    (defprop unreachable-100 (model-check 0 (fn [n] (> n 100)) (fn [n] [(+ n 1)]) 10))";
+        let prog = desugar(src);
+        let mut interp = Interpreter::new();
+        let results = interp.verify_properties(&prog).unwrap();
+        assert_eq!(results.len(), 2, "应验证 2 个属性,实际 {:?}", results.len());
+        let holds = |r: &(Symbol, Value)| -> bool {
+            match &r.1 {
+                Value::Data(c, fields) if c.as_str() == "VerifyResult" => matches!(fields.first(), Some(Value::Bool(true))),
+                Value::Bool(b) => *b,
+                _ => false,
+            }
+        };
+        assert!(results.iter().any(holds), "至少一个属性应成立");
+        assert!(results.iter().any(|r| !holds(r)), "至少一个属性应不成立");
+    }
+
+    #[test]
+    fn test_calculus_encodings_source_callable() {
+        // §8.3/8.4 演算互编码:源码可调用,编码结果可执行/可比较
+        let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (pi-to-ski [\"send:42\" \"recv\"]))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        match r {
+            Value::Vector(v) => assert!(v.iter().any(|x| matches!(x, Value::Int(42))), "π→SKI 编码结果应保留负载 42,实际 {:?}", v),
+            other => panic!("pi-to-ski 应返回编码向量,实际 {:?}", other),
+        }
+
+        let eq = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (trace-equivalence [\"send:7\"] (async-to-pi [\"send:7\"])))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert!(matches!(eq, Value::Bool(true)), "async→π 编码应迹等价,实际 {:?}", eq);
+
+        let bad = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (pi-to-ski [\"bogus:1\"]))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap_err()
+        }).unwrap().join().unwrap();
+        assert!(bad.message.contains("未知通道操作"), "不可编码构造应显式报错,实际: {}", bad.message);
+    }
+
+    #[test]
+    fn test_paradigm_error_semantics() {
+        // §9.2/9.3 范式非法输入显式报错:概率越界、DFA 未声明符号、模糊真值越界
+        let bad_prob = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (plp-marginal 1 [1 1.5]))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap_err()
+        }).unwrap().join().unwrap();
+        assert!(bad_prob.message.contains("越界"), "概率越界应报错,实际: {}", bad_prob.message);
+
+        let bad_dfa = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (dfa-accept 0 [0] [0 97 1] \"b\"))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap_err()
+        }).unwrap().join().unwrap();
+        assert!(bad_dfa.message.contains("非法输入"), "DFA 未知符号应报错,实际: {}", bad_dfa.message);
+
+        let bad_fuzzy = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defn main [] (fuzzy-eval [1 1.5] [1]))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap_err()
+        }).unwrap().join().unwrap();
+        assert!(bad_fuzzy.message.contains("越界"), "模糊真值越界应报错,实际: {}", bad_fuzzy.message);
     }
 
     #[test]
@@ -5239,8 +6707,6 @@ mod ski_tests {
         // §24:gensym 每次调用唯一
         let r = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
             // 同一解释器内两次 gensym
-            let src = "(defn main [] (do (gensym) (gensym)))";
-            let prog = desugar(src);
             let mut interp = Interpreter::new();
             interp.register_builtins();
             interp.env.push(HashMap::new());
@@ -5311,6 +6777,34 @@ mod ski_tests {
             interp.run_program(&prog).unwrap_err()
         }).unwrap().join().unwrap();
         assert!(r2.message.contains("FFI"), "符号缺失应报 FFI 错误,实际: {}", r2.message);
+
+        // §26.1 ABI 安全分派:sin 走 f64→f64,strlen 走 str→i64,签名不匹配报错
+        let r3 = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defextern c-sin \"sin\" \"libm.so.6\" :abi \"f64->f64\")\n(defn main [] (c-sin 0.5))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        match r3 {
+            Value::Float(v) => assert!((v - 0.479_425_538_604_203).abs() < 1e-9, "sin(0.5) 应约 0.479,实际 {}", v),
+            other => panic!("sin 应返回 Float,实际 {:?}", other),
+        }
+
+        let r4 = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defextern c-strlen \"strlen\" \"libc.so.6\" :abi \"str->i64\")\n(defn main [] (c-strlen \"hello\"))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap().unwrap()
+        }).unwrap().join().unwrap();
+        assert_eq!(as_int(r4), 5, "strlen(\"hello\") 应为 5");
+
+        let r5 = std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(move || {
+            let src = "(defextern bad-sin \"sin\" \"libm.so.6\" :abi \"i64->i64\")\n(defn main [] (bad-sin 0.5))";
+            let prog = desugar(src);
+            let mut interp = Interpreter::new();
+            interp.run_program(&prog).unwrap_err()
+        }).unwrap().join().unwrap();
+        assert!(r5.message.contains("期望 i64"), "签名不匹配应报实参错误,实际: {}", r5.message);
     }
 
     #[test]
@@ -5735,18 +7229,18 @@ mod ski_tests {
         // §9:类型值可模式匹配(Int 匹配 Con(i64);(List a) 匹配 App(Con(List), a))
         let pat_int = tisp_core::core_ast::Pattern::Con(Symbol::new("i64"), vec![]);
         let val_int = Value::Type(tisp_core::types::Type::i64());
-        assert!(Interpreter::new().match_pattern(&pat_int, &val_int).is_some(), "i64 类型值应匹配 (i64) 模式");
+        assert!(Interpreter::new().match_pattern(&pat_int, &val_int).unwrap().is_some(), "i64 类型值应匹配 (i64) 模式");
 
         let pat_list = tisp_core::core_ast::Pattern::Con(
             Symbol::new("List"),
             vec![tisp_core::core_ast::Pattern::Var(Symbol::new("a"))],
         );
         let val_list = Value::Type(tisp_core::types::Type::list(tisp_core::types::Type::i64()));
-        assert!(Interpreter::new().match_pattern(&pat_list, &val_list).is_some(), "(List a) 模式应匹配 List i64 类型值");
+        assert!(Interpreter::new().match_pattern(&pat_list, &val_list).unwrap().is_some(), "(List a) 模式应匹配 List i64 类型值");
 
         // 不匹配:构造器名不同
         let pat_str = tisp_core::core_ast::Pattern::Con(Symbol::new("String"), vec![]);
-        assert!(Interpreter::new().match_pattern(&pat_str, &val_int).is_none(), "i64 类型值不应匹配 String 模式");
+        assert!(Interpreter::new().match_pattern(&pat_str, &val_int).unwrap().is_none(), "i64 类型值不应匹配 String 模式");
     }
 
     #[test]
@@ -5915,6 +7409,11 @@ mod persistent_tests {
         CoreExpr::new(CoreExprNode::Lit(Literal::I64(n)), Span::dummy())
     }
 
+    /// 直接 eval_expr 测试用的程序区域初始化(等价 register_program 中的区域分配)
+    fn setup_program_region(interp: &mut Interpreter) {
+        interp.enter_program_region().unwrap();
+    }
+
     /// §4 结构相等/哈希:Vector/Map/Set 按内容比较,可作 map/set 键
     #[test]
     fn test_value_struct_eq_hash() {
@@ -5984,29 +7483,32 @@ mod persistent_tests {
         assert_eq!(items, vec![1, 2, 3]);
     }
 
-    /// §31/§32 范式全链路接入:24 范式经 ParadigmRegistry 从解释器可调用
+    /// §31/§32 范式全链路接入:完整内置 + pf-* 别名语义一致
     #[test]
     fn test_paradigm_builtins_full_chain() {
         let mut interp = Interpreter::new();
         interp.register_builtins();
+        interp.enter_program_region().unwrap();
         // 数组范式:数组归约
         let r = interp.eval_expr(&app("pf-array-sum", vec![app("vector", vec![int(1), int(2), int(3)])])).unwrap();
         assert_eq!(r, Value::Int(6));
-        // 符号范式:符号代换求值
-        let r = interp.eval_expr(&app("pf-sym-eval", vec![int(2)])).unwrap();
+        // 符号范式:构造 SymExpr 后求值(与 sym-eval 同一实现)
+        let sym = app("sym-add", vec![app("sym-num", vec![int(1)]), app("sym-num", vec![int(2)])]);
+        let r = interp.eval_expr(&app("pf-sym-eval", vec![sym])).unwrap();
         assert_eq!(r, Value::Int(3));
-        // 基于流范式:惰性取前 3 项并映射
-        let r = interp.eval_expr(&app("pf-stream-take", vec![int(3)])).unwrap();
+        // 基于流范式:pf-stream-take 转发完整 stream-take
+        let stream_expr = app("stream", vec![int(0)]);
+        let r = interp.eval_expr(&app("pf-stream-take", vec![stream_expr, int(3)])).unwrap();
         match r {
             Value::Vector(v) => {
                 let xs: Vec<i64> = v.iter().filter_map(|x| if let Value::Int(n) = x { Some(*n) } else { None }).collect();
-                assert_eq!(xs, vec![0, 2, 4]);
+                assert_eq!(xs, vec![0, 1, 2]);
             }
             other => panic!("expected Vector, got {:?}", other),
         }
-        // AOP 范式:around 编织
-        let r = interp.eval_expr(&app("pf-aop-weave", vec![int(42)])).unwrap();
-        assert_eq!(r, Value::Int(142));
+        // AOP 范式:简化投影已被 comptime MOP 编织替代 → 显式报错
+        let err = interp.eval_expr(&app("pf-aop-weave", vec![int(42)])).unwrap_err();
+        assert!(err.message.contains("defaspect"), "pf-aop-weave 应显式报错并指向 defaspect,实际: {}", err.message);
     }
 
     /// §32 真实自动机:DFA 识别(接线 tisp_runtime::programming::Dfa)
@@ -6085,20 +7587,23 @@ mod persistent_tests {
         assert_eq!(interp.eval_expr(&call2).unwrap(), Value::Bool(true));
     }
 
-    /// §32 真实符号编程:后序构造 SymExpr + 化简 + 求值
+    /// §32 真实符号编程:构造 SymExpr 后求值(完整源码表面)
     #[test]
     fn test_real_sym_eval() {
         let mut interp = Interpreter::new();
         interp.register_builtins();
         // (+ 2 1) → 3
-        let call = app("sym-eval", vec![app("vector", vec![int(2), int(1), int(-1)])]);
+        let call = app("sym-eval", vec![app("sym-add", vec![app("sym-num", vec![int(2)]), app("sym-num", vec![int(1)])])]);
         assert_eq!(interp.eval_expr(&call).unwrap(), Value::Int(3));
         // (* 2 3) → 6
-        let call2 = app("sym-eval", vec![app("vector", vec![int(2), int(3), int(-2)])]);
+        let call2 = app("sym-eval", vec![app("sym-mul", vec![app("sym-num", vec![int(2)]), app("sym-num", vec![int(3)])])]);
         assert_eq!(interp.eval_expr(&call2).unwrap(), Value::Int(6));
         // (+ 0 5) 化简 → 5
-        let call3 = app("sym-eval", vec![app("vector", vec![int(0), int(5), int(-1)])]);
+        let call3 = app("sym-eval", vec![app("sym-add", vec![app("sym-num", vec![int(0)]), app("sym-num", vec![int(5)])])]);
         assert_eq!(interp.eval_expr(&call3).unwrap(), Value::Int(5));
+        // 自由变量显式报错
+        let call4 = app("sym-eval", vec![app("sym-var", vec![CoreExpr::new(CoreExprNode::Lit(Literal::String("x".into())), Span::dummy())])]);
+        assert!(interp.eval_expr(&call4).is_err(), "含自由变量求值应报错");
     }
 
     /// §31 真实 EVOLP/ASP:命题稳定模型(p :- not q → {p})
@@ -6175,6 +7680,7 @@ mod persistent_tests {
     fn test_mop_get_set_kb() {
         let mut interp = Interpreter::new();
         interp.register_builtins();
+        setup_program_region(&mut interp);
         // set-kb [1 2] → get-kb 返回 [1 2]
         interp.eval_expr(&app("set-kb", vec![app("vector", vec![int(1), int(2)])])).unwrap();
         let r = interp.eval_expr(&app("get-kb", vec![int(0)])).unwrap();

@@ -45,7 +45,7 @@ crates/
 
 ```bash
 cargo build --release            # 构建
-cargo test --workspace           # 358 个测试
+cargo test --workspace           # 385 个测试
 ```
 
 ### 运行
@@ -82,11 +82,13 @@ CLI flags:`--eval` `--print-ast` `--print-tokens` `--desugar` `--typecheck` `--r
 | **OOP** | defgeneric/defmethod(模式分发)、方法组合(around/before/after + call-next-method)、构造器类型驱动编译期特化、类型类 |
 | **时序 / FRP** | Stream/Signal/Clock、LTL-as-types(delay/advance/⃝)、生产率检查 + 稳定类型、多时钟重采样、空间回收 |
 | **HoTT / Cohesive** | Interval/Path/HIT、HComp(KanFill)/Transp(端点传输)、`:boundary` 可满足性、2 维/N 维立方填充、Cohesive ♭(flat)/♯(sharp)/ʃ(shape)+ adjoint-triple 全语义 |
-| **系统级** | defextern + dlopen(字符串/指针/i64/f64)、无 GC 栈式区域内存、ptr-read/write + Unsafe 效应门控、编译期区域逃逸检查、统一内存管理(线性类型 + 分级线性 + 手动 Unsafe 经单一 Grade + EffectRow) |
-| **验证** | defprop/verify、模型检查(可达性 + 反例 trace)、find-attack、dolev-yao 攻击者知识合成、check-equivalence |
-| **编译器 / 工具链** | 解释器 + LLVM IR 生成(inkwell 真实 IR + 文本回退 + 闭包环境)、编译指示(inline!/specialize!/opt-level/suppress-warning)、反射(type-of/effects-of/grade-of/mode-of/determinism-of)、90+ 内置函数、REPL(:type 查询) |
+| **系统级** | defextern + dlopen(按 `:abi` 签名安全分派:i64/f64/str/指针)、无 GC 栈式区域内存 + RegionBox 析构钩子、ptr-read/write + Unsafe 效应门控、编译期区域逃逸检查、统一内存管理(Unsafe + 依赖线性 + QTT + 分级线性 □_r/@Cost + RegionStack) |
+| **验证** | defprop/verify(用户程序属性真实求值)、model-check(用户模型可达性 + trace)、find-attack(用户协议 + dolev-yao 合成)、check-equivalence、trace-equivalence |
+| **编译器 / 工具链** | 解释器 + LLVM IR 生成(inkwell 真实 IR + 文本回退 + 闭包环境)、`--compile` llc/clang 编译运行闭环(llvm feature)、编译指示(inline!/specialize!/opt-level/suppress-warning)、反射(type-of/effects-of/grade-of/mode-of/determinism-of 返回推断后签名)、90+ 内置函数、REPL(:type 查询) |
 
 > 全部 32 章 ✅ 全链路可用(无 ⚠️/⬜ 项)。逐章证据见 [standard_doc/04-implementation-status.md](./standard_doc/04-implementation-status.md)。
+>
+> 0.1.0 能力检测补齐轮(`make-all-paradigms-usable`):`--run`/`--eval` 先静态检查后执行;lambda 支持 `->` 返回注解;`--verify` 验证用户 defprop;`--compile` 编译运行闭环;FFI 按 ABI 签名分派;会话保留负载且 `join` 结构化等待;范式句柄进入 QTT/依赖线性/`@Cost`/Unsafe 检查并接入 RegionStack;方法组合在特化路径保持语义。
 
 ### 文档
 
@@ -106,4 +108,4 @@ CLI flags:`--eval` `--print-ast` `--print-tokens` `--desugar` `--typecheck` `--r
 
 ### 示例程序
 
-`examples/` 下 19 个示例;14 个可运行输出正确(hello/fibonacci/adt/advanced/run/type-infer/state-effect/logic-test/liquid-types-test/remaining-gaps-demo/dependent-linear-test/partial-completion-demo/finish-design-demo/finish-partial-demo),3 个为定义型(无入口,用 `--typecheck` 检查:frp-counter/phase5-test/_qtt-test),1 个部分支持(logic-search),1 个预期报错(液态类型负面用例,`--typecheck` 演示违反与反例)。
+`examples/` 下 24 个示例:21 个 `--run` 可运行输出正确(含新增 `oop-around`/`paradigm-matrix`/`verify-user`),3 个为定义型或验证型(无入口,用 `--typecheck`/`--verify` 检查:frp-counter/phase5-test/_qtt-test/verify-user),1 个部分支持(logic-search),1 个预期报错(液态类型负面用例,`--typecheck` 演示违反与反例)。

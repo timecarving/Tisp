@@ -28,19 +28,19 @@
 | 17 | Cohesive HoTT | ✅ | ♭(Flat 容器)/♯(Sharp 容器)可区分语义;ʃ(shape)路径连通 + shape-graph 连通图;crisp 上下文检查;adjoint-triple(ʃ ⊣ ♭ ⊣ ♯)全语义:counit(♭∘♯ = id、ʃ∘♭ = id)+ unit(♯∘♭、♭∘ʃ 单元嵌入)+ 态射级自然性(一阶态射 `Morphism<A,B>` + counit/unit 自然变换方块)已接线 |
 | 18 | Temporal Types | ✅ | 惰性 Stream/Signal/Clock 可运行;`(next T)` 等时序模态类型语法与推断;□_t 稳定类型 `is_stable_type` + 生产率检查 `check_productivity` 已接线(§18.3/18.4);因果性经 LTL-as-types(delay/advance)+ 生产率 + 稳定类型覆盖;空间回收 `Next`(⃝ 值两次 advance 后回收,无泄漏)已接线 |
 | 19 | Dependent Graded Types | ✅ | **Type 有 Pi/Sigma 变体**(§19.1 语法/显示/推断统一,`->` 注解生效);依赖等级 r+s 传播已实现(grade_check.rs 类型级使用计数 + 有限等级求解);符号等级不等式经 Z3 判定(`verify_grade_inequalities` + `grade_to_smt`:可证恒真→verified、欠约束→明确警告带反例、降级→warned) |
-| 20 | Session Types | ✅ | defsession 协议解析为 SessionType;MPST `:role` 分段投影;类型级协议顺序检查(期望违反报错) |
+| 20 | Session Types | ✅ | defsession 协议解析为 SessionType;MPST `:role` 分段投影;类型级协议顺序检查按通道键控并检查首操作;会话 send/recv 保留负载并经真实通道读写(close 关闭通道) |
 | 21 | Logic Programming | ✅ | defpred/回溯/CLP label/constrain 线性+算术(乘除模)/all-different 传播/solve-all/find-all/abduce 多解枚举+不可满足原因;任意谓词 Prolog 式全多解(结构化值统一+分支隔离+空解过滤) |
 | 22 | Generic Functions | ✅ | defgeneric/defmethod 模式分发+方法组合(:around/:before/:after/call-next-method);构造器类型驱动编译期特化(monomorphize)+ 多参数特化接入 --run |
 | 23 | Typeclasses | ✅ | defclass 方法分发器(隐式字典按参数类型查 instance_dict)+ definstance 方法参数绑定 + 构造器→ADT 映射 |
 | 24 | Macros | ✅ | defmacro 展开+syntax-quote/unquote/unquote-splice;fn/lambda/if-let/when-let/match 卫生重命名 + gensym + `~x` unquote 替换 |
 | 25 | Module System | ✅ | ns (:require [lib])/(:require [lib :as a])/(:refer [f]) 解析 + 跨文件加载(基准目录+防循环) |
-| 26 | FFI & System-Level | ✅ | defextern 经 `ffi` feature 真实 dlopen(字符串/指针/i64/f64);ptr-read/ptr-write/region-alloc/with-region 模拟内存 + Unsafe 门控警告;悬垂指针运行时检测;编译期区域逃逸检查(region_infer:返回值 + let 绑定 + 闭包捕获 + 实参流入 + 数据结构嵌入 + match 分支的别名逃逸) |
-| 27 | Process Calculi | ✅ | π 通道(FIFO)/Async/加密/spi commit-check/SKI 组合子/ambient/ρ/κ 全部接线 |
-| 28 | Verification | ✅ | defprop/verify/ModelChecker 可达性 + find-attack + check-equivalence + dolev-yao 攻击者知识合成(窃听/拼接/重放) |
-| 29 | Built-in Functions | ✅ | 90+ 注册、集合/字符串/IO/构造器齐;反射(type-of/effects-of/grade-of/mode-of/determinism-of/reflect)返回真实静态信息(名称/参数/类型/效果/等级/模式/确定性) |
-| 30 | Compiler Pragmas | ✅ | inline!/specialize!/opt-level/suppress-warning 解析;opt-level 调内联阈值 + inline! 强制内联已接线;--ir 文本回退带参签名+call;闭包代码生成(文本 IR 嵌套 lambda 参数绑定 + 捕获自由变量标注;inkwell 层闭包环境堆分配 `@closure_env` 槽 + 捕获计数,llvm feature 门控) |
-| 31 | Everything-as-ADT 逻辑编程扩展 | ✅ | Rule/Program/EvolInstr 一等 ADT(tisp-core/evolp.rs);EVOLP 稳定模型+foldl+不动点、DLP 动态稳定模型(tisp-runtime/evolp.rs);GetKB/SetKB+handler 元解释器+State 引用(tisp-runtime/mop.rs);12 类 LP 范式(tisp-runtime/paradigms.rs)全链路接线真实求解器:高阶 `higher-order-call`、归纳 `ilp-induce`、概率 `plp-marginal`、时序 `temporal-eventually`、描述逻辑 `subsume`、可废止 `defeasible-settle`、模糊 `fuzzy-eval`、表格化 `tabling`、一体化基底 `typed-pred`、响应式 `reactive-eval`、情境 `context-query`、模态 `modal-possible`;type_infer 补 12 范式单态签名 + effect_infer 门控(Search `ilp-induce`/Signal `reactive-eval`);演化 `evolp-stable`/`evolp-evolve`、动态稳定 `dlp-stable`、KB 读写 `get-kb`/`set-kb` |
-| 32 | Programming Paradigms & AOP | ✅ | 8 类范式(数组/栈/连接式/符号/自动机/状态机/数据驱动/基于流,tisp-runtime/programming.rs);AOP 编织(tisp-runtime/aop.rs);□_r/◇_ε 推理、Cost 渐近、稳定类型、区域逃逸、完整立方填充语义助手(tisp-runtime/full_chain.rs);可接入接口 `ParadigmFacility`+`ParadigmRegistry`(tisp-runtime/facility.rs);interpreter 经 `pf-*` 内置接入 + type_infer 补 24 个 `pf-*` 单态签名;真实求解器已接线:自动机 `dfa-accept`、状态机 `sm-drive`、描述逻辑 `subsume`、表格化 `tabling`、符号 `sym-eval`、稳定模型 `evolp-stable`、动态稳定模型 `dlp-stable`、演化 `evolp-evolve`、KB 读写 `get-kb`/`set-kb` |
+| 26 | FFI & System-Level | ✅ | defextern 经 `ffi` feature 真实 dlopen,`:abi` 签名安全分派(i64→i64 / f64→f64 / str→i64 / str→str / ptr→i64),签名不匹配显式报错;默认构建对真实库路径报 feature 缺失;ptr-read/ptr-write/region-alloc/with-region 模拟内存 + Unsafe 门控;悬垂指针运行时检测;编译期区域逃逸检查;范式状态经 RegionBox + 析构钩子接入 RegionStack |
+| 27 | Process Calculi | ✅ | π 通道(FIFO 阻塞 + Condvar)/Async/spi/SKI/ambient/ρ/κ 接线;spawn/join 结构化等待并传播结果;演算互编码(pi-to-ski/async-to-pi/applied-to-pi/rho-to-pi/ambient-to-channel)源码可调用 + trace-equivalence |
+| 28 | Verification | ✅ | defprop/verify 求值用户程序属性;`model-check` 用户模型可达性 + trace;find-attack 用户协议 + dolev-yao 合成;check-equivalence/trace-equivalence |
+| 29 | Built-in Functions | ✅ | 90+ 注册、集合/字符串/IO/构造器齐;反射(type-of/effects-of/grade-of/mode-of/determinism-of)返回推断后静态签名;值字面量 type-of 返回静态类型 |
+| 30 | Compiler Pragmas | ✅ | inline!/specialize!/opt-level/suppress-warning 解析;opt-level 调内联阈值 + inline! 强制内联;--ir 文本回退带参签名+call;--compile(llvm feature)经 llc/clang 编译运行闭环;泛型特化对方法组合保持语义(around 不丢组合链) |
+| 31 | Everything-as-ADT 逻辑编程扩展 | ✅ | 12 类 LP 范式全链路接线(prob/induce/fuzzy/settle/tabling/modal 等经 paradigms.rs);EVOLP/DLP/MOP(evolp-stable/evolp-evolve/dlp-stable/get-kb/set-kb);compile 期 MOP KB 与运行时 KB 分离 |
+| 32 | Programming Paradigms & AOP | ✅ | 8 类范式完整源码表面(数组/栈/连接式/符号/自动机/状态机/数据驱动/基于流),State/Signal 效应门控 + 非法输入显式报错;pf-* 与完整内置同一实现;comptime 编译期 pass + MOP KB;defaspect 编译期编织为 OOP MethodDef(around/before/after + call-next-method),`--desugar` 可见 |
 
 ---
 
@@ -59,8 +59,8 @@
 | 5 | 类型一等值(Value::Type) | §9 | ✅ 显示/匹配/六维反射(上一轮 finish-partial-features) |
 | 6 | 依赖会话类型 / MPST 类型级协议检查 | §20.2/20.3 | ✅ 依赖负载类型可解析;顺序检查保持 |
 | 7 | 类型类完整实例解析 | §23 | ✅ `:fun-deps`/超类/kind 解析 + 冲突/超类检测 |
-| 8 | 真实 dlopen FFI 全签名 | §26 | ✅ 字符串(CString)+ 指针(i64 透传)+ i64/f64 |
-| 9 | 验证 find-attack/dolev-yao 完整 | §28 | ✅ dolev-yao 知识合成(窃听/拼接/重放) |
+| 8 | 真实 dlopen FFI 全签名 | §26 | ✅ `:abi` 签名安全分派(i64/f64/str/ptr),签名不匹配/缺 feature 显式报错 |
+| 9 | 验证 find-attack/dolev-yao 完整 | §28 | ✅ 用户协议模型驱动 dolev-yao 知识合成(窃听/拼接/重放);--verify 验证用户 defprop;model-check 可达性 + trace |
 | 10 | 编译指示全处理 | §30 | ✅ 解析 + suppress-warning 过滤 + opt-level/inline! 优化器接线 |
 
 ### ⚠️ 部分实现(有骨架、语义残缺)

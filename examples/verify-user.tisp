@@ -1,0 +1,22 @@
+;; 用户程序验证(§28):defprop + model-check 可达性
+;;
+;; 用法:
+;;   tisp --verify examples/verify-user.tisp
+;;
+;; model-check 参数:(init goal next max-depth)
+;; - init  : 初始状态
+;; - goal  : 状态谓词(命中即 property holds)
+;; - next  : 状态 → 后继状态列表(模型转换关系)
+;; - depth : 搜索深度上界
+
+(defprop reachable-5
+  (model-check 0
+    (fn [n] (= n 5))
+    (fn [n] [(+ n 1) (+ n 2)])
+    20))
+
+(defprop upper-bound-100-unreachable
+  (model-check 0
+    (fn [n] (> n 100))
+    (fn [n] [(+ n 1)])
+    10))

@@ -27,8 +27,10 @@ pub struct TypeInfer {
     data_env: DataEnv,
     pub hole_env: HoleEnv,
     pub liquid_checker: LiquidChecker,
-    /// Session type protocol state: channel_id → expected next operation
-    session_state: HashMap<u64, SessionExpectation>,
+    /// Session type protocol state: channel key → expected next operation
+    session_state: HashMap<String, SessionExpectation>,
+    /// 程序是否声明了 defsession 协议(有协议时首操作必须为 send)
+    has_session_protocol: bool,
     /// 类型族实例表(§9)
     type_families: Vec<TypeFamilyInstance>,
     /// §17 crisp 上下文深度(♭ 解包要求)
@@ -37,6 +39,7 @@ pub struct TypeInfer {
 
 #[derive(Debug, Clone, PartialEq)]
 enum SessionExpectation {
+    Send,
     Recv,
     Close,
     End,
@@ -119,7 +122,9 @@ impl TypeInfer {
         let builtin = matches!(name.as_str(),
             "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
             | "f32" | "f64" | "bool" | "String" | "Unit" | "Char"
-            | "List" | "Map" | "Set" | "Vec" | "Maybe" | "Result" | "Option" | "Tuple");
+            | "List" | "Map" | "Set" | "Vec" | "Maybe" | "Result" | "Option" | "Tuple"
+            | "Chan" | "Stream" | "LVar" | "KB" | "Ref" | "Ptr" | "Clock"
+            | "Array" | "Stack" | "Sym" | "Dfa" | "SM" | "Table");
         !builtin && self.data_env.lookup(name).is_none()
     }
 
@@ -220,6 +225,7 @@ impl TypeInfer {
             hole_env: HoleEnv::new(),
             liquid_checker: LiquidChecker::new(),
             session_state: HashMap::new(),
+            has_session_protocol: false,
             type_families: Vec::new(),
             crisp_depth: 0,
         }
@@ -231,6 +237,10 @@ impl TypeInfer {
 
         // 类型族实例表(§9)
         self.type_families = program.type_families.clone();
+        // 存在 defsession 协议时,会话/通道操作的首个期望为 Send(§20.2)
+        self.has_session_protocol = program.defs.iter().any(|d| {
+            matches!(&d.ty, Some(Type::Session(_)))
+        });
 
         // Register data declarations
         for decl in &program.data_decls {
@@ -388,11 +398,27 @@ impl TypeInfer {
         env.insert(Symbol::new("tell"), TypeScheme::poly(vec![tv(56, "a")], Type::fun(Type::Var(tv(56, "a")), Type::unit())));
         env.insert(Symbol::new("throw"), TypeScheme::poly(vec![tv(57, "a")], Type::fun(Type::Var(tv(57, "a")), Type::unit())));
         env.insert(Symbol::new("choose"), TypeScheme::poly(vec![tv(58, "a")], Type::fun(Type::Var(tv(58, "a")), Type::Var(tv(58, "a")))));
-        env.insert(Symbol::new("chan"), TypeScheme::mono(Type::fun(Type::unit(), Type::string())));
-        env.insert(Symbol::new("send"), TypeScheme::poly(vec![tv(59, "a")], Type::fun(Type::string(), Type::fun(Type::Var(tv(59, "a")), Type::unit()))));
-        env.insert(Symbol::new("recv"), TypeScheme::mono(Type::fun(Type::string(), Type::i64())));
-        env.insert(Symbol::new("stream"), TypeScheme::mono(Type::fun(Type::i64(), Type::Temporal(TemporalOp::Next, Box::new(Type::i64())))));
-        env.insert(Symbol::new("stream-take"), TypeScheme::mono(Type::fun(Type::Temporal(TemporalOp::Next, Box::new(Type::i64())), Type::fun(Type::i64(), Type::list(Type::i64())))));
+        // §7.1 范式句柄:分级类型构造(Chan a / Stream a / LVar a / KB),与效应行一起
+        // 由 grade_check/effect_infer 检查(完整统一内存体系)
+        let chan_ty = Type::App(Box::new(Type::Con(TypeCon { name: Symbol::new("Chan"), kind: Kind::Arrow(Box::new(Kind::Star), Box::new(Kind::Star)) })), Box::new(Type::i64()));
+        let stream_ty = Type::App(Box::new(Type::Con(TypeCon { name: Symbol::new("Stream"), kind: Kind::Arrow(Box::new(Kind::Star), Box::new(Kind::Star)) })), Box::new(Type::i64()));
+        let lvar_ty = Type::App(Box::new(Type::Con(TypeCon { name: Symbol::new("LVar"), kind: Kind::Arrow(Box::new(Kind::Star), Box::new(Kind::Star)) })), Box::new(Type::i64()));
+        let kb_ty = Type::App(Box::new(Type::Con(TypeCon { name: Symbol::new("KB"), kind: Kind::Arrow(Box::new(Kind::Star), Box::new(Kind::Star)) })), Box::new(Type::unit()));
+        let handle_con = |name: &str| Type::Con(TypeCon { name: Symbol::new(name), kind: Kind::Arrow(Box::new(Kind::Star), Box::new(Kind::Star)) });
+        let array_ty = Type::App(Box::new(handle_con("Array")), Box::new(Type::i64()));
+        let stack_ty = Type::App(Box::new(handle_con("Stack")), Box::new(Type::i64()));
+        let sym_ty = Type::App(Box::new(handle_con("Sym")), Box::new(Type::i64()));
+        let dfa_ty = Type::Con(TypeCon { name: Symbol::new("Dfa"), kind: Kind::Star });
+        let sm_ty = Type::Con(TypeCon { name: Symbol::new("SM"), kind: Kind::Star });
+        let table_ty = Type::App(Box::new(handle_con("Table")), Box::new(Type::i64()));
+        env.insert(Symbol::new("chan"), TypeScheme::mono(Type::fun(Type::unit(), chan_ty.clone())));
+        env.insert(Symbol::new("send"), TypeScheme::poly(vec![tv(59, "a")], Type::fun(chan_ty.clone(), Type::fun(Type::Var(tv(59, "a")), Type::unit()))));
+        env.insert(Symbol::new("recv"), TypeScheme::mono(Type::fun(chan_ty, Type::i64())));
+        env.insert(Symbol::new("stream"), TypeScheme::mono(Type::fun(Type::i64(), stream_ty.clone())));
+        env.insert(Symbol::new("stream-take"), TypeScheme::mono(Type::fun(stream_ty.clone(), Type::fun(Type::i64(), Type::list(Type::i64())))));
+        env.insert(Symbol::new("fresh"), TypeScheme::mono(Type::fun(Type::unit(), lvar_ty)));
+        env.insert(Symbol::new("get-kb"), TypeScheme::mono(Type::fun(Type::unit(), kb_ty.clone())));
+        env.insert(Symbol::new("set-kb"), TypeScheme::mono(Type::fun(Type::list(Type::i64()), kb_ty)));
         // §18.5 LTL-as-types:delay : a → (next a);advance : (next a) → a(时序模态类型匹配)
         env.insert(Symbol::new("delay"), TypeScheme::poly(vec![tv(60, "a")], Type::fun(Type::Var(tv(60, "a")), Type::Temporal(TemporalOp::Next, Box::new(Type::Var(tv(60, "a")))))));
         env.insert(Symbol::new("advance"), TypeScheme::poly(vec![tv(61, "a")], Type::fun(Type::Temporal(TemporalOp::Next, Box::new(Type::Var(tv(61, "a")))), Type::Var(tv(61, "a")))));
@@ -401,12 +427,12 @@ impl TypeInfer {
             Type::fun(Type::fun(Type::i64(), Type::bool()), Type::fun(Type::i64(), Type::bool())));
         env.insert(Symbol::new("always"), TypeScheme::mono(stream_pred_bool.clone()));
         env.insert(Symbol::new("eventually"), TypeScheme::mono(stream_pred_bool));
-        env.insert(Symbol::new("clock"), TypeScheme::mono(Type::fun(Type::unit(), Type::string())));
+        let clock_ty = Type::App(Box::new(Type::Con(TypeCon { name: Symbol::new("Clock"), kind: Kind::Arrow(Box::new(Kind::Star), Box::new(Kind::Star)) })), Box::new(Type::i64()));
+        env.insert(Symbol::new("clock"), TypeScheme::mono(Type::fun(Type::string(), Type::fun(Type::i64(), clock_ty))));
         env.insert(Symbol::new("~"), TypeScheme::mono(Type::fun(Type::bool(), Type::bool())));
         env.insert(Symbol::new("interval-neg"), TypeScheme::mono(Type::fun(Type::bool(), Type::bool())));
         env.insert(Symbol::new("interval-and"), TypeScheme::mono(Type::fun(Type::bool(), Type::fun(Type::bool(), Type::bool()))));
         env.insert(Symbol::new("interval-or"), TypeScheme::mono(Type::fun(Type::bool(), Type::fun(Type::bool(), Type::bool()))));
-        env.insert(Symbol::new("fresh"), TypeScheme::mono(Type::fun(Type::unit(), Type::i64())));
         env.insert(Symbol::new("search"), TypeScheme::poly(vec![tv(62, "a")], Type::fun(Type::Var(tv(62, "a")), Type::bool())));
         env.insert(Symbol::new("solve-all"), TypeScheme::mono(Type::fun(Type::i64(), Type::list(Type::i64()))));
         env.insert(Symbol::new("find-all"), TypeScheme::poly(vec![tv(65, "a")],
@@ -440,10 +466,10 @@ impl TypeInfer {
         m("pf-stack-top", Type::fun(li.clone(), i64t.clone()));
         m("pf-compose", Type::fun(i64t.clone(), i64t.clone()));
         m("pf-sym-eval", Type::fun(i64t.clone(), i64t.clone()));
-        m("pf-dfa-accept", Type::fun(li.clone(), bt.clone()));
-        m("pf-sm-drive", Type::fun(i64t.clone(), i64t.clone()));
-        m("pf-dispatch", Type::fun(i64t.clone(), st.clone()));
-        m("pf-stream-take", Type::fun(i64t.clone(), li.clone()));
+        m("pf-dfa-accept", Type::fun(i64t.clone(), Type::fun(li.clone(), Type::fun(li.clone(), Type::fun(st.clone(), bt.clone())))));
+        m("pf-sm-drive", Type::fun(i64t.clone(), Type::fun(i64t.clone(), Type::fun(li.clone(), i64t.clone()))));
+        m("pf-dispatch", Type::fun(i64t.clone(), Type::fun(i64t.clone(), Type::fun(i64t.clone(), i64t.clone()))));
+        m("pf-stream-take", Type::fun(stream_ty.clone(), Type::fun(i64t.clone(), li.clone())));
         m("pf-aop-weave", Type::fun(i64t.clone(), i64t.clone()));
         // §31 12 逻辑范式真实内置(接线 paradigms.rs 求解器,替换 pf-* 简化投影)
         // 描述:subsume:(subsumes li, concept i64, query i64) → bool
@@ -472,11 +498,68 @@ impl TypeInfer {
         m("typed-pred", Type::fun(i64t.clone(), Type::fun(li.clone(), li.clone())));
         // 响应式:reactive-eval:(rule-id i64, sig i64) → i64
         m("reactive-eval", Type::fun(i64t.clone(), Type::fun(i64t.clone(), i64t.clone())));
+        // §2 8 编程范式完整源码表面签名(句柄类型 Array/Stack/Sym/Dfa/SM/Table)
+        let li = Type::list(Type::i64());
+        let i = Type::i64();
+        let st = Type::string();
+        let unary = Type::fun(i.clone(), i.clone());
+        m("array", Type::fun(li.clone(), Type::fun(li.clone(), array_ty.clone())));
+        m("array-dims", Type::fun(array_ty.clone(), li.clone()));
+        m("array-index", Type::fun(array_ty.clone(), Type::fun(li.clone(), i.clone())));
+        m("array-slice", Type::fun(array_ty.clone(), Type::fun(i.clone(), Type::fun(i.clone(), array_ty.clone()))));
+        m("array-map", Type::fun(array_ty.clone(), Type::fun(unary.clone(), array_ty.clone())));
+        m("array-reduce", Type::fun(array_ty.clone(), Type::fun(i.clone(), Type::fun(unary.clone(), i.clone()))));
+        m("array-sum-axis0", Type::fun(array_ty, li.clone()));
+        m("stack-new", Type::fun(Type::unit(), stack_ty.clone()));
+        m("stack-push", Type::fun(stack_ty.clone(), Type::fun(i.clone(), stack_ty.clone())));
+        m("stack-pop", Type::fun(stack_ty.clone(), Type::list(i.clone())));
+        m("stack-peek", Type::fun(stack_ty.clone(), i.clone()));
+        m("stack-dup", Type::fun(stack_ty.clone(), stack_ty.clone()));
+        m("stack-swap", Type::fun(stack_ty.clone(), stack_ty.clone()));
+        m("stack-rotate", Type::fun(stack_ty.clone(), Type::fun(i.clone(), stack_ty.clone())));
+        m("stack-len", Type::fun(stack_ty, i.clone()));
+        m("concatenate", Type::fun(unary.clone(), Type::fun(unary.clone(), unary.clone())));
+        m("point-apply", Type::fun(unary.clone(), Type::fun(i.clone(), i.clone())));
+        m("branch", Type::fun(Type::bool(), Type::fun(i.clone(), Type::fun(i.clone(), i.clone()))));
+        m("sym-num", Type::fun(i.clone(), sym_ty.clone()));
+        m("sym-var", Type::fun(st.clone(), sym_ty.clone()));
+        m("sym-add", Type::fun(sym_ty.clone(), Type::fun(sym_ty.clone(), sym_ty.clone())));
+        m("sym-mul", Type::fun(sym_ty.clone(), Type::fun(sym_ty.clone(), sym_ty.clone())));
+        m("sym-substitute", Type::fun(sym_ty.clone(), Type::fun(st.clone(), Type::fun(i.clone(), sym_ty.clone()))));
+        m("sym-simplify", Type::fun(sym_ty.clone(), sym_ty.clone()));
+        m("sym-eval", Type::fun(sym_ty, i.clone()));
+        m("dfa-union", Type::fun(dfa_ty.clone(), Type::fun(dfa_ty.clone(), Type::fun(st.clone(), Type::bool()))));
+        m("dfa-concat", Type::fun(dfa_ty.clone(), Type::fun(dfa_ty.clone(), Type::fun(st.clone(), Type::bool()))));
+        m("dfa-accept", Type::fun(i.clone(), Type::fun(li.clone(), Type::fun(li.clone(), Type::fun(st.clone(), Type::bool())))));
+        m("table-new", Type::fun(li.clone(), Type::fun(Type::list(Type::fun(i.clone(), i.clone())), table_ty.clone())));
+        m("table-dispatch", Type::fun(table_ty, Type::fun(i.clone(), Type::fun(i.clone(), i.clone()))));
+        m("sm-new", Type::fun(i.clone(), sm_ty.clone()));
+        m("sm-drive", Type::fun(i.clone(), Type::fun(i.clone(), Type::fun(li.clone(), i.clone()))));
+        m("sm-trace", Type::fun(sm_ty, li.clone()));
+        m("stream-map", Type::fun(stream_ty.clone(), Type::fun(unary.clone(), Type::fun(i.clone(), li.clone()))));
+        m("stream-filter", Type::fun(stream_ty.clone(), Type::fun(unary, Type::fun(i.clone(), li.clone()))));
+        m("stream-sink", Type::fun(stream_ty, Type::fun(i, li)));
+        // §16.3 fun-ext:两个 i64→i64 函数在有限整数域上点态等价 → bool
+        m("fun-ext", Type::fun(Type::fun(i64t.clone(), i64t.clone()),
+            Type::fun(Type::fun(i64t.clone(), i64t.clone()),
+                Type::fun(Type::list(i64t.clone()), bt.clone()))));
+        // §16.4 幺半等价:二元运算 × 单位元 × 有限域 → bool
+        m("monoid-check", Type::fun(Type::fun(i64t.clone(), Type::fun(i64t.clone(), i64t.clone())),
+            Type::fun(i64t.clone(), Type::fun(Type::list(i64t.clone()), bt.clone()))));
         // §统一内存管理:ref/deref/set! 为 State 效应操作,Ref a 分级值
         let ref_i64 = Type::Ref(Box::new(i64t.clone()));
         m("ref", Type::fun(i64t.clone(), ref_i64.clone()));
         m("deref", Type::fun(ref_i64.clone(), i64t.clone()));
         m("set!", Type::fun(ref_i64.clone(), Type::fun(i64t.clone(), ut.clone())));
+
+        // §9.1 范式签名从设施元数据生成:对 Registry 中尚未手工接线的 pf-* 设施,
+        // 用其 params/ret 元数据构造签名,保证每个注册范式都参与类型检查。
+        for facility in tisp_runtime::facility::default_registry().all() {
+            let name = Symbol::new(&format!("pf-{}", facility.keyword));
+            if env.lookup(&name).is_none() {
+                env.insert(name, TypeScheme::mono(facility.signature()));
+            }
+        }
 
         env
     }
@@ -567,6 +650,10 @@ impl TypeInfer {
                         if param_types.len() == 1 {
                             result = Type::Pi(name.clone(), Box::new(param_types[0].clone()), Box::new(body_ty));
                         }
+                    } else if !matches!(ret, Type::Sigma(..)) {
+                        // 普通返回类型注解:与函数体类型统一(类型不匹配报错)
+                        let ret_body_ty = self.apply_subst(&body_ty);
+                        self.unify(&ret_body_ty, ret, expr.span)?;
                     }
                 }
                 // §零参 lambda:(fn [] body) → Unit -> body(与解释器零参闭包语义一致)
@@ -587,6 +674,16 @@ impl TypeInfer {
             }
 
             CoreExprNode::App(func, arg) => {
+                // 零参构造器调用 (Nothing)/(Nil):解释器以 App(f, Unit) 表示,
+                // 类型检查按构造器类型直接返回(不再与 Unit -> ? 统一)
+                if let (CoreExprNode::Var(name), CoreExprNode::Lit(Literal::Unit)) = (&func.node, &arg.node) {
+                    if let Some((_, ctor)) = self.data_env.lookup_constructor(name) {
+                        if ctor.fields.is_empty() {
+                            let ctor_ty = self.infer_expr(env, func)?;
+                            return Ok(self.apply_subst(&ctor_ty));
+                        }
+                    }
+                }
                 let func_ty = self.infer_expr(env, func)?;
                 let arg_ty = self.infer_expr(env, arg)?;
                 let ret_ty = self.fresh_var();
@@ -724,43 +821,46 @@ impl TypeInfer {
             }
 
             // ── Session type protocol checking (§20.2)──
-            CoreExprNode::Session(op, body) => {
-                // 协议顺序检查:期望操作与实际操作不符报错
-                let expected = self.session_state.get(&0).cloned();
-                let actual = match op {
-                    SessionOp::Send => Some("send"),
-                    SessionOp::Recv => Some("recv"),
-                    SessionOp::Close => Some("close"),
-                    SessionOp::Fork(_) => None,
-                };
-                if let (Some(exp), Some(act)) = (expected, actual) {
-                    let exp_str = match exp {
-                        SessionExpectation::Recv => "recv",
-                        SessionExpectation::Close => "close",
-                        SessionExpectation::End => "end",
-                    };
-                    if exp_str != act {
-                        return Err(TypeError {
-                            message: format!("会话协议顺序违反:期望 {} 实际 {}", exp_str, act),
-                            span: expr.span.clone(),
-                        });
+            CoreExprNode::Session(op, operands) => {
+                for (idx, operand) in operands.iter().enumerate() {
+                    let _ty = self.infer_expr(env, operand)?;
+                    if idx == 0 {
+                        let key = self.session_key_for(operand);
+                        self.check_session_step(&key, op.clone(), expr.span)?;
                     }
                 }
                 match op {
-                    SessionOp::Send => {
-                        // After send, expect recv
-                        self.session_state.insert(0, SessionExpectation::Recv);
-                    }
-                    SessionOp::Recv => {
-                        // After recv, expect close
-                        self.session_state.insert(0, SessionExpectation::Close);
-                    }
-                    SessionOp::Close => {
-                        self.session_state.insert(0, SessionExpectation::End);
-                    }
-                    _ => {}
+                    SessionOp::Send | SessionOp::Close | SessionOp::Fork(_) => Ok(Type::unit()),
+                    SessionOp::Recv => Ok(self.fresh_var()),
                 }
-                self.infer_expr(env, body)
+            }
+            // §21 逻辑变量:(fresh [x ...]) 绑定到新类型变量,后续使用可类型化
+            CoreExprNode::Fresh(name) => {
+                let ty = self.fresh_var();
+                env.insert(name.clone(), TypeScheme::mono(ty.clone()));
+                Ok(ty)
+            }
+            CoreExprNode::ChannelNew => Ok(Type::string()),            CoreExprNode::ChannelSend(ch, val) => {
+                let _ch_ty = self.infer_expr(env, ch)?;
+                self.infer_expr(env, val)?;
+                let key = self.session_key_for(ch);
+                self.check_session_step(&key, SessionOp::Send, expr.span)?;
+                Ok(Type::unit())
+            }
+            CoreExprNode::ChannelRecv(ch) => {
+                self.infer_expr(env, ch)?;
+                let key = self.session_key_for(ch);
+                self.check_session_step(&key, SessionOp::Recv, expr.span)?;
+                Ok(self.fresh_var())
+            }
+            CoreExprNode::AsyncSend(ch, val) => {
+                let _ch_ty = self.infer_expr(env, ch)?;
+                self.infer_expr(env, val)?;
+                Ok(Type::unit())
+            }
+            CoreExprNode::AsyncRecv(ch) => {
+                self.infer_expr(env, ch)?;
+                Ok(self.fresh_var())
             }
 
             CoreExprNode::FlatMod(e) => {
@@ -784,8 +884,49 @@ impl TypeInfer {
         }
     }
 
-    fn infer_literal(&self, lit: &Literal) -> Type {
-        match lit {
+    /// 会话/通道操作的通道键:Var 名或 default(§20.2 每通道独立协议状态)
+    fn session_key_for(&self, expr: &CoreExpr) -> String {
+        match &expr.node {
+            CoreExprNode::Var(name) => name.as_str().to_string(),
+            CoreExprNode::Lit(Literal::String(s)) => s.clone(),
+            _ => "default".into(),
+        }
+    }
+
+    /// 按通道键检查并推进会话协议状态(首操作在声明协议时要求 send)
+    fn check_session_step(&mut self, key: &str, op: SessionOp, span: Span) -> Result<(), TypeError> {
+        let actual = match op {
+            SessionOp::Send => Some("send"),
+            SessionOp::Recv => Some("recv"),
+            SessionOp::Close => Some("close"),
+            SessionOp::Fork(_) => None,
+        };
+        let expected = self.session_state.get(key).cloned()
+            .or_else(|| if self.has_session_protocol { Some(SessionExpectation::Send) } else { None });
+        if let (Some(exp), Some(act)) = (expected, actual) {
+            let exp_str = match exp {
+                SessionExpectation::Send => "send",
+                SessionExpectation::Recv => "recv",
+                SessionExpectation::Close => "close",
+                SessionExpectation::End => "end",
+            };
+            if exp_str != act {
+                return Err(TypeError {
+                    message: format!("会话协议顺序违反:通道 {} 期望 {} 实际 {}", key, exp_str, act),
+                    span,
+                });
+            }
+        }
+        match op {
+            SessionOp::Send => { self.session_state.insert(key.to_string(), SessionExpectation::Recv); }
+            SessionOp::Recv => { self.session_state.insert(key.to_string(), SessionExpectation::Close); }
+            SessionOp::Close => { self.session_state.insert(key.to_string(), SessionExpectation::End); }
+            SessionOp::Fork(_) => {}
+        }
+        Ok(())
+    }
+
+    fn infer_literal(&self, lit: &Literal) -> Type {        match lit {
             Literal::I8(_) => Type::i8(),
             Literal::I16(_) => Type::i16(),
             Literal::I32(_) => Type::i32(),
@@ -1529,6 +1670,39 @@ mod ltl_tests {
             }
             other => panic!("delay 应为函数类型,实际 {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_lambda_ret_annotation_matches() {
+        // lambda 返回注解与函数体类型统一(匹配时通过)
+        let mut ti = TypeInfer::new();
+        let mut env = TypeEnv::new();
+        let lam = CoreExpr::new(CoreExprNode::Lam(Lambda {
+            params: vec![Param { name: Symbol::new("x"), ty: Some(Type::i64()), grade: Grade::Omega, mode: Mode::In }],
+            body: Box::new(CoreExpr::new(CoreExprNode::Lit(Literal::I64(1)), Span::dummy())),
+            ret_type: Some(Type::i64()),
+        }), Span::dummy());
+        let ty = ti.infer_expr(&mut env, &lam).unwrap();
+        match ty {
+            Type::Fun(p, _, r) => {
+                assert_eq!(*p, Type::i64(), "参数类型应为 i64");
+                assert_eq!(*r, Type::i64(), "返回类型应为 i64");
+            }
+            other => panic!("lambda 应为函数类型,实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_lambda_ret_annotation_mismatch() {
+        // 函数体返回 i64 但标注 String → 报类型错误
+        let mut ti = TypeInfer::new();
+        let mut env = TypeEnv::new();
+        let lam = CoreExpr::new(CoreExprNode::Lam(Lambda {
+            params: vec![],
+            body: Box::new(CoreExpr::new(CoreExprNode::Lit(Literal::I64(1)), Span::dummy())),
+            ret_type: Some(Type::string()),
+        }), Span::dummy());
+        assert!(ti.infer_expr(&mut env, &lam).is_err(), "返回类型不匹配应报错");
     }
 
     #[test]

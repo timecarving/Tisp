@@ -954,6 +954,7 @@ dependencies = [
  "petgraph",
  "thiserror 2.0.19",
  "tisp-core",
+ "tisp-runtime",
 ]
 
 [[package]]

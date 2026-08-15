@@ -3,7 +3,7 @@
 (defdata (Stream a)
   (::: [a, (⃝ (Stream a))]))
 
-(defn const-stream [{stable a : Type}, x : a] -> (Stream a)
+(defn const-stream [a : Type, x : a] -> (Stream a)
   (::: x (delay (const-stream x))))
 
 (defn running-sum [s : (Stream Int)] -> (Stream Int)

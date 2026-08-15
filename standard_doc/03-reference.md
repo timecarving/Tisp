@@ -223,6 +223,11 @@ tisp                                # 进入 REPL
 | `finish-partial-demo.tisp` | 综合演示 | 六维注解 `->[ε,ρ,@r,m,d]`/QTT 擦除/Monad |
 | `phase5-test.tisp` | 定义型(无入口) | 洞/确定性 |
 | `_qtt-test.tisp` | 定义型(无入口) | QTT |
+| `oop-around.tisp` | `100` | OOP around 方法组合经特化路径保持语义 |
+| `paradigm-matrix.tisp` | 范式矩阵输出 | 12 逻辑 + 8 编程 + AOP + FRP 端到端 |
+| `verify-user.tisp` | `--verify` 2 properties | 用户 defprop + model-check 可达性 |
+| `declarative-paradigms.tisp` | 8 范式输出 | 8 编程范式端到端(State/Signal 效应) |
+| `aop-mop.tisp` | `100` / `[]` | comptime MOP KB + defaspect 编译期编织 |
 
 > 定义型示例只含声明(defn/defdata),无 main 或顶层表达式,`--run` 报 `no main function` 属预期;可用 `--typecheck` 检查。
 

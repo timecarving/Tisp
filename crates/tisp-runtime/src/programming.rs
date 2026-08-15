@@ -21,6 +21,15 @@ impl<T: Clone> Array<T> {
         Array { shape, data }
     }
 
+    /// 校验构造:shape/data 不匹配返回可读错误(§1.1 显式错误)
+    pub fn new_checked(shape: Vec<usize>, data: Vec<T>) -> Result<Self, String> {
+        let total: usize = shape.iter().product();
+        if total != data.len() {
+            return Err(format!("数组形状 {:?} 需要 {} 个元素,实际 {}", shape, total, data.len()));
+        }
+        Ok(Array { shape, data })
+    }
+
     /// 查询形状(维度/长度)
     pub fn dims(&self) -> &[usize] {
         &self.shape
@@ -28,19 +37,36 @@ impl<T: Clone> Array<T> {
 
     /// 多维系索引
     pub fn index(&self, idx: &[usize]) -> Option<&T> {
+        self.index_checked(idx).ok()
+    }
+
+    /// 多维系索引:维度数不匹配/越界返回可读错误(§1.1 显式错误)
+    pub fn index_checked(&self, idx: &[usize]) -> Result<&T, String> {
         if idx.len() != self.shape.len() {
-            return None;
+            return Err(format!("索引维数 {} 与数组维数 {} 不一致", idx.len(), self.shape.len()));
         }
         let mut flat = 0usize;
         let mut stride = 1usize;
         for (coord, &dim) in idx.iter().rev().zip(self.shape.iter().rev()) {
             if *coord >= dim {
-                return None;
+                return Err(format!("索引 {:?} 越界:维 {} 长度 {}", idx, coord, dim));
             }
             flat += *coord * stride;
             stride *= dim;
         }
-        self.data.get(flat)
+        self.data.get(flat).ok_or_else(|| format!("索引 {:?} 越界", idx))
+    }
+
+    /// 一维切片:[lo, hi)(闭区间右开);返回新数组(纯函数)
+    pub fn slice(&self, lo: usize, hi: usize) -> Result<Array<T>, String> {
+        if self.shape.len() != 1 {
+            return Err("切片当前仅支持一维数组".into());
+        }
+        let n = self.shape[0];
+        if lo > hi || hi > n {
+            return Err(format!("切片区间 [{}, {}) 越界:长度 {}", lo, hi, n));
+        }
+        Ok(Array { shape: vec![hi - lo], data: self.data[lo..hi].to_vec() })
     }
 
     /// 逐元素映射(纯函数,原数组不变)
@@ -95,12 +121,40 @@ impl<T> Stack<T> {
         (self, v)
     }
 
+    /// pop 显式错误(空栈不静默返回 None)
+    pub fn pop_checked(mut self) -> Result<(Self, T), String> {
+        match self.0.pop() {
+            Some(v) => Ok((self, v)),
+            None => Err("pop on empty stack".into()),
+        }
+    }
+
     pub fn peek(&self) -> Option<&T> {
         self.0.last()
     }
 
+    /// peek 显式错误(空栈不静默返回 None)
+    pub fn peek_checked(&self) -> Result<&T, String> {
+        self.0.last().ok_or_else(|| "peek on empty stack".into())
+    }
+
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    /// 旋转:把栈顶第 n 项移到栈顶(纯函数)
+    pub fn rotate(mut self, n: usize) -> Result<Self, String> {
+        let len = self.0.len();
+        if len == 0 {
+            return Err("rotate on empty stack".into());
+        }
+        let n = n % len;
+        if n == 0 {
+            return Ok(self);
+        }
+        let v = self.0.remove(len - 1 - n);
+        self.0.push(v);
+        Ok(self)
     }
 }
 
@@ -201,6 +255,16 @@ impl SymExpr {
             SymExpr::Mul(a, b) => Some(a.eval()? * b.eval()?),
         }
     }
+
+    /// 求值:含自由变量返回可读错误(§1.4 显式错误)
+    pub fn eval_checked(&self) -> Result<i64, String> {
+        match self {
+            SymExpr::Num(n) => Ok(*n),
+            SymExpr::Var(v) => Err(format!("符号表达式含自由变量 {}", v)),
+            SymExpr::Add(a, b) => Ok(a.eval_checked()? + b.eval_checked()?),
+            SymExpr::Mul(a, b) => Ok(a.eval_checked()? * b.eval_checked()?),
+        }
+    }
 }
 
 // ── 自动机编程 ──
@@ -226,6 +290,87 @@ impl Dfa {
         }
         self.accept.contains(&state)
     }
+
+    /// 识别输入串:未声明符号/未声明状态转移 SHALL 显式报错;
+    /// 支持组合自动机的 ε 转移('\0')。
+    pub fn accepts_checked(&self, input: &str) -> Result<bool, String> {
+        let mut states: im::HashSet<String> = im::HashSet::new();
+        states.insert(self.start.clone());
+        self.epsilon_close(&mut states);
+        for c in input.chars() {
+            let mut next: im::HashSet<String> = im::HashSet::new();
+            let mut declared_any = false;
+            for from in &states {
+                for (f, sym, to) in &self.transitions {
+                    if f == from && *sym == c {
+                        next.insert(to.clone());
+                        declared_any = true;
+                    }
+                }
+            }
+            if next.is_empty() {
+                return Err(format!("DFA 非法输入:当前状态集 {:?} 对符号 '{}' 无转移", states, c));
+            }
+            let _ = declared_any;
+            self.epsilon_close(&mut next);
+            states = next;
+        }
+        Ok(states.iter().any(|s| self.accept.contains(s)))
+    }
+
+    fn epsilon_close(&self, states: &mut im::HashSet<String>) {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let current: Vec<String> = states.iter().cloned().collect();
+            for from in current {
+                for (f, sym, to) in &self.transitions {
+                    if f == &from && *sym == '\0' && states.insert(to.clone()).is_none() {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 自动机并:接受两个自动机语言的并集(状态名加前缀避免冲突)
+    pub fn union(&self, other: &Dfa) -> Dfa {
+        let prefix_a = |s: &str| format!("a:{}", s);
+        let prefix_b = |s: &str| format!("b:{}", s);
+        let mut dfa = Dfa {
+            start: "__union__".to_string(),
+            accept: im::HashSet::new(),
+            transitions: Vec::new(),
+        };
+        for (from, sym, to) in &self.transitions {
+            dfa.transitions.push((prefix_a(from), *sym, prefix_a(to)));
+        }
+        for (from, sym, to) in &other.transitions {
+            dfa.transitions.push((prefix_b(from), *sym, prefix_b(to)));
+        }
+        for s in &self.accept { dfa.accept.insert(prefix_a(s)); }
+        for s in &other.accept { dfa.accept.insert(prefix_b(s)); }
+        dfa.transitions.push(("__union__".into(), '\0', prefix_a(&self.start)));
+        dfa.transitions.push(("__union__".into(), '\0', prefix_b(&other.start)));
+        dfa
+    }
+
+    /// 自动机串联:先识别 self 再识别 other(接受 self 后进入 other 的启动)
+    pub fn concat(&self, other: &Dfa) -> Dfa {
+        let mut dfa = Dfa {
+            start: self.start.clone(),
+            accept: other.accept.clone(),
+            transitions: self.transitions.clone(),
+        };
+        for (from, sym, to) in &other.transitions {
+            dfa.transitions.push((from.clone(), *sym, to.clone()));
+        }
+        // self 的接受态以 ε 转移到 other.start;DFA 表示中用 '\0' 占位并在识别时跳过
+        for acc in &self.accept {
+            dfa.transitions.push((acc.clone(), '\0', other.start.clone()));
+        }
+        dfa
+    }
 }
 
 // ── 状态机编程 ──
@@ -236,13 +381,15 @@ pub struct StateMachine {
     pub current: String,
     /// (from, event, to)
     pub transitions: Vec<(String, String, String)>,
+    /// (state, event, action)——转移动作,成功转移时追加进 trace
+    pub actions: Vec<(String, String, String)>,
     /// 转移动作日志(每次转移追加)
     pub trace: Vec<String>,
 }
 
 impl StateMachine {
     pub fn new(initial: &str) -> Self {
-        StateMachine { current: initial.to_string(), transitions: Vec::new(), trace: Vec::new() }
+        StateMachine { current: initial.to_string(), transitions: Vec::new(), actions: Vec::new(), trace: Vec::new() }
     }
 
     /// 事件驱动转移:合法则转移并记录动作,非法则报错且状态不变
@@ -250,7 +397,13 @@ impl StateMachine {
         match self.transitions.iter().find(|(from, ev, _)| *from == self.current && ev == event) {
             Some((_, _, to)) => {
                 let to = to.clone();
-                self.trace.push(format!("{} --{}--> {}", self.current, event, to));
+                let from = self.current.clone();
+                for (st, ev, action) in &self.actions {
+                    if *st == from && ev == event {
+                        self.trace.push(action.clone());
+                    }
+                }
+                self.trace.push(format!("{} --{}--> {}", from, event, to));
                 self.current = to;
                 Ok(())
             }
@@ -270,6 +423,14 @@ pub struct DispatchTable {
 impl DispatchTable {
     pub fn dispatch(&self, key: &str, arg: &str) -> Option<String> {
         self.table.get(key).map(|handler| handler(arg))
+    }
+
+    /// 查表分发:缺失键显式报错(§1.7 错误语义)
+    pub fn dispatch_checked(&self, key: &str, arg: &str) -> Result<String, String> {
+        match self.table.get(key) {
+            Some(handler) => Ok(handler(arg)),
+            None => Err(format!("分发表缺失键: {}", key)),
+        }
     }
 }
 
@@ -406,5 +567,72 @@ mod tests {
         // 无限流:0,1,2,... 惰性取前 3 项并映射(不卡死)
         let out = sink(map_node(take_node(0i64.., 3), |x| x * 2));
         assert_eq!(out, vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn test_array_checked_errors() {
+        assert!(Array::new_checked(vec![2, 2], vec![1, 2, 3]).is_err(), "shape/data 不匹配应报错");
+        let a = Array::new_checked(vec![2, 2], vec![1, 2, 3, 4]).unwrap();
+        assert_eq!(a.index_checked(&[1, 1]).unwrap(), &4);
+        assert!(a.index_checked(&[2, 0]).is_err(), "越界索引应报错");
+        assert!(a.index_checked(&[1]).is_err(), "维数不匹配应报错");
+        let one = Array::new_checked(vec![4], vec![1, 2, 3, 4]).unwrap();
+        assert_eq!(one.slice(1, 3).unwrap().data, vec![2, 3]);
+    }
+
+    #[test]
+    fn test_stack_checked_errors() {
+        let s0 = Stack::<i64>::new();
+        assert!(s0.peek_checked().is_err(), "空栈 peek 应报错");
+        assert!(s0.pop_checked().is_err(), "空栈 pop 应报错");
+        let s = Stack::<i64>::new().push(1).push(2).push(3);
+        let s = s.rotate(1).unwrap();
+        assert_eq!(s.peek_checked().unwrap(), &2, "rotate 1 应把栈顶下第 1 项移到栈顶");
+        let (_, top) = s.pop_checked().unwrap();
+        assert_eq!(top, 2);
+    }
+
+    #[test]
+    fn test_sym_eval_checked() {
+        let e = SymExpr::Add(Box::new(SymExpr::Var("x".into())), Box::new(SymExpr::Num(1)));
+        assert!(e.eval_checked().is_err(), "自由变量应显式报错");
+        assert_eq!(e.substitute("x", 2).eval_checked().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_dfa_union_concat_epsilon() {
+        let dfa = Dfa {
+            start: "s0".into(),
+            accept: ["s0".to_string()].into_iter().collect(),
+            transitions: vec![("s0".into(), 'a', "s1".into()), ("s1".into(), 'a', "s0".into())],
+        };
+        let u = dfa.union(&dfa);
+        assert!(u.accepts_checked("aa").unwrap(), "并集应接受 aa");
+        let c = dfa.concat(&dfa);
+        assert!(c.accepts_checked("aaaa").unwrap(), "串联应接受 aaaa");
+        assert!(c.accepts_checked("b").is_err(), "未声明符号应报错");
+    }
+
+    #[test]
+    fn test_state_machine_actions() {
+        let mut sm = StateMachine::new("idle");
+        sm.transitions = vec![("idle".into(), "start".into(), "running".into())];
+        sm.actions = vec![("idle".into(), "start".into(), "entry-running".into())];
+        sm.drive("start").unwrap();
+        assert_eq!(sm.current, "running");
+        assert_eq!(sm.trace.last().unwrap(), "idle --start--> running");
+        assert!(sm.trace.iter().any(|a| a == "entry-running"), "entry/exit 动作应记录");
+        assert!(sm.drive("bogus").is_err());
+        assert_eq!(sm.current, "running", "非法转移后状态不变");
+    }
+
+    #[test]
+    fn test_dispatch_checked() {
+        let dt = DispatchTable {
+            table: [("greet".to_string(), (|n: &str| format!("Hello, {}!", n)) as fn(&str) -> String)]
+                .into_iter().collect(),
+        };
+        assert_eq!(dt.dispatch_checked("greet", "Tisp").unwrap(), "Hello, Tisp!");
+        assert!(dt.dispatch_checked("nope", "x").is_err(), "缺失键应显式报错");
     }
 }

@@ -3,7 +3,7 @@
 //! 未特化调用保持运行时分发(现有 generic_table 语义)。
 
 use std::collections::HashMap;
-use tisp_core::core_ast::{CoreDef, CoreExpr, CoreExprNode, CoreProgram, Lambda, Literal, Param, Pattern, Visibility};
+use tisp_core::core_ast::{CoreDef, CoreExpr, CoreExprNode, CoreProgram, Lambda, Literal, MethodCategory, Param, Pattern, Visibility};
 use tisp_core::symbol::Symbol;
 
 pub struct Specializer {
@@ -28,12 +28,12 @@ impl Specializer {
                 self.ctor_types.insert(ctor.name.as_str().to_string(), decl.name.as_str().to_string());
             }
         }
-        // 1) 收集方法表:generic → [(模式列表, body)]
-        let mut methods: HashMap<String, Vec<(Vec<Pattern>, CoreExpr)>> = HashMap::new();
+        // 1) 收集方法表:generic → [(类别, 模式列表, body)]
+        let mut methods: HashMap<String, Vec<(MethodCategory, Vec<Pattern>, CoreExpr)>> = HashMap::new();
         for def in &program.defs {
-            if let CoreExprNode::MethodDef(gen, _cat, patterns, body) = &def.body.node {
+            if let CoreExprNode::MethodDef(gen, cat, patterns, body) = &def.body.node {
                 methods.entry(gen.as_str().to_string()).or_default()
-                    .push((patterns.clone(), (**body).clone()));
+                    .push((cat.clone(), patterns.clone(), (**body).clone()));
             }
         }
         if methods.is_empty() {
@@ -70,7 +70,7 @@ impl Specializer {
             type_families: program.type_families.clone(),
             resource_algebras: program.resource_algebras.clone(),
             defs: new_defs,
-            pragmas: vec![],
+            pragmas: program.pragmas.clone(),
         }
     }
 
@@ -78,7 +78,7 @@ impl Specializer {
     fn specialize_body(
         &mut self,
         expr: &CoreExpr,
-        methods: &HashMap<String, Vec<(Vec<Pattern>, CoreExpr)>>,
+        methods: &HashMap<String, Vec<(MethodCategory, Vec<Pattern>, CoreExpr)>>,
         next_id: &mut usize,
     ) -> (CoreExpr, Vec<CoreDef>) {
         let span = expr.span.clone();
@@ -94,55 +94,62 @@ impl Specializer {
                 }
                 if let CoreExprNode::Var(name) = &cur.node {
                     if let Some(ms) = methods.get(name.as_str()) {
-                        // §22.4 类型驱动:多参数构造器类型匹配
-                        if let Some((patterns, body)) = ms.iter().find(|(pats, _)| {
-                            pats.len() == chain.len()
-                                && pats.iter().zip(&chain).all(|(pat, arg)| self.pat_matches(pat, arg))
-                        }) {
-                            let bound_vars: Vec<Symbol> = patterns.iter().flat_map(pattern_vars).collect();
-                            *next_id += 1;
-                            let spec_name = Symbol::new(&format!("{}__spec_{}", name, next_id));
-                            let spec_body = if bound_vars.is_empty() {
-                                body.clone()
-                            } else {
-                                let params: Vec<Param> = bound_vars.iter().map(|v| Param {
-                                    name: v.clone(),
+                        // §22.4 类型驱动:多参数构造器类型匹配。
+                        // 方法组合语义优先:含 around/before/after 或 call-next-method 的
+                        // 泛型调用保持运行时分发,不生成丢组合链的特化副本。
+                        let has_combination = ms.iter().any(|(cat, _, body)| {
+                            *cat != MethodCategory::Primary || references_symbol(body, "call-next-method")
+                        });
+                        if !has_combination {
+                            if let Some((_cat, patterns, body)) = ms.iter().find(|(_cat, pats, _)| {
+                                pats.len() == chain.len()
+                                    && pats.iter().zip(&chain).all(|(pat, arg)| self.pat_matches(pat, arg))
+                            }) {
+                                let bound_vars: Vec<Symbol> = patterns.iter().flat_map(pattern_vars).collect();
+                                *next_id += 1;
+                                let spec_name = Symbol::new(&format!("{}__spec_{}", name, next_id));
+                                let spec_body = if bound_vars.is_empty() {
+                                    body.clone()
+                                } else {
+                                    let params: Vec<Param> = bound_vars.iter().map(|v| Param {
+                                        name: v.clone(),
+                                        ty: None,
+                                        grade: tisp_core::types::Grade::Omega,
+                                        mode: tisp_core::types::Mode::In,
+                                    }).collect();
+                                    CoreExpr::new(CoreExprNode::Lam(Lambda {
+                                        params,
+                                        body: Box::new(body.clone()),
+                                        ret_type: None,
+                                    }), span.clone())
+                                };
+                                let spec_def = CoreDef {
+                                    name: spec_name.clone(),
                                     ty: None,
+                                    effects: tisp_core::types::EffectRow::Pure,
                                     grade: tisp_core::types::Grade::Omega,
                                     mode: tisp_core::types::Mode::In,
-                                }).collect();
-                                CoreExpr::new(CoreExprNode::Lam(Lambda {
-                                    params,
-                                    body: Box::new(body.clone()),
-                                    ret_type: None,
-                                }), span.clone())
-                            };
-                            let spec_def = CoreDef {
-                                name: spec_name.clone(),
-                                ty: None,
-                                effects: tisp_core::types::EffectRow::Pure,
-                                grade: tisp_core::types::Grade::Omega,
-                                mode: tisp_core::types::Mode::In,
-                                mode_sigs: vec![],
-                                determinism: tisp_core::types::Determinism::Det,
-                                region: None,
-                                visibility: Visibility::Public,
-                                body: spec_body,
-                                requires: None,
-                                ensures: None,
-                                span: span.clone(),
-                            };
-                            specs.push(spec_def);
-                            self.specialized += 1;
-                            // 调用替换为 (spec_name a1 ... an)
-                            let mut call = CoreExpr::new(CoreExprNode::Var(spec_name), span.clone());
-                            for a in &chain {
-                                call = CoreExpr::new(
-                                    CoreExprNode::App(Box::new(call), Box::new((**a).clone())),
-                                    span.clone(),
-                                );
+                                    mode_sigs: vec![],
+                                    determinism: tisp_core::types::Determinism::Det,
+                                    region: None,
+                                    visibility: Visibility::Public,
+                                    body: spec_body,
+                                    requires: None,
+                                    ensures: None,
+                                    span: span.clone(),
+                                };
+                                specs.push(spec_def);
+                                self.specialized += 1;
+                                // 调用替换为 (spec_name a1 ... an)
+                                let mut call = CoreExpr::new(CoreExprNode::Var(spec_name), span.clone());
+                                for a in &chain {
+                                    call = CoreExpr::new(
+                                        CoreExprNode::App(Box::new(call), Box::new((**a).clone())),
+                                        span.clone(),
+                                    );
+                                }
+                                return (call, specs);
                             }
-                            return (call, specs);
                         }
                     }
                 }
@@ -225,5 +232,133 @@ fn pattern_vars(pat: &Pattern) -> Vec<Symbol> {
         Pattern::Tuple(subs) => subs.iter().flat_map(pattern_vars).collect(),
         Pattern::Or(subs) => subs.iter().flat_map(pattern_vars).collect(),
         _ => vec![],
+    }
+}
+
+/// 表达式树中是否引用指定符号(用于检测 call-next-method 等组合依赖)
+fn references_symbol(expr: &CoreExpr, name: &str) -> bool {
+    match &expr.node {
+        CoreExprNode::Var(s) => s.as_str() == name,
+        CoreExprNode::App(f, a) => references_symbol(f, name) || references_symbol(a, name),
+        CoreExprNode::Lam(l) => references_symbol(&l.body, name),
+        CoreExprNode::Let(_, _, v, b) => references_symbol(v, name) || references_symbol(b, name),
+        CoreExprNode::If(c, t, e) => references_symbol(c, name) || references_symbol(t, name) || references_symbol(e, name),
+        CoreExprNode::Do(es) => es.iter().any(|e| references_symbol(e, name)),
+        CoreExprNode::Match(s, arms) => {
+            references_symbol(s, name) || arms.iter().any(|a| references_symbol(&a.body, name))
+        }
+        CoreExprNode::Handle(e, h) => {
+            references_symbol(e, name)
+                || h.clauses.iter().any(|c| references_symbol(&c.body, name))
+                || h.return_clause.as_ref().map(|r| references_symbol(r, name)).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tisp_core::span::Span as SpanT;
+
+    fn span() -> SpanT {
+        SpanT::dummy()
+    }
+
+    fn lit(n: i64) -> CoreExpr {
+        CoreExpr::new(CoreExprNode::Lit(Literal::I64(n)), span())
+    }
+
+    #[test]
+    fn test_method_combination_keeps_runtime_dispatch() {
+        // 泛型含 around 方法时不得生成特化副本(会丢组合链)
+        let program = CoreProgram {
+            data_decls: vec![],
+            effect_decls: vec![],
+            type_families: vec![],
+            resource_algebras: vec![],
+            pragmas: vec![],
+            defs: vec![
+                CoreDef {
+                    name: Symbol::new("area"),
+                    ty: None,
+                    effects: tisp_core::types::EffectRow::Pure,
+                    grade: tisp_core::types::Grade::Omega,
+                    mode: tisp_core::types::Mode::In,
+                    mode_sigs: vec![],
+                    determinism: tisp_core::types::Determinism::Det,
+                    region: None,
+                    visibility: Visibility::Public,
+                    body: CoreExpr::new(CoreExprNode::GenericDef(Symbol::new("area"), vec![], None), span()),
+                    requires: None,
+                    ensures: None,
+                    span: span(),
+                },
+                CoreDef {
+                    name: Symbol::new("__method_area"),
+                    ty: None,
+                    effects: tisp_core::types::EffectRow::Pure,
+                    grade: tisp_core::types::Grade::Omega,
+                    mode: tisp_core::types::Mode::In,
+                    mode_sigs: vec![],
+                    determinism: tisp_core::types::Determinism::Det,
+                    region: None,
+                    visibility: Visibility::Public,
+                    body: CoreExpr::new(CoreExprNode::MethodDef(
+                        Symbol::new("area"),
+                        MethodCategory::Around,
+                        vec![Pattern::Var(Symbol::new("x"))],
+                        Box::new(lit(99)),
+                    ), span()),
+                    requires: None,
+                    ensures: None,
+                    span: span(),
+                },
+                CoreDef {
+                    name: Symbol::new("__method_area_primary"),
+                    ty: None,
+                    effects: tisp_core::types::EffectRow::Pure,
+                    grade: tisp_core::types::Grade::Omega,
+                    mode: tisp_core::types::Mode::In,
+                    mode_sigs: vec![],
+                    determinism: tisp_core::types::Determinism::Det,
+                    region: None,
+                    visibility: Visibility::Public,
+                    body: CoreExpr::new(CoreExprNode::MethodDef(
+                        Symbol::new("area"),
+                        MethodCategory::Primary,
+                        vec![Pattern::Lit(Literal::I64(5))],
+                        Box::new(lit(50)),
+                    ), span()),
+                    requires: None,
+                    ensures: None,
+                    span: span(),
+                },
+                CoreDef {
+                    name: Symbol::new("main"),
+                    ty: None,
+                    effects: tisp_core::types::EffectRow::Pure,
+                    grade: tisp_core::types::Grade::Omega,
+                    mode: tisp_core::types::Mode::In,
+                    mode_sigs: vec![],
+                    determinism: tisp_core::types::Determinism::Det,
+                    region: None,
+                    visibility: Visibility::Public,
+                    body: CoreExpr::new(CoreExprNode::App(
+                        Box::new(CoreExpr::new(CoreExprNode::Var(Symbol::new("area")), span())),
+                        Box::new(lit(5)),
+                    ), span()),
+                    requires: None,
+                    ensures: None,
+                    span: span(),
+                },
+            ],
+        };
+        let mut spec = Specializer::new();
+        let out = spec.specialize(&program);
+        assert_eq!(spec.specialized, 0, "含 around 的泛型调用不得被特化");
+        // 特化前后的调用结构一致(保持运行时分发)
+        let main = out.defs.iter().find(|d| d.name.as_str() == "main").unwrap();
+        assert!(matches!(&main.body.node, CoreExprNode::App(..)), "main 调用应保持原样");
     }
 }

@@ -1,0 +1,19 @@
+;; comptime 纯声明式 MOP + AOP 编译期编织示例(§5-§7)
+;;
+;; 用法:
+;;   tisp --desugar examples/aop-mop.tisp   # 可见 comptime 内联 + 编织后的 MethodDef
+;;   tisp --typecheck examples/aop-mop.tisp
+;;   tisp --run examples/aop-mop.tisp
+;;
+;; comptime (set-kb [1 2]) 在编译期写入编译期 MOP 知识库,运行时不重复执行;
+;; defaspect 在编译期把 around 切面编织进 area 方法链。
+
+(defgeneric area [x])
+(defmethod area [5] 50)
+(defaspect double-area (pointcut area [x]) :around (* 2 (call-next-method)))
+
+(defn main [] -> [[State], rho1, @omega, in, det] Unit
+  (do
+    (comptime (set-kb [1 2]))   ; 编译期执行一次,内联为 Unit
+    (println (area 5))          ; => 100(around 编织)
+    (println (get-kb))))        ; => [](运行时 KB 与编译期 KB 分离)

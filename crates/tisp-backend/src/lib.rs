@@ -1,4 +1,5 @@
 pub mod codegen;
+pub mod comptime;
 pub mod interpreter;
 pub mod liquid_verify;
 pub mod process;

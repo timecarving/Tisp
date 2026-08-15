@@ -49,6 +49,67 @@ fn grade_usage_value(g: &Grade) -> Option<u64> {
     }
 }
 
+/// 表达式树中指定符号的出现次数(§7.4 范式操作代价计数)
+fn count_symbol_uses(expr: &CoreExpr, name: &str) -> u64 {
+    let mut n = match &expr.node {
+        CoreExprNode::Var(s) if s.as_str() == name => 1,
+        _ => 0,
+    };
+    n += match &expr.node {
+        CoreExprNode::App(f, a) => count_symbol_uses(f, name) + count_symbol_uses(a, name),
+        CoreExprNode::Lam(l) => count_symbol_uses(&l.body, name),
+        CoreExprNode::Let(_, _, v, b) => count_symbol_uses(v, name) + count_symbol_uses(b, name),
+        CoreExprNode::If(c, t, e) => count_symbol_uses(c, name) + count_symbol_uses(t, name) + count_symbol_uses(e, name),
+        CoreExprNode::Do(es) => es.iter().map(|e| count_symbol_uses(e, name)).sum(),
+        CoreExprNode::Match(s, arms) => {
+            count_symbol_uses(s, name) + arms.iter().map(|a| count_symbol_uses(&a.body, name)).sum::<u64>()
+        }
+        CoreExprNode::Handle(e, h) => {
+            count_symbol_uses(e, name)
+                + h.clauses.iter().map(|c| count_symbol_uses(&c.body, name)).sum::<u64>()
+                + h.return_clause.as_ref().map(|r| count_symbol_uses(r, name)).unwrap_or(0)
+        }
+        CoreExprNode::Session(_, operands) => operands.iter().map(|e| count_symbol_uses(e, name)).sum(),
+        CoreExprNode::Search(e) => count_symbol_uses(e, name),
+        _ => 0,
+    };
+    n
+}
+
+/// §7.4 范式操作代价:search/stream-take/label/solve-all 与 pf-* 接入的次数
+fn count_cost_ops(expr: &CoreExpr) -> u64 {
+    ["search", "stream-take", "label", "solve-all"].iter()
+        .map(|op| count_symbol_uses(expr, op)).sum::<u64>()
+        + count_pf_prefix(expr)
+}
+
+/// 统计 pf-* 范式内置调用次数(§31/§32 资源上界)
+fn count_pf_prefix(expr: &CoreExpr) -> u64 {
+    let mut n = match &expr.node {
+        CoreExprNode::Var(s) if s.as_str().starts_with("pf-") => 1,
+        _ => 0,
+    };
+    n += match &expr.node {
+        CoreExprNode::App(f, a) => count_pf_prefix(f) + count_pf_prefix(a),
+        CoreExprNode::Lam(l) => count_pf_prefix(&l.body),
+        CoreExprNode::Let(_, _, v, b) => count_pf_prefix(v) + count_pf_prefix(b),
+        CoreExprNode::If(c, t, e) => count_pf_prefix(c) + count_pf_prefix(t) + count_pf_prefix(e),
+        CoreExprNode::Do(es) => es.iter().map(count_pf_prefix).sum(),
+        CoreExprNode::Match(s, arms) => {
+            count_pf_prefix(s) + arms.iter().map(|a| count_pf_prefix(&a.body)).sum::<u64>()
+        }
+        CoreExprNode::Handle(e, h) => {
+            count_pf_prefix(e)
+                + h.clauses.iter().map(|c| count_pf_prefix(&c.body)).sum::<u64>()
+                + h.return_clause.as_ref().map(|r| count_pf_prefix(r)).unwrap_or(0)
+        }
+        CoreExprNode::Session(_, operands) => operands.iter().map(|e| count_pf_prefix(e)).sum(),
+        CoreExprNode::Search(e) => count_pf_prefix(e),
+        _ => 0,
+    };
+    n
+}
+
 /// §11.2 □_r 分级必然:参数类型为 (□_r A) 时,用 r 作等级(与 param.grade 统一)
 fn effective_grade(param: &Param) -> Grade {
     match &param.ty {
@@ -103,6 +164,32 @@ impl GradeChecker {
                             span: def.span.clone(),
                         });
                     }
+                }
+            }
+        }
+        // §7.4 分级线性 @Cost:范式操作(search/stream-take/label/solve-all/pf-*)的资源
+        // 使用上界。可判定上界(Custom Cost Nat n)超界报错;符号上界(Var Cost)记录不等式,
+        // 由 Z3 验证层给出 verified/warned 结论(不可静默通过)。
+        let cost_bound = match &def.grade {
+            Grade::Custom(name, bound) if name.as_str() == "Cost" => grade_usage_value(bound),
+            _ => None,
+        };
+        if cost_bound.is_some() || matches!(&def.grade, Grade::Var(v) if v.as_str() == "Cost") {
+            let cost_usage = count_cost_ops(&def.body);
+            match cost_bound {
+                Some(n) if cost_usage > n => {
+                    return Err(GradeError {
+                        message: format!("cost violation: 范式操作使用 {} 次,超过 @Cost 上界 {}", cost_usage, n),
+                        span: def.span.clone(),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    self.inequalities.push(GradeInequality {
+                        grade: def.grade.clone(),
+                        count: cost_usage,
+                        span: def.span.clone(),
+                    });
                 }
             }
         }
@@ -404,6 +491,21 @@ impl GradeChecker {
                 for e in exprs { self.check_expr(e)?; }
                 Ok(())
             }
+            // §7.2 范式句柄/通道/内存原语:递归计入句柄使用次数(QTT 移动检查)
+            CoreExprNode::ChannelSend(ch, val) | CoreExprNode::AsyncSend(ch, val) => {
+                self.check_expr(ch)?;
+                self.check_expr(val)
+            }
+            CoreExprNode::ChannelRecv(ch) | CoreExprNode::AsyncRecv(ch) => self.check_expr(ch),
+            CoreExprNode::Session(_, operands) => {
+                for opnd in operands { self.check_expr(opnd)?; }
+                Ok(())
+            }
+            CoreExprNode::PtrRead(e) | CoreExprNode::RegionFree(e) | CoreExprNode::SignalNew(e) => self.check_expr(e),
+            CoreExprNode::PtrWrite(a, b) | CoreExprNode::RegionAlloc(a, b) => {
+                self.check_expr(a)?;
+                self.check_expr(b)
+            }
             _ => Ok(()),
         }
     }
@@ -647,6 +749,50 @@ mod tests {
     }
 
     #[test]
+    fn test_cost_bound_violation_and_symbolic() {
+        // §7.4 分级线性 @Cost:可判定上界超界报错;符号上界记录不等式交 Z3 判定
+        let mut bad = def_with_lam("bad", vec![], CoreExprNode::Do(vec![
+            e(CoreExprNode::App(Box::new(e(var("search"))), Box::new(e(int(1))))),
+            e(CoreExprNode::App(Box::new(e(var("search"))), Box::new(e(int(2))))),
+        ]));
+        bad.grade = Grade::Custom(Symbol::new("Cost"), Box::new(Grade::Nat(1)));
+        let err = check(vec![bad]).unwrap_err();
+        assert!(err.message.contains("cost violation"), "代价超界应报错,实际: {}", err.message);
+
+        let mut sym = def_with_lam("sym", vec![], CoreExprNode::App(
+            Box::new(e(var("stream-take"))), Box::new(e(int(1))),
+        ));
+        sym.grade = Grade::Var(Symbol::new("Cost"));
+        let mut g = GradeChecker::new();
+        g.check_program(&CoreProgram { data_decls: vec![], effect_decls: vec![], type_families: vec![],
+            resource_algebras: vec![], defs: vec![sym], pragmas: vec![] }).unwrap();
+        assert!(!g.inequalities.is_empty(), "符号 @Cost 应记录等级不等式");
+    }
+
+    #[test]
+    fn test_handle_linear_grade() {        // §7.2 范式句柄 QTT:线性 Chan 句柄复用报错,ω 句柄多读放行,0 级可擦除
+        let chan_ty = tisp_core::types::Type::App(
+            Box::new(tisp_core::types::Type::Con(tisp_core::types::TypeCon {
+                name: Symbol::new("Chan"),
+                kind: tisp_core::types::Kind::Arrow(Box::new(tisp_core::types::Kind::Star), Box::new(tisp_core::types::Kind::Star)),
+            })),
+            Box::new(tisp_core::types::Type::i64()),
+        );
+        let linear = Param { name: Symbol::new("c"), ty: Some(chan_ty.clone()), grade: Grade::One, mode: tisp_core::types::Mode::In };
+        let bad = def_with_lam("bad", vec![linear.clone()], CoreExprNode::Do(vec![e(var("c")), e(var("c"))]));
+        let err = check(vec![bad]).unwrap_err();
+        assert!(err.message.contains("linear"), "线性 Chan 句柄复用应报错,实际: {}", err.message);
+
+        let shared = Param { name: Symbol::new("c"), ty: Some(chan_ty.clone()), grade: Grade::Omega, mode: tisp_core::types::Mode::In };
+        let ok = def_with_lam("ok", vec![shared], CoreExprNode::Do(vec![e(var("c")), e(var("c"))]));
+        assert!(check(vec![ok]).is_ok(), "ω 级 Chan 句柄多读应放行");
+
+        let erased = Param { name: Symbol::new("c"), ty: Some(chan_ty), grade: Grade::Zero, mode: tisp_core::types::Mode::In };
+        let erased_ok = def_with_lam("erased", vec![erased], int(0));
+        assert!(check(vec![erased_ok]).is_ok(), "0 级句柄应可擦除");
+    }
+
+    #[test]
     fn test_dependent_grade_pi_ok() {
         // §19.1:Pi 绑定类型检查通过(当前绑定为 ω)
         let pi_ty = Type::Pi(
@@ -775,7 +921,6 @@ mod dep_grade_tests {
         CoreExpr::new(node, Span::dummy())
     }
     fn var(name: &str) -> CoreExprNode { CoreExprNode::Var(Symbol::new(name)) }
-    fn int(n: i64) -> CoreExprNode { CoreExprNode::Lit(tisp_core::core_ast::Literal::I64(n)) }
 
     fn def_with_grade(name: &str, grade: Grade, uses: usize) -> CoreDef {
         let body = if uses == 1 {

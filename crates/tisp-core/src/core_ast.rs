@@ -138,7 +138,7 @@ pub enum CoreExprNode {
     Comptime(Box<CoreExpr>),
     CompilerMacroDef(Symbol, usize, Box<CoreExpr>),
     MetaQuery(Symbol),
-    AdviceDef(Symbol, Box<CoreExpr>, Box<CoreExpr>),
+    AdviceDef(Symbol, MethodCategory, Vec<Pattern>, Box<CoreExpr>),
 
     // ── Theorem Proving ──
     TheoremDef(Symbol, Box<CoreExpr>),
@@ -153,7 +153,7 @@ pub enum CoreExprNode {
     PtrWrite(Box<CoreExpr>, Box<CoreExpr>),
 
     // ── Session types ──
-    Session(SessionOp, Box<CoreExpr>),
+    Session(SessionOp, Vec<CoreExpr>),
 
     // ── Dependent types ──
     Pi(Symbol, Type, Box<CoreExpr>),
@@ -184,7 +184,7 @@ pub enum CoreExprNode {
     NSDef(Symbol, Vec<(Symbol, Symbol)>, Vec<Symbol>),
 
     // ── FFI ──
-    ExternDef(Symbol, String, Vec<Type>, Option<Type>, Vec<EffectLabel>),
+    ExternDef(Symbol, String, Vec<Type>, Option<Type>, Vec<EffectLabel>, String),
 }
 
 /// 定义可见性(§6.5):`defn-`/`def-` 私有,`defn`/`def` 公开

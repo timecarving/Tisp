@@ -23,6 +23,39 @@ impl<T: Clone + std::fmt::Debug + Send + 'static> Stream<T> {
 
     pub fn now(&self) -> &T { &self.head }
 
+    /// 惰性逐元素映射(§1 基于流编程):tail 保留原始流的惰性结构
+    pub fn map<U>(self, f: Arc<dyn Fn(&T) -> U + Send + Sync>) -> Stream<U>
+    where U: Clone + std::fmt::Debug + Send + 'static {
+        let head = f(&self.head);
+        let head2 = head.clone();
+        let this = self.clone();
+        let tail: Thunk<U> = Arc::new(Mutex::new(Some(Box::new(move || {
+            match this.next() {
+                Some(s) => s.map(f),
+                None => Stream::repeat(head2.clone()),
+            }
+        }))));
+        Stream { head, tail }
+    }
+
+    /// 惰性过滤:跳过不满足谓词的元素(§1 基于流编程)
+    pub fn filter(self, p: Arc<dyn Fn(&T) -> bool + Send + Sync>) -> Stream<T> {
+        if p(&self.head) {
+            let this = self.clone();
+            let tail: Thunk<T> = Arc::new(Mutex::new(Some(Box::new(move || {
+                match this.next() {
+                    Some(s) => s.filter(p),
+                    None => Stream::repeat(this.head.clone()),
+                }
+            }))));
+            Stream { head: self.head, tail }
+        } else if let Some(next) = self.next() {
+            next.filter(p)
+        } else {
+            Stream::repeat(self.head)
+        }
+    }
+
     pub fn next(&self) -> Option<Stream<T>> {
         let mut guard = self.tail.lock().unwrap();
         if let Some(thunk) = guard.take() {

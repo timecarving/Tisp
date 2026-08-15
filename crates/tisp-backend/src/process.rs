@@ -1,15 +1,59 @@
 use tisp_core::symbol::Symbol;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// Process runtime supporting π-calculus channels
 pub struct ProcessRuntime {
     channels: HashMap<Symbol, Channel>,
 }
 
+struct ChannelInner {
+    queue: VecDeque<Value>,
+    closed: bool,
+}
+
 #[derive(Clone)]
-struct Channel {
-    buffer: Arc<Mutex<Vec<Value>>>,
+pub(crate) struct Channel {
+    inner: Arc<(Mutex<ChannelInner>, Condvar)>,
+}
+
+impl Channel {
+    pub(crate) fn send_value(&self, val: Value) {
+        let (lock, cvar) = &*self.inner;
+        let mut inner = lock.lock().unwrap();
+        if !inner.closed {
+            inner.queue.push_back(val);
+            cvar.notify_one();
+        }
+    }
+
+    /// 阻塞接收:空通道等待 send;close 后唤醒并返回 None
+    pub(crate) fn recv_blocking(&self) -> Option<Value> {
+        let (lock, cvar) = &*self.inner;
+        let mut inner = lock.lock().unwrap();
+        while inner.queue.is_empty() && !inner.closed {
+            inner = cvar.wait(inner).unwrap();
+        }
+        inner.queue.pop_front()
+    }
+
+    pub(crate) fn try_recv_value(&self) -> Option<Value> {
+        let (lock, _cvar) = &*self.inner;
+        lock.lock().unwrap().queue.pop_front()
+    }
+
+    pub(crate) fn close_channel(&self) {
+        let (lock, cvar) = &*self.inner;
+        let mut inner = lock.lock().unwrap();
+        inner.closed = true;
+        // 关闭即释放缓冲队列中的待收负载(§统一内存管理:通道关闭/区域退出均释放)
+        inner.queue.clear();
+        cvar.notify_all();
+    }
+
+    pub(crate) fn is_closed_channel(&self) -> bool {
+        self.inner.0.lock().unwrap().closed
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -27,22 +71,51 @@ impl ProcessRuntime {
     }
 
     pub fn new_channel(&mut self, name: Symbol) -> Value {
-        self.channels.insert(name.clone(), Channel { buffer: Arc::new(Mutex::new(Vec::new())) });
+        self.channels.insert(name.clone(), Channel {
+            inner: Arc::new((Mutex::new(ChannelInner { queue: VecDeque::new(), closed: false }), Condvar::new())),
+        });
         Value::Chan(name)
     }
 
-    pub fn send(&self, chan_name: &Symbol, val: Value) {
-        if let Some(ch) = self.channels.get(chan_name) {
-            ch.buffer.lock().unwrap().push(val);
+    /// 释放通道:关闭、清空缓冲队列并从通道表摘除(程序区域 pop 时经 RegionStack 钩子调用)
+    pub fn release_channel(&mut self, name: &Symbol) {
+        if let Some(ch) = self.channels.remove(name) {
+            ch.close_channel();
         }
     }
 
+    /// 取出通道句柄(短暂持锁),供调用方在不持有进程运行时锁的情况下阻塞等待
+    pub(crate) fn get_channel(&self, chan_name: &Symbol) -> Option<Channel> {
+        self.channels.get(chan_name).cloned()
+    }
+
+    pub fn send(&self, chan_name: &Symbol, val: Value) {
+        if let Some(ch) = self.get_channel(chan_name) {
+            ch.send_value(val);
+        }
+    }
+
+    /// FIFO 阻塞接收(§27.2):空通道等待 send;close 后唤醒并返回 None。
+    /// 注意:调用方若经 `Mutex<ProcessRuntime>` 持锁调用本方法会与 send 死锁,
+    /// 阻塞路径请使用 get_channel + Channel::recv_blocking。
     pub fn recv(&self, chan_name: &Symbol) -> Option<Value> {
-        // FIFO:从队首取(§27.2 通道语义)
-        self.channels.get(chan_name).and_then(|ch| {
-            let mut buf = ch.buffer.lock().unwrap();
-            if buf.is_empty() { None } else { Some(buf.remove(0)) }
-        })
+        self.get_channel(chan_name).and_then(|ch| ch.recv_blocking())
+    }
+
+    /// 非阻塞接收(async-recv):空通道立即返回 None
+    pub fn try_recv(&self, chan_name: &Symbol) -> Option<Value> {
+        self.get_channel(chan_name).and_then(|ch| ch.try_recv_value())
+    }
+
+    /// 关闭通道:唤醒全部等待者,后续 send 无效(§20 close 语义)
+    pub fn close(&self, chan_name: &Symbol) {
+        if let Some(ch) = self.get_channel(chan_name) {
+            ch.close_channel();
+        }
+    }
+
+    pub fn is_closed(&self, chan_name: &Symbol) -> bool {
+        self.get_channel(chan_name).map(|ch| ch.is_closed_channel()).unwrap_or(false)
     }
 
     pub fn has_channel(&self, name: &Symbol) -> bool {

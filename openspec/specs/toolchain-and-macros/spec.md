@@ -32,7 +32,7 @@
 
 ### Requirement: 泛型编译期特化
 
-GenericDef SHALL 在 middle 层被识别并可按参数**类型** monomorphize:对构造器类型(如 `Circle`)的调用 SHALL 特化为专用方法(不再走运行时分发);多参数调用 SHALL 按参数类型组合特化;特化 SHALL 作用于 `--run` 执行路径(非仅 `--typecheck` 展示);非特化调用保持运行时分发。`--typecheck` SHALL 报告特化数量。
+GenericDef SHALL 在 middle 层被识别并可按参数**类型** monomorphize:对构造器类型(如 `Circle`)的调用 SHALL 特化为专用方法(不再走运行时分发);多参数调用 SHALL 按参数类型组合特化;特化 SHALL 作用于 `--run` 执行路径(非仅 `--typecheck` 展示);非特化调用保持运行时分发。`--typecheck` SHALL 报告特化数量。特化 SHALL 保持语义透明：含方法组合的泛型调用（around/before/after）经特化后运行结果 SHALL 与直接运行时分发完全一致。
 
 #### Scenario: ground 类型特化
 
@@ -54,6 +54,10 @@ GenericDef SHALL 在 middle 层被识别并可按参数**类型** monomorphize:�
 - **WHEN** 泛型函数以无法静态判定类型的实参调用
 - **THEN** 保持运行时分发,行为正确
 
+#### Scenario: 方法组合语义保持
+
+- **WHEN** 泛型函数含 `:around` 方法与 `call-next-method` 且调用可特化，以 `--run` 执行
+- **THEN** 结果与未特化的运行时分发一致（如 around 翻倍结果），不得丢失 around 链
 ### Requirement: 编译指示全处理
 
 编译指示 SHALL 有真实语义(§30,替换「仅语法接受」):`opt-level` SHALL 控制优化级别(实际改变优化器迭代次数/内联阈值,而非仅统计);`inline!`/`specialize!` SHALL 强制目标函数在优化器中内联/特化;`suppress-warning` SHALL 抑制指定警告;未识别的编译指示 SHALL 报错。
@@ -182,3 +186,97 @@ EffectCompiler SHALL 从「检测单处理器」扩展到「编译降级」:对�
 
 - **WHEN** 程序含捕获自由变量的闭包,以 `--ir` 运行
 - **THEN** 生成环境打包与调用,llc 编译通过,结果与解释器一致
+
+### Requirement: --eval 真实求值
+
+`--eval EXPR` SHALL 对表达式完成「读取 → 脱糖 → 静态检查 → 求值 → 输出结果」全链路；非法表达式 SHALL 报告对应诊断；SHALL 不得只打印读取数量。
+
+#### Scenario: eval 求值表达式
+
+- **WHEN** 以 `--eval '(+ 1 2)'` 运行
+- **THEN** 输出 3（或含结果的求值输出），不出现未求值的“N form(s) read”
+
+#### Scenario: eval 报错
+
+- **WHEN** 以 `--eval '(+ 1 true)'` 运行
+- **THEN** 报告类型错误并以非零码退出
+
+### Requirement: --run 静态检查前置
+
+`--run` SHALL 在执行前运行与 `--typecheck` 相同的全部静态检查；任一维度（类型/效果/等级/模式/确定性/区域/液态类型）失败 SHALL 拒绝执行并报告诊断；通过后执行的程序 SHALL 与直接解释一致。
+
+#### Scenario: 类型错误拒绝执行
+
+- **WHEN** 含类型错误的程序以 `--run` 运行
+- **THEN** 不执行 main，报告类型错误
+
+#### Scenario: 检查通过正常执行
+
+- **WHEN** 合法程序以 `--run` 运行
+- **THEN** 执行结果与现有正确行为一致，且额外报告静态检查通过信息
+
+### Requirement: --compile 可执行语义
+
+启用 `llvm` feature 时，`--compile FILE` SHALL 生成 LLVM IR、经 llc/clang 编译为可执行文件并运行，输出程序运行结果；编译或链接失败 SHALL 报告明确错误。未启用 `llvm` feature 时，`--compile` SHALL 报告「未启用 llvm feature」错误，不得只打印 IR 加提示。
+
+#### Scenario: compile 运行程序
+
+- **WHEN** 以 `--features llvm` 构建后对简单程序执行 `--compile`
+- **THEN** 程序被编译并运行，输出结果（如 42）
+
+#### Scenario: 缺 feature 显式报错
+
+- **WHEN** 默认构建下执行 `--compile`
+- **THEN** 报告需要 llvm feature 的错误
+
+### Requirement: FFI 按声明签名安全分派
+
+`defextern` SHALL 以显式或可推导的 ABI 签名（i64→i64、f64→f64、str→str/str→i64、指针透传）解析符号并调用；解析到的函数指针 SHALL 以该签名调用，不得先按 i64 签名试探导致其他签名函数被错误调用或崩溃；参数不匹配 SHALL 报告明确错误。默认构建（无 `ffi` feature）对声明了真实库路径的外部函数 SHALL 报告「未启用 ffi feature」错误；模拟回退仅允许用于显式标记为模拟的符号，且必须输出警告，不得对未知符号静默返回实参。
+
+#### Scenario: 浮点签名正确
+
+- **WHEN** 声明 `sin` 为 f64→f64 并传入 0.5，以 `--run` 执行
+- **THEN** 返回约 0.479，而非 0 或实参直通
+
+#### Scenario: 字符串签名正确
+
+- **WHEN** 声明 `strlen` 为 str→i64 并传入 "hello"，以 `--run` 执行
+- **THEN** 返回 5，进程不崩溃
+
+#### Scenario: 签名不匹配报错
+
+- **WHEN** 以 i64 签名声明 `sin` 并传入浮点实参，以 `--run` 执行
+- **THEN** 报告参数/签名不匹配错误，不按错误 ABI 调用
+
+#### Scenario: 默认构建显式报错
+
+- **WHEN** 默认构建（无 ffi feature）执行带真实库路径的 `defextern` 调用
+- **THEN** 报告未启用 ffi feature，不静默返回错误结果
+
+### Requirement: 范式 monadic 状态链真实编译
+
+`mlet`/`get-m`/`put-m`/`pure` SHALL 在 8 类范式的状态线程中真实可用：monadic 风格编写的栈/状态机/数据驱动程序 SHALL 经单处理器检测降级为直接状态传递并执行；结果 SHALL 与代数效应风格等价；`--run` SHALL 报告降级数量与实际路径，而非仅语法接受。
+
+#### Scenario: monadic 栈程序
+
+- **WHEN** 以 `mlet`/`get-m`/`put-m`/`pure` 编写数据栈操作并以 `--run` 执行
+- **THEN** 执行结果与 effect 风格一致，且报告走直接状态线程
+
+#### Scenario: 效应风格等价
+
+- **WHEN** 同一栈/状态机程序分别以 handle/perform 与 monadic 风格编写并运行
+- **THEN** 两种风格输出一致
+
+### Requirement: comptime 工具链全链路
+
+`comptime` SHALL 贯通工具链：lexer/reader 识别 → desugar 执行编译期求值与 MOP 编织 → `--desugar` 输出内联/编织后的 Core AST → `--typecheck` 检查内联后的程序 → `--run` 执行内联后的程序；`--run` 在执行前 SHALL 已完成 comptime 阶段，运行时不再次求值。
+
+#### Scenario: 全链路 comptime
+
+- **WHEN** 程序含 `comptime` 常量表达式，依次以 `--desugar`/`--typecheck`/`--run` 运行
+- **THEN** desugar 显示内联结果，typecheck 通过，run 输出与内联语义一致
+
+#### Scenario: 运行时不重复求值
+
+- **WHEN** comptime 表达式带副作用（如编译期 KB 写入），以 `--run` 执行
+- **THEN** 副作用只发生一次（编译期），运行阶段不重复执行

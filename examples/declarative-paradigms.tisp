@@ -1,0 +1,27 @@
+;; 8 类编程范式端到端示例(纯声明式副作用管理)
+;;
+;; 用法:
+;;   tisp --typecheck examples/declarative-paradigms.tisp
+;;   tisp --run examples/declarative-paradigms.tisp
+;;
+;; 数组/符号/自动机/连接式为 Pure;栈/状态机/数据驱动为 State;
+;; 基于流为 Signal。main 在效应行显式声明 State/Signal。
+
+(defn main [] -> [[State Signal], rho1, @omega, in, det] Unit
+  ;; 1 数组编程(纯函数):索引/映射/沿轴求和
+  (println (array-index (array [2 2] [1 2 3 4]) [1 1])) ; => 4
+  (println (array-sum-axis0 (array [2 2] [1 2 3 4])))   ; => [4 6]
+  ;; 2 栈编程(State 效应):new → push → peek
+  (println (stack-peek (stack-push (stack-new) 7)))     ; => 7
+  ;; 3 连接式编程(纯函数):点自由组合 g∘f
+  (println (point-apply (concatenate (fn [x] (+ x 1)) (fn [x] (* x 2))) 3)) ; => 8
+  ;; 4 符号编程(纯函数):构造/化简/求值
+  (println (sym-eval (sym-add (sym-num 1) (sym-num 2)))) ; => 3
+  ;; 5 自动机编程(纯函数):DFA 识别(0 --a--> 1 --a--> 0,0 接受)
+  (println (dfa-accept 0 [0] [0 97 1 1 97 0] "aa"))      ; => true
+  ;; 6 状态机编程(State 效应):0 --1--> 1
+  (println (sm-drive 0 1 [0 1 1]))                       ; => 1
+  ;; 7 数据驱动编程(State 效应):查表分发
+  (println (table-dispatch (table-new [1] [(fn [x] (+ x 1))]) 1 41)) ; => 42
+  ;; 8 基于流编程(Signal 效应):惰性流汇聚
+  (println (stream-sink (stream 1) 5)))                  ; => [1 2 3 4 5]

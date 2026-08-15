@@ -187,15 +187,18 @@ impl EffectInferrer {
             CoreExprNode::Join(_h) => Ok(EffectRow::Closed(vec![EffectLabel::Named(Symbol::new("Spawn"))])),
 
             // ── Session type protocol tracking ──
-            CoreExprNode::Session(op, e) => {
+            CoreExprNode::Session(op, operands) => {
                 let session_eff = match op {
                     tisp_core::core_ast::SessionOp::Send => EffectRow::Closed(vec![EffectLabel::Session]),
                     tisp_core::core_ast::SessionOp::Recv => EffectRow::Closed(vec![EffectLabel::Session]),
                     tisp_core::core_ast::SessionOp::Close => EffectRow::Closed(vec![EffectLabel::Session]),
                     tisp_core::core_ast::SessionOp::Fork(_) => EffectRow::Closed(vec![EffectLabel::Session, EffectLabel::Named(Symbol::new("Spawn"))]),
                 };
-                let e_eff = self.infer_expr(e)?;
-                Ok(row_union(&e_eff, &session_eff))
+                let mut combined = session_eff.clone();
+                for operand in operands {
+                    combined = row_union(&self.infer_expr(operand)?, &combined);
+                }
+                Ok(combined)
             }
 
             // ── FRP Signal thread safety ──
@@ -215,6 +218,27 @@ impl EffectInferrer {
                 let a_eff = self.infer_expr(a)?; let b_eff = self.infer_expr(b)?;
                 Ok(row_union(&row_union(&a_eff, &b_eff), &EffectRow::Closed(vec![EffectLabel::Signal])))
             }
+
+            // §26/§7.5 裸内存原语:PtrRead/PtrWrite/RegionAlloc/RegionFree 引入 Unsafe
+            CoreExprNode::PtrRead(e) => {
+                let e_eff = self.infer_expr(e)?;
+                Ok(row_union(&e_eff, &EffectRow::Closed(vec![EffectLabel::Named(Symbol::new("Unsafe"))])))
+            }
+            CoreExprNode::PtrWrite(a, b) => {
+                let eff = row_union(&self.infer_expr(a)?, &self.infer_expr(b)?);
+                Ok(row_union(&eff, &EffectRow::Closed(vec![EffectLabel::Named(Symbol::new("Unsafe"))])))
+            }
+            CoreExprNode::RegionAlloc(a, b) => {
+                let eff = row_union(&self.infer_expr(a)?, &self.infer_expr(b)?);
+                Ok(row_union(&eff, &EffectRow::Closed(vec![EffectLabel::Named(Symbol::new("Unsafe"))])))
+            }
+            CoreExprNode::RegionFree(e) => {
+                let e_eff = self.infer_expr(e)?;
+                Ok(row_union(&e_eff, &EffectRow::Closed(vec![EffectLabel::Named(Symbol::new("Unsafe"))])))
+            }
+
+            // §7.5 AOP 编织效应行合成:切面/方法体效应进入编织后定义
+            CoreExprNode::MethodDef(_, _, _, body) | CoreExprNode::AdviceDef(_, _, _, body) => self.infer_expr(body),
 
             _ => Ok(EffectRow::Pure),
         }
@@ -289,30 +313,37 @@ impl EffectEnv {
             ],
         });
 
-        // Search:choose(§21 回溯)+ ilp-induce(§31 归纳搜索)
+        // Search:choose(§21 回溯)+ ilp-induce(§31 归纳搜索)+ fresh(逻辑变量句柄)
         env.register_effect(EffectDecl {
             name: Symbol::new("Search"),
             type_params: Vec::new(),
             operations: vec![
                 OperationDecl { name: Symbol::new("choose"), params: vec![Type::i64()], return_type: Type::i64() },
                 OperationDecl { name: Symbol::new("ilp-induce"), params: vec![Type::list(Type::i64()), Type::list(Type::i64())], return_type: Type::list(Type::i64()) },
+                OperationDecl { name: Symbol::new("fresh"), params: Vec::new(), return_type: Type::i64() },
             ],
         });
 
-        // Signal:reactive-eval(§31 响应式信号派生)
+        // Signal:reactive-eval(§31 响应式信号派生)+ stream/stream-take(FRP 流句柄)
         env.register_effect(EffectDecl {
             name: Symbol::new("Signal"),
             type_params: Vec::new(),
             operations: vec![
                 OperationDecl { name: Symbol::new("reactive-eval"), params: vec![Type::i64(), Type::i64()], return_type: Type::i64() },
+                OperationDecl { name: Symbol::new("stream"), params: vec![Type::i64()], return_type: Type::i64() },
+                OperationDecl { name: Symbol::new("stream-take"), params: vec![Type::i64(), Type::i64()], return_type: Type::list(Type::i64()) },
+                OperationDecl { name: Symbol::new("stream-map"), params: vec![Type::i64(), Type::i64(), Type::i64()], return_type: Type::list(Type::i64()) },
+                OperationDecl { name: Symbol::new("stream-filter"), params: vec![Type::i64(), Type::i64(), Type::i64()], return_type: Type::list(Type::i64()) },
+                OperationDecl { name: Symbol::new("stream-sink"), params: vec![Type::i64(), Type::i64()], return_type: Type::list(Type::i64()) },
             ],
         });
 
-        // Channel:send/recv(§27 π)
+        // Channel:send/recv(§27 π)+ chan(通道句柄创建)
         env.register_effect(EffectDecl {
             name: Symbol::new("Channel"),
             type_params: vec![Symbol::new("a")],
             operations: vec![
+                OperationDecl { name: Symbol::new("chan"), params: Vec::new(), return_type: Type::string() },
                 OperationDecl { name: Symbol::new("send"), params: vec![Type::string(), Type::i64()], return_type: Type::unit() },
                 OperationDecl { name: Symbol::new("recv"), params: vec![Type::string()], return_type: Type::i64() },
             ],
@@ -344,6 +375,19 @@ impl EffectEnv {
                 OperationDecl { name: Symbol::new("ref"), params: vec![Type::i64()], return_type: Type::Ref(Box::new(Type::i64())) },
                 OperationDecl { name: Symbol::new("deref"), params: vec![Type::Ref(Box::new(Type::i64()))], return_type: Type::i64() },
                 OperationDecl { name: Symbol::new("set!"), params: vec![Type::Ref(Box::new(Type::i64())), Type::i64()], return_type: Type::unit() },
+                OperationDecl { name: Symbol::new("get-kb"), params: Vec::new(), return_type: Type::i64() },
+                OperationDecl { name: Symbol::new("set-kb"), params: vec![Type::list(Type::i64())], return_type: Type::unit() },
+                OperationDecl { name: Symbol::new("stack-push"), params: vec![Type::i64(), Type::i64()], return_type: Type::i64() },
+                OperationDecl { name: Symbol::new("stack-pop"), params: vec![Type::i64()], return_type: Type::i64() },
+                OperationDecl { name: Symbol::new("stack-peek"), params: vec![Type::i64()], return_type: Type::i64() },
+                OperationDecl { name: Symbol::new("stack-dup"), params: vec![Type::i64()], return_type: Type::i64() },
+                OperationDecl { name: Symbol::new("stack-swap"), params: vec![Type::i64()], return_type: Type::i64() },
+                OperationDecl { name: Symbol::new("stack-rotate"), params: vec![Type::i64(), Type::i64()], return_type: Type::i64() },
+                OperationDecl { name: Symbol::new("stack-new"), params: Vec::new(), return_type: Type::i64() },
+                OperationDecl { name: Symbol::new("sm-drive"), params: vec![Type::i64(), Type::i64(), Type::list(Type::i64())], return_type: Type::i64() },
+                OperationDecl { name: Symbol::new("sm-new"), params: vec![Type::i64()], return_type: Type::i64() },
+                OperationDecl { name: Symbol::new("table-new"), params: vec![Type::list(Type::i64()), Type::list(Type::i64())], return_type: Type::i64() },
+                OperationDecl { name: Symbol::new("table-dispatch"), params: vec![Type::i64(), Type::i64(), Type::i64()], return_type: Type::i64() },
             ],
         });
 
@@ -369,7 +413,6 @@ impl EffectEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tisp_core::core_ast::*;
     use tisp_core::span::Span;
     use tisp_core::symbol::Symbol;
 

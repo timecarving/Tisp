@@ -1,0 +1,22 @@
+;; 范式可用性矩阵(§31/§32):8 编程范式 + 逻辑范式 + FRP 全链路
+;;
+;; 用法:
+;;   tisp --typecheck examples/paradigm-matrix.tisp
+;;   tisp --run examples/paradigm-matrix.tisp
+;;
+;; 栈/状态机/数据驱动/流经 State/Signal 效应;main 在效应行显式声明。
+
+(defn main [] -> [[State Signal], rho1, @omega, in, det] Unit
+  ;; 12 逻辑范式代表
+  (println (ilp-induce [1 2] [2]))            ; 归纳 → [1]
+  (println (fuzzy-eval [1 0.7 2 0.5] [1 2]))  ; 模糊合取 → 0.5
+  (println (defeasible-settle [1 1 0 1 2 1])) ; 可废止 → []
+  (println (reactive-eval 0 21))              ; 响应式 ×2 → 42
+  (println (modal-possible [1 2] [2 1] 1 1))  ; 模态可达 → true
+  ;; 数组 / 符号(纯函数)
+  (println (array-sum-axis0 (array [2 2] [1 2 3 4]))) ; 沿轴求和 → [4 6]
+  (println (sym-eval (sym-add (sym-num 1) (sym-num 2)))) ; 符号求值 → 3
+  ;; 栈(State 效应,main 已声明)
+  (println (stack-peek (stack-push (stack-new) 7))) ; 栈顶 → 7
+  ;; 基于流(Signal 效应,main 已声明)
+  (println (stream-sink (stream 1) 5)))       ; 流汇聚 → [1 2 3 4 5]

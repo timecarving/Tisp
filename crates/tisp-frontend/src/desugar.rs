@@ -27,7 +27,7 @@ enum TopLevel {
     ResourceAlgebra(tisp_core::types::ResourceAlgebra),
     EffectDecl(tisp_core::effects::EffectDecl),
     Namespace(Symbol, Vec<(Symbol, Symbol)>, Vec<Symbol>),
-    FFIDecl(Symbol, String, Vec<tisp_core::types::Type>, Option<tisp_core::types::Type>, Vec<tisp_core::types::EffectLabel>),
+    FFIDecl(Symbol, String, Vec<tisp_core::types::Type>, Option<tisp_core::types::Type>, Vec<tisp_core::types::EffectLabel>, String),
     /// 声明类形式(defmacro 等):已处理,不产生 def 也不作为顶层表达式
     Ignored,
     /// 编译指示(§30):(指示名, 目标/参数符号列表)
@@ -66,6 +66,8 @@ pub struct Desugarer {
     type_aliases: std::cell::RefCell<std::collections::HashMap<Symbol, (Vec<Symbol>, Vec<Symbol>, tisp_core::types::Type)>>,
     /// §草稿 (with ...) 子句产生的 definstance(在 desugar_program 末尾汇入 defs)
     pending_instances: std::cell::RefCell<Vec<CoreDef>>,
+    /// §25.2 别名导入的私有定义(限定名):其他命名空间直接引用应报错
+    private_aliases: std::cell::RefCell<std::collections::HashSet<String>>,
 }
 
 impl Desugarer {
@@ -84,6 +86,7 @@ impl Desugarer {
             gensym_counter: std::cell::RefCell::new(0),
             type_aliases: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_instances: std::cell::RefCell::new(Vec::new()),
+            private_aliases: std::cell::RefCell::new(std::collections::HashSet::new()),
         }
     }
 
@@ -102,10 +105,10 @@ impl Desugarer {
                 Some(TopLevel::TypeFamily(insts)) => type_families.extend(insts),
                 Some(TopLevel::ResourceAlgebra(alg)) => resource_algebras.push(alg),
                 Some(TopLevel::Def(def)) => defs.push(def),
-                Some(TopLevel::Namespace(name, requires, refers)) => {
+                Some(TopLevel::Namespace(_name, requires, refers)) => {
                     // §25 跨文件加载:require 的模块 {mod}.tisp 合并进当前程序(防循环)
-                    // §25.2/:refer 过滤 + §6.5 私有定义不可见
-                    for (mod_name, _alias) in &requires {
+                    // §25.2/:refer 过滤 + §6.5 私有定义不可见 + :as 别名限定引用
+                    for (mod_name, alias) in &requires {
                         let path = match &*self.base_dir.borrow() {
                             Some(dir) => format!("{}/{}.tisp", dir, mod_name),
                             None => format!("{}.tisp", mod_name),
@@ -119,31 +122,45 @@ impl Desugarer {
                                 if let Ok(loaded) = self.desugar_program(forms) {
                                     data_decls.extend(loaded.data_decls);
                                     effect_decls.extend(loaded.effect_decls);
-                                    // 私有定义(defn-/def-)不可跨文件引用;:refer 非空时仅导入列出的公开符号
-                                    let filtered: Vec<CoreDef> = loaded.defs.into_iter()
-                                        .filter(|d| d.visibility != Visibility::Private)
-                                        .filter(|d| refers.is_empty() || refers.contains(&d.name))
-                                        .collect();
-                                    defs.extend(filtered);
+                                    let use_alias = alias.as_str() != mod_name.as_str();
+                                    let mut imported: Vec<CoreDef> = Vec::new();
+                                    for d in loaded.defs {
+                                        let orig = d.name.clone();
+                                        let is_private = d.visibility == Visibility::Private;
+                                        if is_private {
+                                            // 私有定义随模块导入以供模块内部链接,但外部引用在
+                                            // desugar_expr 中被 private_aliases 拒绝。
+                                            if use_alias {
+                                                self.private_aliases.borrow_mut().insert(format!("{}/{}", alias, orig));
+                                            }
+                                            self.private_aliases.borrow_mut().insert(orig.as_str().to_string());
+                                            imported.push(d);
+                                            continue;
+                                        }
+                                        if !refers.is_empty() && !refers.contains(&orig) {
+                                            continue;
+                                        }
+                                        imported.push(d.clone());
+                                        if use_alias {
+                                            let mut alias_def = d;
+                                            alias_def.name = Symbol::new(&format!("{}/{}", alias, orig));
+                                            imported.push(alias_def);
+                                        }
+                                    }
+                                    defs.extend(imported);
                                 }
                             }
                         }
                     }
-                    defs.push(CoreDef { name: name.clone(), ty: None, effects: EffectRow::Pure, grade: Grade::Omega,
-                        mode: Mode::In, determinism: Determinism::Det,
-            region: None,
-            visibility: Visibility::Public,
-            mode_sigs: vec![],
-                        body: CoreExpr::new(CoreExprNode::NSDef(name, vec![], vec![]), Span::dummy()),
-                        requires: None, ensures: None, span: Span::dummy() });
+                    // §25.3 (ns name ...) 只声明模块边界,不注册同名函数定义
                 }
-                Some(TopLevel::FFIDecl(name, c_name, params, ret, effects)) => {
+                Some(TopLevel::FFIDecl(name, c_name, params, ret, effects, abi)) => {
                     defs.push(CoreDef { name: name.clone(), ty: None, effects: EffectRow::Closed(effects), grade: Grade::Omega,
                         mode: Mode::In, determinism: Determinism::Det,
             region: None,
             visibility: Visibility::Public,
             mode_sigs: vec![],
-                        body: CoreExpr::new(CoreExprNode::ExternDef(name, c_name, params, ret, vec![]), Span::dummy()),
+                        body: CoreExpr::new(CoreExprNode::ExternDef(name, c_name, params, ret, vec![], abi), Span::dummy()),
                         requires: None, ensures: None, span: Span::dummy() });
                 }
                 Some(TopLevel::Ignored) => {}
@@ -227,6 +244,7 @@ impl Desugarer {
                             return Ok(Some(TopLevel::EffectDecl(self.desugar_defeffect_form(items, expr.span)?)));
                         }
                         "defpred" => return Ok(Some(TopLevel::Def(self.desugar_defpred_form(items, expr.span)?))),
+                        "defaspect" => return self.desugar_defaspect_form(items, expr.span),
                         "defclass" => return self.desugar_defclass_form(items, expr.span),
                         // §草稿 trait 语法糖:deftrait / polytrait → defclass
                         "deftrait" | "polytrait" => return self.desugar_deftrait_form(items, expr.span),
@@ -757,9 +775,25 @@ impl Desugarer {
                     }
                 };
                 if let Some(v) = entries {
-                    for entry in v {
+                    let mut i = 0;
+                    while i < v.len() {
+                        let entry = &v[i];
                         if let Expr::Sym(m) = &entry.node {
-                            if tag == "require" { requires.push((m.clone(), m.clone())); }
+                            if tag == "require" {
+                                // 扁平向量形式 [lib :as a]:一个 Sym + :as + 别名 Sym 组成三元组
+                                if i + 2 < v.len() {
+                                    if let Expr::Keyword(as_kw) = &v[i + 1].node {
+                                        if as_kw.as_str() == "as" {
+                                            if let Expr::Sym(alias) = &v[i + 2].node {
+                                                requires.push((m.clone(), alias.clone()));
+                                                i += 3;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                                requires.push((m.clone(), m.clone()));
+                            }
                             if tag == "refer" { refers.push(m.clone()); }
                         } else if let Expr::List(l) = &entry.node {
                             if tag == "require" && l.len() >= 2 {
@@ -772,6 +806,7 @@ impl Desugarer {
                                 }
                             }
                         }
+                        i += 1;
                     }
                 }
             }
@@ -783,13 +818,32 @@ impl Desugarer {
         if items.len() < 4 { return Ok(None); }
         let name = match &items[1].node { Expr::Sym(s) => s.clone(), _ => return Ok(None) };
         let c_name = match &items[2].node { Expr::Str(s) => s.clone(), _ => return Ok(None) };
-        // §26 真实 dlopen:可选第三参为动态库路径 (defextern name "c_name" "libm.so.6")
-        // c_name 编码为 "libpath:sym",ExternDef 求值时按 ffi feature 解析
-        let c_name = match items.get(3).and_then(|i| match &i.node { Expr::Str(lib) => Some(lib.clone()), _ => None }) {
-            Some(lib) => format!("{}:{}", lib, c_name),
+        // §26 真实 dlopen:可选动态库路径 (defextern name "c_name" "libm.so.6")
+        // 与可选 ABI 签名 (defextern name "c_name" "libm.so.6" :abi f64->f64)。
+        // c_name 编码为 "libpath:sym",ExternDef 求值时按 ffi feature 解析。
+        let mut lib: Option<String> = None;
+        let mut abi = "i64->i64".to_string();
+        let mut i = 3;
+        while i < items.len() {
+            match &items[i].node {
+                Expr::Str(s) => lib = Some(s.clone()),
+                Expr::Keyword(k) if k.as_str() == "abi" => {
+                    if let Some(Expr::Str(s)) = items.get(i + 1).map(|x| &x.node) {
+                        abi = s.clone();
+                        i += 1;
+                    } else {
+                        return Err(DesugarError { message: ":abi requires a signature string".into(), span: items[i].span });
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let c_name = match lib {
+            Some(l) => format!("{}:{}", l, c_name),
             None => c_name,
         };
-        Ok(Some(TopLevel::FFIDecl(name, c_name, vec![], None, vec![])))
+        Ok(Some(TopLevel::FFIDecl(name, c_name, vec![], None, vec![], abi)))
     }
     fn desugar_defdata_hit_form(&self, items: &[SExpr], span: Span) -> Result<DataDecl, DesugarError> {
         let mut decl = self.desugar_defdata_form(items, span)?;
@@ -2069,6 +2123,52 @@ impl Desugarer {
         })
     }
 
+    /// §7.1 (defaspect name (pointcut Gen [pats...]) [:around|:before|:after|:primary] body...)
+    /// 脱糖为 AdviceDef 节点,由 ComptimePass 在编译期编织为 MethodDef。
+    fn desugar_defaspect_form(&self, items: &[SExpr], span: Span) -> Result<Option<TopLevel>, DesugarError> {
+        if items.len() < 5 {
+            return Err(DesugarError { message: "defaspect 需 (defaspect name (pointcut Gen [pats...]) :category body...)".into(), span });
+        }
+        let name = match &items[1].node { Expr::Sym(s) => s.clone(), _ => return Err(DesugarError { message: "defaspect name must be a symbol".into(), span: items[1].span }) };
+        let pointcut = match &items[2].node { Expr::List(p) if !p.is_empty() => p, _ => return Err(DesugarError { message: "defaspect pointcut 须为 (pointcut Gen [pats...])".into(), span: items[2].span }) };
+        if !matches!(pointcut.first().map(|i| &i.node), Some(Expr::Sym(s)) if s.as_str() == "pointcut") {
+            return Err(DesugarError { message: "pointcut 须以 pointcut 关键字开头".into(), span: items[2].span });
+        }
+        let gen = match pointcut.get(1).map(|i| &i.node) {
+            Some(Expr::Sym(s)) => s.clone(),
+            _ => return Err(DesugarError { message: "pointcut 须包含泛型名".into(), span: items[2].span }),
+        };
+        let mut patterns = Vec::new();
+        for p in &pointcut[2..] {
+            if let Expr::Vec(pats) = &p.node {
+                for x in pats { patterns.push(self.desugar_method_pattern(x)?); }
+            } else {
+                patterns.push(self.desugar_method_pattern(p)?);
+            }
+        }
+        let category = match items.get(3).map(|i| &i.node) {
+            Some(Expr::Keyword(k)) => match k.as_str() {
+                "around" => MethodCategory::Around,
+                "before" => MethodCategory::Before,
+                "after" => MethodCategory::After,
+                "primary" => MethodCategory::Primary,
+                other => return Err(DesugarError { message: format!("未知切面类别 :{}", other), span: items[3].span }),
+            },
+            _ => return Err(DesugarError { message: "defaspect 需要 :around/:before/:after/:primary 类别".into(), span: items.get(3).map(|i| i.span).unwrap_or(span) }),
+        };
+        let mut goals = Vec::new();
+        for g in &items[4..] { goals.push(self.desugar_expr(g)?); }
+        let advice = if goals.len() == 1 { goals.pop().unwrap() } else { CoreExpr::new(CoreExprNode::Do(goals), span) };
+        let def = CoreDef {
+            name: Symbol::new(&format!("__aspect_{}", name)),
+            ty: None, effects: EffectRow::Pure, grade: Grade::Omega, mode: Mode::In, determinism: Determinism::Det,
+            region: None, visibility: Visibility::Public, mode_sigs: vec![],
+            body: CoreExpr::new(CoreExprNode::AdviceDef(gen, category, patterns, Box::new(advice)), span),
+            requires: None, ensures: None, span,
+        };
+        Ok(Some(TopLevel::Def(def)))
+    }
+
     fn desugar_params(&self, expr: &SExpr) -> Result<Vec<Param>, DesugarError> {
         match &expr.node {
             Expr::Vec(items) => {
@@ -2467,6 +2567,12 @@ impl Desugarer {
                 expr.span,
             )),
             Expr::Sym(name) => {
+                if self.private_aliases.borrow().contains(name.as_str()) {
+                    return Err(DesugarError {
+                        message: format!("私有定义不可跨命名空间引用: {}", name),
+                        span: expr.span,
+                    });
+                }
                 if name.as_str() == "Unit" {
                     // 值上下文的 unit 字面量(如 handler 里的 (k Unit v))
                     Ok(CoreExpr::new(CoreExprNode::Lit(Literal::Unit), expr.span))
@@ -2743,9 +2849,41 @@ impl Desugarer {
         }
 
         let params = self.desugar_params(&items[1])?;
+
+        // 可选返回类型注解,与 defn 一致:(fn [params] -> Ret body...)
+        // 或六维变体:(fn [params] ->[ε, ρ, @r, m, d] Ret body...)
+        let mut ret_type = None;
+        let mut body_start = 2;
+        let is_arrow = match &items[body_start].node {
+            Expr::Keyword(kw) => kw.as_str() == "->",
+            Expr::Sym(s) => s.as_str() == "->",
+            _ => false,
+        };
+        if is_arrow {
+            if body_start + 1 < items.len() {
+                if let Expr::Vec(ann_items) = &items[body_start + 1].node {
+                    let (ef, rg, gr, md, dt) = self.desugar_six_dim_annotation(ann_items)?;
+                    if body_start + 2 < items.len() {
+                        ret_type = Some(self.desugar_type_with_params(&items[body_start + 2], &[])?);
+                        // 六维注解暂存到 lambda 返回类型之外:effect/region/grade/mode/determinism
+                        // 在 Lambda 中无独立字段,交由后续 FunAnnotation 接线使用(此处解析即验证语法)。
+                        let _ = (ef, rg, gr, md, dt);
+                        body_start += 3;
+                    } else {
+                        return Err(DesugarError { message: "-> [...] requires a return type".into(), span: items[body_start].span });
+                    }
+                } else {
+                    ret_type = Some(self.desugar_type_with_params(&items[body_start + 1], &[])?);
+                    body_start += 2;
+                }
+            } else {
+                return Err(DesugarError { message: "-> requires a return type".into(), span: items[body_start].span });
+            }
+        }
+
         // 收集全部 body 表达式(多表达式用 Do 包装;原实现只保留第一个)
         let mut body_exprs = Vec::new();
-        for item in &items[2..] {
+        for item in &items[body_start..] {
             body_exprs.push(self.desugar_expr(item)?);
         }
         let body = if body_exprs.len() == 1 {
@@ -2758,7 +2896,7 @@ impl Desugarer {
             CoreExprNode::Lam(Lambda {
                 params,
                 body: Box::new(body),
-                ret_type: None,
+                ret_type,
             }),
             span,
         ))
@@ -3543,7 +3681,11 @@ impl Desugarer {
         if items.len() < 2 {
             return Err(DesugarError { message: "session op requires operand".into(), span });
         }
-        Ok(CoreExpr::new(CoreExprNode::Session(op, Box::new(self.desugar_expr(&items[1])?)), span))
+        // operands[0] = 通道表达式;其余为负载(§20 会话语义,负载不得丢失)
+        let operands = items[1..].iter()
+            .map(|e| self.desugar_expr(e))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(CoreExpr::new(CoreExprNode::Session(op, operands), span))
     }
 
     fn desugar_handle(&self, items: &[SExpr], span: Span) -> Result<CoreExpr, DesugarError> {
@@ -3779,6 +3921,36 @@ mod tests {
     }
 
     #[test]
+    fn test_lambda_return_annotation() {
+        // lambda 支持 (fn [x] -> T body...),返回注解写入 Lambda.ret_type
+        let d = Desugarer::new();
+        let src = "(defn f [x] (let [g (fn [y : Int] -> Int (+ y 1))] (g x)))";
+        let prog = d.desugar_program(parse(src)).unwrap();
+        let def = prog.defs.iter().find(|def| def.name.as_str() == "f").unwrap();
+        use tisp_core::core_ast::CoreExprNode;
+        fn walk(e: &tisp_core::core_ast::CoreExpr) -> bool {
+            match &e.node {
+                CoreExprNode::Lam(l) => {
+                    l.ret_type.as_ref().map(|t| t.to_string()) == Some("i64".into()) || walk(&l.body)
+                }
+                CoreExprNode::Let(_, _, v, b) => walk(v) || walk(b),
+                CoreExprNode::Do(es) => es.iter().any(|e| walk(e)),
+                _ => false,
+            }
+        }
+        assert!(walk(&def.body), "lambda 返回类型注解应写入 ret_type");
+    }
+
+    #[test]
+    fn test_lambda_six_dim_annotation_parses() {
+        // 六维变体语法可解析(不报错),返回类型写入 ret_type
+        let d = Desugarer::new();
+        let src = "(defn f [x] (let [g (fn [y] -> [Pure, rho1, @1, in, det] i64 y)] (g x)))";
+        let prog = d.desugar_program(parse(src)).unwrap();
+        assert!(prog.defs.iter().any(|def| def.name.as_str() == "f"), "六维 lambda 注解应可解析");
+    }
+
+    #[test]
     fn test_implicit_binding_default_zero() {
         // §10.2:隐式绑定 {n : T} 默认等级 0;显式 {0 n : T} 亦为 0
         let d = Desugarer::new();
@@ -3855,6 +4027,22 @@ mod tests {
     }
 
     #[test]
+    fn test_ns_alias_requires() {
+        // §25.2 (:require [lib :as a]) 解析为 (lib, a),别名不得丢失
+        let d = Desugarer::new();
+        let forms = parse("(ns my.core (:require [lib :as a]))");
+        let tl = d.desugar_top_level(&forms[0]).unwrap().unwrap();
+        match tl {
+            TopLevel::Namespace(_, requires, _) => {
+                assert_eq!(requires.len(), 1);
+                assert_eq!(requires[0].0.as_str(), "lib");
+                assert_eq!(requires[0].1.as_str(), "a");
+            }
+            _ => panic!("应解析为 Namespace"),
+        }
+    }
+
+    #[test]
     fn test_ns_refer_parsing() {
         // §25.2:ns 的 :refer 列表解析进 Namespace 第三元素(不再丢弃)
         let d = Desugarer::new();
@@ -3871,19 +4059,24 @@ mod tests {
 
     #[test]
     fn test_ns_import_filtering() {
-        // §25.2/§6.5:跨文件加载按导出表过滤——私有定义不可见,:refer 仅导入列出的公开符号
+        // §25.2/§6.5:跨文件加载按导出表过滤——私有定义仅用于模块内部链接,
+        // 外部引用报错;:refer 仅导入列出的公开符号
         let dir = std::env::temp_dir().join(format!("tisp-ns-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // 模块 lib:公开 pub/extra,私有 priv
         std::fs::write(dir.join("lib.tisp"), "(defn pub [x] x)\n(defn- priv [x] x)\n(defn extra [x] x)\n").unwrap();
         let d = Desugarer::new();
         d.set_base_dir(&dir.to_string_lossy());
-        // :refer [pub] → 仅 pub 导入(priv 私有不可见,extra 未列入 refer)
+        // :refer [pub] → 仅公开 pub 导入(extra 未列入 refer);priv 保留为内部链接
         let prog = d.desugar_program(parse("(ns my.core (:require [lib]) (:refer [pub]))")).unwrap();
         let names: Vec<&str> = prog.defs.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"pub"), "pub 应导入,实际 {:?}", names);
-        assert!(!names.contains(&"priv"), "私有定义不可跨文件引用,实际 {:?}", names);
         assert!(!names.contains(&"extra"), ":refer 未列出 extra,不应导入,实际 {:?}", names);
+        // 外部直接引用私有符号 → desugar 报错
+        let d2 = Desugarer::new();
+        d2.set_base_dir(&dir.to_string_lossy());
+        let err = d2.desugar_program(parse("(ns my.core (:require [lib]))\n(defn main [] (priv 1))")).unwrap_err();
+        assert!(err.message.contains("私有定义"), "引用私有定义应报私有错误,实际 {}", err.message);
         std::fs::remove_dir_all(&dir).ok();
     }
 

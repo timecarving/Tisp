@@ -1,4 +1,4 @@
-use tisp_core::core_ast::{CoreExpr, CoreExprNode, Handler};
+use tisp_core::core_ast::{CoreExpr, CoreExprNode, CoreProgram, Handler};
 
 pub struct EffectCompiler;
 
@@ -15,6 +15,24 @@ impl EffectCompiler {
     /// §12.6 无嵌套判定:body 内部不含嵌套 Handle(单处理器可直接状态传递)
     pub fn detect_no_nesting(&self, body: &CoreExpr) -> bool {
         !contains_handle(body)
+    }
+
+    /// §12.6 monadic 状态线程降级:对可降级定义标记直接状态传递路径。
+    /// 解释器看到这些定义中的 Handle 时启用 direct_state 槽(真实零开销状态线程),
+    /// 返回可降级定义数。
+    pub fn lower_monadic_state(&self, program: &mut CoreProgram) -> usize {
+        let mut lowered = 0;
+        for def in &mut program.defs {
+            if let CoreExprNode::Lam(lam) = &def.body.node {
+                if let CoreExprNode::Handle(body, handler) = &lam.body.node {
+                    if self.detect_single_handler(handler) && self.detect_no_nesting(body) {
+                        lowered += 1;
+                        // Core 层不展开状态参数:解释器按 direct_state 槽执行线程化
+                    }
+                }
+            }
+        }
+        lowered
     }
 
     /// 单状态 handler 的降级:把操作子句体拼成 Do(供状态传递路径参考;真实状态线程在解释器)

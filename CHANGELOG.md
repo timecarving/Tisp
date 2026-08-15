@@ -5,11 +5,47 @@
 
 ---
 
+## [Unreleased] - make-all-paradigms-usable
+
+### 新增
+- 统一静态检查管线:`--run`/`--eval` 执行前运行 type/effect/grade/mode/det/region/liquid 全维度检查;`ConstraintSolver` 共享图聚合跨维度冲突
+- lambda 返回类型注解 `(fn [params] -> Ret body...)` 与六维变体
+- `--verify` 验证用户 `defprop` 属性;新增 `model-check` 用户模型可达性内置与 `examples/verify-user.tisp`
+- `--compile`(llvm feature)生成 IR → llc-17 → clang/gcc 编译运行闭环;默认构建显式报 feature 缺失
+- `defextern :abi` 按签名安全分派 FFI(i64/f64/str/ptr),杜绝错误 ABI 调用
+- 会话 `send`/`recv` 保留负载、按通道隔离协议;`spawn`/`join` 结构化等待;阻塞 `recv` + close 语义
+- 范式句柄类型(Chan/Stream/LVar/KB/Clock)接入 type_infer;QTT 线性句柄、依赖等级、`@Cost` 资源上界、Unsafe 门控四支柱检查
+- `RegionBox<T>` 区域真实分配 + 析构钩子;CLP/逻辑/流/信号/KB 状态迁入 RegionStack,重复运行配对无泄漏
+- HoTT `Squash::elim` 显式错误、`Equiv::new` 见证校验(去 panic);演算互编码(pi-to-ski/async-to-pi/applied-to-pi/rho-to-pi/ambient-to-channel/trace-equivalence)源码可调用
+- 12 逻辑范式/8 编程范式非法输入显式报错(概率越界、DFA 未知符号、模糊真值越界等)
+- `examples/oop-around.tisp`、`examples/paradigm-matrix.tisp`、`scripts/check-paradigm-matrix.sh` 验收矩阵
+
+### 变更
+- `ns (:require [lib :as alias])` 别名限定引用生效;私有定义跨空间引用显式报错
+- 反射 `type-of` 返回推断后静态签名(值字面量返回 i64/f64/bool/String/Unit)
+- 泛型特化保守跳过含 around/before/after 的方法组合,保证 `--run` 路径结果等价
+- Cons/Vector 打印为可读列表字面量
+
+
+### complete-declarative-paradigms-aop
+- 8 类编程范式完整源码表面:数组/栈/连接式/符号/自动机/状态机/数据驱动/基于流,全部经 type/effect/grade 检查、非法输入显式报错、State/Signal 效应门控
+- `pf-*` 与完整内置同一实现,旧 sum%2/+100/默认 0 投影移除(**BREAKING**)
+- comptime 编译期 pass:常量内联、编译期错误、运行时不重复求值
+- 编译期 MOP 知识库与运行时 KB 分离;`defaspect` 经 ComptimePass 编译期编织为 MethodDef,around/before/after + call-next-method 保持 OOP 语义,`--desugar` 可见
+- 新增 `examples/declarative-paradigms.tisp`、`examples/aop-mop.tisp`;验收矩阵 14/14
+
+### 破坏性变更
+- **BREAKING**:默认构建(无 `ffi` feature)对带库路径的 `defextern` 显式报错;未知模拟符号不再恒等回退
+- **BREAKING**:`--run` 现先做全量静态检查,类型/效果/等级等错误会拒绝执行(此前直接解释)
+- `Equiv::new` 需提供见证值并返回 `Result`;`Squash::elim` 返回 `Result`
+
+---
+
 ## 当前状态(0.1.0 收尾,2026-08)
 
-- 6 crate / 64 Rust 源文件 / 26,527 行 / 358 单元测试 / 零编译警告
+- 6 crate / 64 Rust 源文件 / 385 单元测试 / 零编译警告
 - `docs/spec.md` 32 章 + 6 附录:32 ✅ / 0 ⚠️ / 0 ⬜(全部全链路可用)
-- 19 个示例;19 份 OpenSpec 能力规范
+- 24 个示例;20 份 OpenSpec 能力规范
 - 逐章实现状态以 [standard_doc/04-implementation-status.md](./standard_doc/04-implementation-status.md) 为唯一事实源
 
 ---

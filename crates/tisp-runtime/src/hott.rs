@@ -78,14 +78,36 @@ pub struct Equiv {
 }
 
 impl Equiv {
+    /// 构造等价:要求提供见证值,并在见证上校验
+    /// section(backward ∘ forward = id)与 retraction(forward ∘ backward = id);
+    /// 任一方程不满足即返回可读错误(不再静默填入 refl)。
     pub fn new(fwd: impl Fn(PointValue) -> PointValue + Send + Sync + 'static,
-               bwd: impl Fn(PointValue) -> PointValue + Send + Sync + 'static) -> Self {
-        let a = PointValue::Unit;
-        Equiv {
-            forward: Arc::new(fwd), backward: Arc::new(bwd),
-            section: PathTerm::refl(a.clone()),
-            retraction: PathTerm::refl(a),
+               bwd: impl Fn(PointValue) -> PointValue + Send + Sync + 'static,
+               witnesses: &[PointValue]) -> Result<Self, String> {
+        if witnesses.is_empty() {
+            return Err("Equiv::new 需要至少一个见证值以校验 section/retraction".into());
         }
+        let forward = Arc::new(fwd);
+        let backward = Arc::new(bwd);
+        for w in witnesses {
+            let y = forward(w.clone());
+            if backward(y.clone()) != *w {
+                return Err(format!("等价见证失败:section(backward ∘ forward) 不保持 {:?} (得到 {:?})", w, backward(y)));
+            }
+            if forward(backward(y.clone())) != y {
+                return Err(format!("等价见证失败:retraction(forward ∘ backward) 不保持 {:?}", y));
+            }
+        }
+        let witness = witnesses[0].clone();
+        let section = PathTerm::new(witness.clone(), witness.clone(), {
+            let f = forward.clone(); let b = backward.clone(); let w = witness.clone();
+            move |_| b(f(w.clone()))
+        });
+        let retraction = PathTerm::new(witness.clone(), witness.clone(), {
+            let f = forward.clone(); let b = backward.clone(); let w = witness.clone();
+            move |_| f(b(w.clone()))
+        });
+        Ok(Equiv { forward, backward, section, retraction })
     }
 }
 
@@ -144,9 +166,9 @@ pub struct Squash<A> {
 
 impl<A: Clone> Squash<A> {
     pub fn squash(val: A) -> Self { Squash { value: val } }
-    pub fn elim<B>(&self, _f: impl Fn(&A) -> B) -> B where B: Clone {
-        // Cannot inspect A due to squash — this is a placeholder
-        panic!("squash elim: can't extract from propositional truncation")
+    /// 命题截断消去:不可提取时返回可读错误(替换 panic 占位)
+    pub fn elim<B>(&self, _f: impl Fn(&A) -> B) -> Result<B, String> where B: Clone {
+        Err("squash elim: 不可从命题截断中提取 A 的值(截断语义要求目标为命题,当前实现显式拒绝)".into())
     }
 }
 
@@ -313,5 +335,24 @@ mod tests {
         let left = |_: Interval| PointValue::Int(2);
         let right = |_: Interval| PointValue::Int(1);
         assert!(kan_fill_2d(top, bottom, left, right).is_err(), "边界不一致应报错");
+    }
+
+    #[test]
+    fn test_squash_elim_no_panic() {
+        // §8.1 命题截断非法消去:返回可读错误,不 panic
+        let s = Squash::squash(PointValue::Int(1));
+        let r = std::panic::catch_unwind(|| s.elim(|_x| PointValue::Int(2)));
+        assert!(r.is_ok(), "squash elim 不应 panic");
+        assert!(r.unwrap().is_err(), "不可提取时应返回错误");
+    }
+
+    #[test]
+    fn test_equiv_witness_validation() {
+        // §8.2 等价见证:恒等函数经见证校验通过;不一致函数构造失败
+        let ok = Equiv::new(|x| x.clone(), |x| x, &[PointValue::Int(1), PointValue::Bool(true)]);
+        assert!(ok.is_ok(), "恒等等价应通过见证校验");
+        let bad = Equiv::new(|_| PointValue::Int(0), |_| PointValue::Int(2), &[PointValue::Int(1)]);
+        assert!(bad.is_err(), "不满足 section/retraction 的等价应构造失败");
+        assert!(Equiv::new(|x| x.clone(), |x| x, &[]).is_err(), "无见证值应报错");
     }
 }

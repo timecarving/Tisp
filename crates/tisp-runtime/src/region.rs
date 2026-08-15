@@ -39,6 +39,8 @@ pub struct RegionStack {
     stack: Vec<Region>,
     next_id: u64,
     page_size: usize,
+    /// 区域内分配对象的析构钩子:(region id, drop fn);pop 时先析构再释放内存
+    drop_hooks: Vec<(RegionId, Box<dyn FnOnce()>)>,
     pub stats: RegionStats,
 }
 
@@ -56,6 +58,7 @@ impl RegionStack {
             stack: Vec::new(),
             next_id: 0,
             page_size: page_size.max(4096),
+            drop_hooks: Vec::new(),
             stats: RegionStats::default(),
         }
     }
@@ -106,6 +109,7 @@ impl RegionStack {
     /// Pop the top region, freeing all its memory
     pub fn pop_region(&mut self) {
         if let Some(region) = self.stack.pop() {
+            self.run_drop_hooks(region.id);
             self.stats.regions_deallocated += 1;
             match region.kind {
                 RegionKind::Finite { ptr, size, .. } => {
@@ -188,6 +192,23 @@ impl RegionStack {
         self.stack.iter().any(|r| r.id == id)
     }
 
+    /// 注册区域对象的析构钩子(区域 pop 时按注册序调用,在内存释放前)
+    pub fn register_drop(&mut self, id: RegionId, hook: Box<dyn FnOnce()>) {
+        self.drop_hooks.push((id, hook));
+    }
+
+    fn run_drop_hooks(&mut self, id: RegionId) {
+        let mut i = 0;
+        while i < self.drop_hooks.len() {
+            if self.drop_hooks[i].0 == id {
+                let (_, hook) = self.drop_hooks.remove(i);
+                hook();
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     fn fresh_id(&mut self) -> RegionId {
         let id = RegionId(self.next_id);
         self.next_id += 1;
@@ -204,9 +225,68 @@ impl Drop for RegionStack {
     }
 }
 
+/// 区域盒(§统一内存管理):值真实分配在 RegionStack 区域内,
+/// 区域 pop 时经析构钩子调用 drop(T) 后再释放底层内存。
+pub struct RegionBox<T> {
+    ptr: *mut T,
+    region: RegionId,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T: 'static> RegionBox<T> {
+    /// 在指定区域分配并写入 value;分配失败(区域耗尽/已死)返回 None
+    pub fn new_in(stack: &mut RegionStack, region: RegionId, value: T) -> Option<Self> {
+        let bytes = std::mem::size_of::<T>();
+        let ptr = stack.region_alloc(region, bytes.max(1))? as *mut T;
+        unsafe { ptr.write(value); }
+        let hook_ptr = ptr;
+        stack.register_drop(region, Box::new(move || unsafe {
+            std::ptr::drop_in_place(hook_ptr);
+        }));
+        Some(Self { ptr, region, _marker: std::marker::PhantomData })
+    }
+
+    pub fn get(&self) -> &T {
+        unsafe { &*self.ptr }
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.ptr }
+    }
+
+    pub fn region(&self) -> RegionId {
+        self.region
+    }
+}
+
+// RegionBox 本身不释放:值随区域生命周期结束由 RegionStack 的析构钩子回收
+impl<T> Drop for RegionBox<T> {
+    fn drop(&mut self) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_region_box_drop_hook() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        struct CountDrop;
+        impl Drop for CountDrop {
+            fn drop(&mut self) { DROPS.fetch_add(1, Ordering::SeqCst); }
+        }
+        let mut rs = RegionStack::new(4096);
+        let id = rs.push_finite_region(1024);
+        {
+            let _boxed = RegionBox::new_in(&mut rs, id, CountDrop).expect("区域应可分配");
+            assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        }
+        // RegionBox drop 不析构;区域 pop 时执行钩子
+        assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        rs.pop_region();
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1, "区域回收应先析构对象");
+    }
 
     #[test]
     fn test_finite_region() {

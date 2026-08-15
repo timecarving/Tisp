@@ -1,0 +1,8 @@
+;; OOP 方法组合 + 泛型特化语义保持(§22.3/§22.4)
+;; around 包裹 primary,call-next-method 进入内层;--run 经 specializer
+;; 路径执行,结果必须与运行时分发一致(5 → 100,而非丢失 around 的 50)。
+
+(defgeneric area [x])
+(defmethod area :around [x] (* 2 (call-next-method)))
+(defmethod area [5] 50)
+(defn main [] (area 5))

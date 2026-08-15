@@ -59,6 +59,29 @@ pub fn marginal(query: &LTerm, facts: &[ProbFact]) -> f64 {
     total
 }
 
+/// 校验概率事实:概率必须落在 [0,1],违反返回可读错误(§9.2 错误语义)
+pub fn marginal_checked(query: &LTerm, facts: &[ProbFact]) -> Result<f64, String> {
+    for f in facts {
+        if !(0.0..=1.0).contains(&f.prob) {
+            return Err(format!("概率事实 {:?} 的概率 {} 越界(须在 [0,1])", f.atom, f.prob));
+        }
+    }
+    if facts.len() > 20 {
+        return Err("概率事实数量超过精确枚举上限(20)".into());
+    }
+    Ok(marginal(query, facts))
+}
+
+/// 模糊事实校验:真值度必须落在 [0,1]
+pub fn checked_degree(facts: &[FuzzyFact], atom: &LTerm) -> Result<f64, String> {
+    for f in facts {
+        if !(0.0..=1.0).contains(&f.degree) {
+            return Err(format!("模糊事实 {:?} 的真值度 {} 越界(须在 [0,1])", f.atom, f.degree));
+        }
+    }
+    Ok(degree(facts, atom))
+}
+
 // ── 5.4 时序逻辑编程 ──
 
 /// 时间索引事实序列
