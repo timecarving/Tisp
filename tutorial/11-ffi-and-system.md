@@ -14,9 +14,9 @@
 ### 基本 FFI 调用
 
 ```tisp
-;; ✅ 可运行  $ tisp --run
+;; ⚠️ 运行需 --features ffi 构建；默认构建 --typecheck 通过、--run 报「未启用 ffi feature」
 (defextern c-abs "abs" "libc.so.6")
-(defn main [] (c-abs -42))  ;; → 42
+(defn main [] (c-abs -42))  ;; → 42（ffi feature 构建）
 ```
 
 语法：`(defextern <tisp-name> "<c-symbol>" "<library>" [:abi "<signature>"])`
@@ -29,10 +29,10 @@
 ### ABI 签名
 
 ```tisp
-;; ✅ 可运行 —— 浮点签到浮点
+;; ⚠️ 需 ffi feature —— 浮点签到浮点
 (defextern c-sin "sin" "libm.so.6" :abi "f64->f64")
 
-;; ✅ 可运行 —— 字符串长度
+;; ⚠️ 需 ffi feature —— 字符串长度
 (defextern c-strlen "strlen" "libc.so.6" :abi "str->i64")
 
 ;; 调用
@@ -90,7 +90,8 @@
 
 ## 11.4 feature 门控行为
 
-- 默认构建（无 `ffi` feature）：`defextern` 可通过 `libloading` 实际加载库——当前实现**默认即支持 dlopen**，无需特殊 feature
+- 默认构建（无 `ffi` feature）：`defextern` 声明可通过 `--typecheck`，但 `--run` 调用时报「未启用 ffi feature,无法加载动态库符号」
+- 启用 ffi：`cargo build --features ffi` 后可通过 `libloading` 实际加载库并调用
 - 无 `llvm` feature 时：`--ir` 回退为文本 IR（解释器输出），`--compile` 报「未启用 llvm feature」错误
 
 ---
@@ -99,8 +100,8 @@
 
 ```tisp
 ;; tutorial/examples/ch11-ffi.tisp
-;; ✅ 可运行  $ tisp --run tutorial/examples/ch11-ffi.tisp
-;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch11-ffi.tisp
+;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch11-ffi.tisp（默认构建）
+;; ⚠️ 运行需 ffi feature  $ tisp --run tutorial/examples/ch11-ffi.tisp
 (defextern c-abs "abs" "libc.so.6")
 (defextern c-strlen "strlen" "libc.so.6" :abi "str->i64")
 

@@ -158,7 +158,33 @@ Error: 需要 llvm feature
 
 **修复**：用正确的 `:abi` 签名（`i64->i64`/`f64->f64`/`str->i64` 等）。
 
-## 8. 其他
+## 8. REPL 特殊限制
+
+### 提示符下直接调用 State/Signal 范式报「效应缺失」
+
+**症状**：
+
+```
+tisp> (stack-peek (stack-push (stack-new) 7))
+tisp> ; static check error: [effect] State 效应缺失...
+```
+
+**原因**：REPL 表达式行被包装为**无效应行的纯函数**检查，栈/状态机/数据驱动（State）与基于流（Signal）操作无法声明效应。
+
+**修复**：写入文件并声明效应行后 `--run`：
+
+```tisp
+;; ❌ REPL 提示符直接调用
+;; ✅ 写入文件
+(defn main [] -> [[State Signal], rho1, @omega, in, det] Unit
+  (println (stack-peek (stack-push (stack-new) 7)))
+  (println (stream-sink (stream 1) 5)))
+;; $ tisp --run file.tisp
+```
+
+Pure 范式（数组/符号/DFA/连接式）不受此限，可直接在提示符求值。
+
+## 9. 其他
 
 ### `no main function`
 

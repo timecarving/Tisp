@@ -194,24 +194,26 @@ CLP(FD) 通过**有限域变量** + **约束传播**求解：
 
 ## 7.7 12 类逻辑范式
 
-Tisp 的 EVOLP/DLP 架构将全部 12 类逻辑编程范式统一为 `pf-*` 内置调用，经 `ParadigmRegistry` 分发（实现状态见行内标注）：
+Tisp 通过 `ParadigmRegistry` 提供 12 类逻辑编程范式的统一内置（`--eval` / REPL 表达式行直接可用，`reactive-eval` 除外——需 Signal 效应，见脚注）：
 
-| # | 范式 | 内置入口 | 状态 | 简述 |
-|---|------|---------|------|------|
-| 1 | 高阶逻辑（Higher-Order） | `pf-higher-order` | ⚠️ | 谓词作为值传递 / 应用 |
-| 2 | 归纳逻辑（ILP） | `pf-induce` | ⚠️ | 从正/负例归纳规则 |
-| 3 | 概率逻辑（PLP） | `pf-prob` | ⚠️ | 概率事实的边际概率 |
-| 4 | 时序逻辑（Temporal） | `pf-eventually` | ⚠️ | LTL 时序算子（always / eventually / next） |
-| 5 | 描述逻辑（Description） | `pf-subsume` | ⚠️ | 概念 ⊑ 角色推理 |
-| 6 | 可废止（Defeasible） | `pf-settle` | ⚠️ | 优先级裁决冲突规则 |
-| 7 | 模糊逻辑（Fuzzy） | `pf-fuzzy-and` | ⚠️ | 真值度组合（min/max） |
-| 8 | 表格化（Tabled） | `tabling` / `pf-tabling` | ⚠️ | 记忆已解目标，左递归终止 |
-| 9 | 一体化基底（Integrated） | `pf-typed-pred` | ⚠️ | 静态类型 + 函数/OOP/并发互操作 |
-| 10 | 响应式逻辑（Reactive） | `pf-reactive` | ⚠️ | FRP 信号驱动规则更新 |
-| 11 | 情境逻辑（Context） | `pf-context-query` | ⚠️ | 情境层次 / 继承 / 隔离 |
-| 12 | 模态逻辑（Modal） | `pf-possible` | ⚠️ | 可能世界 `possible` / `necessary` |
+| # | 范式 | 内置入口（推荐） | REPL 可用 | 状态 | 简述 |
+|---|------|----------------|----------|------|------|
+| 1 | 高阶逻辑（Higher-Order） | `higher-order-call` | ✅ | ⚠️ | 谓词作为值传递 / 应用 |
+| 2 | 归纳逻辑（ILP） | `ilp-induce` | ✅ | ⚠️ | 从正/负例归纳规则 |
+| 3 | 概率逻辑（PLP） | `plp-marginal` | ✅ | ⚠️ | 概率事实的边际概率 |
+| 4 | 时序逻辑（Temporal） | `temporal-eventually` | ✅ | ⚠️ | LTL 时序算子（always / eventually / next） |
+| 5 | 描述逻辑（Description） | `subsume` | ✅ | ⚠️ | 概念 ⊑ 角色推理 |
+| 6 | 可废止（Defeasible） | `defeasible-settle` | ✅ | ⚠️ | 优先级裁决冲突规则 |
+| 7 | 模糊逻辑（Fuzzy） | `fuzzy-eval` | ✅ | ⚠️ | 真值度组合（min/max） |
+| 8 | 表格化（Tabled） | `tabling` | ✅ | ⚠️ | 记忆已解目标，左递归终止 |
+| 9 | 一体化基底（Integrated） | `typed-pred` | ✅ | ⚠️ | 静态类型 + 函数/OOP/并发互操作 |
+| 10 | 响应式逻辑（Reactive） | `reactive-eval` | ❌¹ | ⚠️ | FRP 信号驱动规则更新 |
+| 11 | 情境逻辑（Context） | `context-query` | ✅ | ⚠️ | 情境层次 / 继承 / 隔离 |
+| 12 | 模态逻辑（Modal） | `modal-possible` | ✅ | ⚠️ | 可能世界 `possible` / `necessary` |
 
-> **clsap 和溯因（CLP + ALP，#11/#12）已通过 `domain` / `constrain` / `label` / `abduce` 全链路验证（标记 ✅）。其余范式后台已接线 `paradigms.rs`，`--run` 可执行但语义输出视范式不同处于构筑阶段（标记 ⚠️）；越界输入显式报错。**
+> **¹** `reactive-eval` 需 **Signal** 效应，无法在 REPL 提示符直接求值（同第 13 章的 State/Signal 范式）；写入文件并在带效应行的 `main` 中调用后 `--run` 即可。
+
+> **遗留投影**：早期版本以 `pf-higher-order`、`pf-settle`、`pf-prob`、`pf-subsume` 等 `pf-*` 名称注册了简化投影，这些投影**仍可调用**但签名和实现有已知问题（`pf-settle` 非法输入会 panic、`pf-higher-order`/`pf-prob`/`pf-subsume` 类型签名不匹配真实语义），建议优先使用上表中的推荐内置名。
 
 ---
 

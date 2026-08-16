@@ -13,16 +13,16 @@ Tisp 提供 8 类编程范式作为**一等内置设施**，所有范式经统�
 
 ## 13.1 效应归属速览
 
-| 范式 | 副作用归属 | 典型操作 |
-|------|-----------|---------|
-| 数组（Array） | **Pure** | `array`/`array-index`/`array-sum-axis0` |
-| 栈（Stack） | **State** | `stack-new`/`stack-push`/`stack-pop`/`stack-peek` |
-| 连接式（Concatenative） | **Pure** | `concatenate`/`point-apply` |
-| 符号（Symbolic） | **Pure** | `sym-num`/`sym-add`/`sym-eval` |
-| 自动机（DFA） | **Pure** | `dfa-accept` |
-| 状态机（State Machine） | **State** | `sm-drive` |
-| 数据驱动（Data-Driven） | **State** | `table-new`/`table-dispatch` |
-| 基于流（Stream） | **Signal** | `stream`/`stream-take`/`stream-sink` |
+| 范式 | 副作用归属 | REPL 提示符直接可用 | 典型操作 |
+|------|-----------|--------------------|---------|
+| 数组（Array） | **Pure** | ✅ | `array`/`array-index`/`array-sum-axis0` |
+| 栈（Stack） | **State** | ❌ 需经带效应行 main + `--run` | `stack-new`/`stack-push`/`stack-pop`/`stack-peek` |
+| 连接式（Concatenative） | **Pure** | ✅ | `concatenate`/`point-apply` |
+| 符号（Symbolic） | **Pure** | ✅ | `sym-num`/`sym-add`/`sym-eval` |
+| 自动机（DFA） | **Pure** | ✅ | `dfa-accept` |
+| 状态机（State Machine） | **State** | ❌ 需经带效应行 main + `--run` | `sm-drive` |
+| 数据驱动（Data-Driven） | **State** | ❌ 需经带效应行 main + `--run` | `table-new`/`table-dispatch` |
+| 基于流（Stream） | **Signal** | ❌ 需经带效应行 main + `--run` | `stream`/`stream-take`/`stream-sink` |
 
 > **重要**：使用 `State` 或 `Signal` 效应的入口，必须在签名中显式声明效应行：
 > ```tisp

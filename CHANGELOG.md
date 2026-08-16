@@ -21,6 +21,13 @@
 - `examples/oop-around.tisp`、`examples/paradigm-matrix.tisp`、`scripts/check-paradigm-matrix.sh` 验收矩阵
 - 新增 `tutorial/` 完整中文教程:16 章 + 4 附录覆盖全部语言特性,含 20 个经 `--typecheck`/`--run` 验证的示例与学习路线导航
 
+### 修复
+- 教程 ch07 12 逻辑范式表从 `pf-*` 遗留投影名更新为真实内置名(`higher-order-call`/`subsume`/`tabling` 等),新增 REPL 可用性列与 `pf-*` 已知问题脚注
+- 新增 `tutorial/examples/ch07-logic12.tisp` 示例文件,12 个真实逻辑范式内置全链路 `--typecheck`/`--run` 验证通过
+- 修复 `pf-settle` 及全部 `pf-*` 投影的非法输入 panic:facility.rs handler 改用 `.get(N)` 安全索引,不再数组越界
+- 教程 ch01/13/A4 补充 REPL 提示符下 State/Signal 效应操作限制说明;ch11 FFI 示例标注修正为 `⚠️ 需 --features ffi`
+- 验收链补充 `cargo build --release` 及 release 二进制冒烟测试,防止 future 变更出现旧二进制缺失内置的问题
+
 ### 变更
 - `ns (:require [lib :as alias])` 别名限定引用生效;私有定义跨空间引用显式报错
 - 反射 `type-of` 返回推断后静态签名(值字面量返回 i64/f64/bool/String/Unit)

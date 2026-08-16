@@ -1,6 +1,6 @@
 ;; ch11-ffi.tisp — FFI 外部函数调用
-;; ✅ 可运行  $ tisp --run tutorial/examples/ch11-ffi.tisp
-;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch11-ffi.tisp
+;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch11-ffi.tisp（默认构建）
+;; ⚠️ 运行需 ffi feature: cargo build --features ffi 后 $ tisp --run tutorial/examples/ch11-ffi.tisp
 (defextern c-abs "abs" "libc.so.6")
 (defextern c-strlen "strlen" "libc.so.6" :abi "str->i64")
 

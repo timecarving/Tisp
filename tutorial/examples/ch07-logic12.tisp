@@ -1,0 +1,50 @@
+;; tutorial/examples/ch07-logic12.tisp
+;; 12 类逻辑编程范式真实内置示例
+;; ✅ 可类型检查  $ ./target/debug/tisp --typecheck tutorial/examples/ch07-logic12.tisp
+;; ✅ 可运行  $ ./target/debug/tisp --run tutorial/examples/ch07-logic12.tisp
+;;
+;; 覆盖:12 个真实逻辑范式内置(higher-order-call / ilp-induce / plp-marginal /
+;;       temporal-eventually / subsume / defeasible-settle / fuzzy-eval /
+;;       tabling / typed-pred / reactive-eval / context-query / modal-possible)
+;;
+;; 注意:reactive-eval 需 Signal 效应，在带效应行 main 中调用
+;; plp-marginal 与 fuzzy-eval 因签名限 List i64,概率/真值用 0/1 整数编码
+
+(defn main [] -> [[State Signal], rho1, @omega, in, det] Unit
+  ;; 1. 高阶逻辑:pred-id > 0 → true
+  (println (higher-order-call 1 2))
+
+  ;; 2. 归纳逻辑:正例中去掉负例后剩余项
+  (println (ilp-induce [1 2 3] [2]))
+
+  ;; 3. 概率逻辑:facts 为 [atom prob atom prob ...]
+  (println (plp-marginal 1 [1 1 2 0]))
+
+  ;; 4. 时序逻辑:facts 为 [time atom time atom ...] 对
+  (println (temporal-eventually [1 1 2 2 3 3] 2))
+
+  ;; 5. 描述逻辑:概念包含查询 → true
+  (println (subsume [1 2] 1 2))
+
+  ;; 6. 可废止:rules 为 [head prio neg ...] 三元组
+  (println (defeasible-settle [1 1 0 2 2 0]))
+
+  ;; 7. 模糊逻辑:facts 为 [atom truth atom truth ...],查询原子 1
+  (println (fuzzy-eval [1 1 2 0] [1]))
+
+  ;; 8. 表格化:facts rules goal → 目标是否可达
+  (println (tabling [1 2] [3 4] 1))
+
+  ;; 9. 一体化基底:typed-pred 1 [xs] → list
+  (println (typed-pred 1 [1 2 3]))
+
+  ;; 10. 响应式逻辑:需 Signal 效应(已在 main 声明)
+  (println (reactive-eval 1 2))
+
+  ;; 11. 情境逻辑:contexts rules ctx atom
+  (println (context-query [1 2] [3 4] 1 2))
+
+  ;; 12. 模态逻辑:reach truths world atom
+  (println (modal-possible [1 2] [3 4] 1 2))
+
+  (println "=== 12 逻辑范式验证完成 ==="))

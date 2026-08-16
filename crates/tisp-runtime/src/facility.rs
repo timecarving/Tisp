@@ -208,51 +208,51 @@ pub fn default_registry() -> ParadigmRegistry {
     let mut r = ParadigmRegistry::new();
     let mut reg = |f: ParadigmFacility| { r.register(f).expect("范式元数据校验失败"); };
 
-    // ── 12 逻辑范式 ──
+    // ── 12 逻辑范式（简化投影——已由真实内置替代，本表仅用于 pf-* 遗留兼容）──
     reg(facility("higher-order", "Pred", vec![], |a| Ok(ParadigmValue::Bool(a.get(0).map(int).unwrap_or(0) > 0))));
     reg(facility("induce", "Hypothesis", vec![search()], |a| {
         // ILP:返回正例中不在负例的项
-        let pos = list(&a[0]);
-        let neg: std::collections::HashSet<i64> = list(&a[1]).into_iter().collect();
+        let pos = a.get(0).map(list).unwrap_or_default();
+        let neg: std::collections::HashSet<i64> = a.get(1).map(list).unwrap_or_default().into_iter().collect();
         Ok(ParadigmValue::List(pos.into_iter().filter(|x| !neg.contains(x)).collect()))
     }));
     reg(facility("prob", "Prob", vec![], |a| Ok(ParadigmValue::Float(a.get(0).map(float).unwrap_or(0.0)))));
     reg(facility("eventually", "TemporalFact", vec![], |a| {
-        Ok(ParadigmValue::Bool(list(&a[0]).contains(&a.get(1).map(int).unwrap_or(0))))
+        Ok(ParadigmValue::Bool(a.get(0).map(|v| list(v).contains(&a.get(1).map(int).unwrap_or(0))).unwrap_or(false)))
     }));
     reg(facility("subsume", "Concept", vec![], |_| Ok(ParadigmValue::Bool(true))));
     reg(facility("settle", "DefRule", vec![], |a| {
-        Ok(ParadigmValue::Bool(int(&a[0]) >= int(&a[1])))
+        Ok(ParadigmValue::Bool(a.get(0).map(int).unwrap_or(0) >= a.get(1).map(int).unwrap_or(0)))
     }));
     reg(facility("fuzzy-and", "Fuzzy", vec![], |a| {
-        Ok(ParadigmValue::Float(float(&a[0]).min(float(&a[1]))))
+        Ok(ParadigmValue::Float(a.get(0).map(float).unwrap_or(0.0).min(a.get(1).map(float).unwrap_or(0.0))))
     }));
     reg(facility("tabling", "Tabled", vec![], |a| Ok(ParadigmValue::Bool(a.get(0).map(bool).unwrap_or(false)))));
-    reg(facility("typed-pred", "Pred", vec![], |a| Ok(ParadigmValue::Bool(int(&a[0]) > 0))));
-    reg(facility("reactive", "Signal", vec![signal()], |a| Ok(ParadigmValue::Int(int(&a[0]) * 2))));
+    reg(facility("typed-pred", "Pred", vec![], |a| Ok(ParadigmValue::Bool(a.get(0).map(int).unwrap_or(0) > 0))));
+    reg(facility("reactive", "Signal", vec![signal()], |a| Ok(ParadigmValue::Int(a.get(0).map(int).unwrap_or(0) * 2))));
     reg(facility("context-query", "Context", vec![], |a| {
-        Ok(ParadigmValue::Bool(bool(&a[0]) || bool(&a[1])))
+        Ok(ParadigmValue::Bool(a.get(0).map(bool).unwrap_or(false) || a.get(1).map(bool).unwrap_or(false)))
     }));
     reg(facility("possible", "Modal", vec![], |a| {
-        Ok(ParadigmValue::Bool(bool(&a[0]) && bool(&a[1])))
+        Ok(ParadigmValue::Bool(a.get(0).map(bool).unwrap_or(false) && a.get(1).map(bool).unwrap_or(false)))
     }));
 
     // ── EVOLP / DLP / MOP ──
-    reg(facility("evolp", "Program", vec![search()], |a| Ok(ParadigmValue::Int(int(&a[0])))));
-    reg(facility("dlp", "DynProgram", vec![search()], |a| Ok(ParadigmValue::List(list(&a[0])))));
+    reg(facility("evolp", "Program", vec![search()], |a| Ok(ParadigmValue::Int(a.get(0).map(int).unwrap_or(0)))));
+    reg(facility("dlp", "DynProgram", vec![search()], |a| Ok(ParadigmValue::List(a.get(0).map(list).unwrap_or_default()))));
     reg(facility("get-kb", "KB", vec![], |_| Ok(ParadigmValue::Str("kb".to_string()))));
 
     // ── 8 编程范式 ──
-    reg(facility("array-sum", "Array", vec![], |a| Ok(ParadigmValue::Int(list(&a[0]).iter().sum()))));
+    reg(facility("array-sum", "Array", vec![], |a| Ok(ParadigmValue::Int(a.get(0).map(|v| list(v).iter().sum()).unwrap_or(0)))));
     reg(facility("stack-top", "Stack", vec![state()], |a| {
-        Ok(ParadigmValue::Int(list(&a[0]).last().copied().unwrap_or(0)))
+        Ok(ParadigmValue::Int(a.get(0).map(|v| list(v).last().copied().unwrap_or(0)).unwrap_or(0)))
     }));
-    reg(facility("compose", "Fun", vec![], |a| Ok(ParadigmValue::Int((int(&a[0]) + 1) * 2))));
-    reg(facility("sym-eval", "Sym", vec![], |a| Ok(ParadigmValue::Int(int(&a[0]) + 1))));
+    reg(facility("compose", "Fun", vec![], |a| Ok(ParadigmValue::Int((a.get(0).map(int).unwrap_or(0) + 1) * 2))));
+    reg(facility("sym-eval", "Sym", vec![], |a| Ok(ParadigmValue::Int(a.get(0).map(int).unwrap_or(0) + 1))));
     reg(facility("dfa-accept", "Dfa", vec![search()], |a| {
-        Ok(ParadigmValue::Bool(list(&a[0]).iter().sum::<i64>() % 2 == 0))
+        Ok(ParadigmValue::Bool(a.get(0).map(|v| list(v).iter().sum::<i64>() % 2 == 0).unwrap_or(false)))
     }));
-    reg(facility("sm-drive", "StateMachine", vec![state()], |a| Ok(ParadigmValue::Int(int(&a[0]) + 1))));
+    reg(facility("sm-drive", "StateMachine", vec![state()], |a| Ok(ParadigmValue::Int(a.get(0).map(int).unwrap_or(0) + 1))));
     reg(facility("dispatch", "Table", vec![], |a| {
         Ok(ParadigmValue::Str(format!("Hello, {}!", a.get(0).map(int).unwrap_or(0))))
     }));
@@ -262,7 +262,7 @@ pub fn default_registry() -> ParadigmRegistry {
     }));
 
     // ── AOP ──
-    reg(facility("aop-weave", "Aspect", vec![], |a| Ok(ParadigmValue::Int(int(&a[0]) + 100))));
+    reg(facility("aop-weave", "Aspect", vec![], |a| Ok(ParadigmValue::Int(a.get(0).map(int).unwrap_or(0) + 100))));
 
     r
 }
