@@ -1,0 +1,13 @@
+;; ch14-aop.tisp — AOP 切面编织
+;; ✅ 可运行  $ tisp --run tutorial/examples/ch14-aop.tisp
+;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch14-aop.tisp
+
+(defgeneric area [x])
+(defmethod area [5] 50)
+(defaspect double-area (pointcut area [x]) :around (* 2 (call-next-method)))
+
+(defn main [] -> [[State], rho1, @omega, in, det] Unit
+  (do
+    (comptime (set-kb [1 2]))
+    (println (area 5))
+    (println (get-kb))))

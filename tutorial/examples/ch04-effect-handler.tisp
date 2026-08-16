@@ -1,0 +1,55 @@
+;; tutorial/examples/ch04-effect-handler.tisp
+;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch04-effect-handler.tisp
+;; ✅ 可运行      $ tisp --run tutorial/examples/ch04-effect-handler.tisp
+;; 效应系统示例：State 效应声明 → handler → monadic 热路径
+
+;; 1. 效应声明
+(defeffect State s
+  (get [] -> s)
+  (put [s] -> Unit))
+
+;; 2. Handler：接管 get/put 并注入自定义语义
+(defn run-state [init f] -> i64
+  (handle (let [_ (put init)]
+            (f))
+    (State s)
+    (get [] [k s] (k s s))
+    (put [v] [k _s] (k Unit v))))
+
+;; 3. 效应行：调用 get/put 的函数必须在签名声明 [State]（否则报「State 效应缺失」）
+(defn counter [] -> [State] i64
+  (let [x (get)]
+    (put (+ x 1))
+    (get)))
+
+;; 4. monadic 风格（零开销状态传递：mlet / get-m / put-m / pure）
+(defn monadic-demo [] -> [State] i64
+  (mlet [x (get-m)
+         _ (put-m (+ x 1))]
+    (pure x)))
+
+;; 5. 内置 Except 效应（throw）
+(defn thrower [] -> [Except] i64
+  (throw 42))
+
+(defn catcher [f] -> i64
+  (handle (f)
+    (Except e)
+    (throw [v] [k] 0)))
+
+;; 6. 内置 Search 效应（choose 回溯）
+(defn pick [] -> [Search] i64
+  (choose 10))
+
+(defn search-handler [f] -> i64
+  (handle (f)
+    (Search)
+    (choose [n] [k] (k 0))))
+
+;; 7. 入口
+(defn main [] -> i64
+  (do
+    (println (run-state 0 (fn [] (do (counter) (counter) (counter)))))
+    (println (run-state 0 (fn [] (monadic-demo))))
+    (println (catcher (fn [] (thrower))))
+    (println (search-handler (fn [] (pick))))))

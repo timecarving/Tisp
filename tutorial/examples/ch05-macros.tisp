@@ -1,0 +1,37 @@
+;; tutorial/examples/ch05-macros.tisp
+;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch05-macros.tisp
+;; ✅ 可运行      $ tisp --run tutorial/examples/ch05-macros.tisp
+;; 宏与元编程示例：defmacro 模板替代、卫生展开、comptime 编译期求值与 KB
+
+;; 1. 基本宏：模板替换（卫生展开自动重命名内部绑定）
+(defmacro add1 [x] (let [y (+ x 1)] y))
+
+;; 2. 卫生示例：宏内部 let x 被自动重命名为 x_gN，调用方 x 不受影响
+(defmacro double-x [y]
+  (let [x (* 2 y)]
+    x))
+
+;; 3. comptime 编译期求值：表达式在编译期求值，结果内联到代码
+(defn compiled-in [] -> i64
+  (comptime (+ 100 200)))
+
+;; 4. 编译期 KB：set-kb 写入编译期 KB（与运行时 KB 分离）
+;;    get-kb 在运行时返回 KB 类型，读写 KB 需声明 [State] 效应行
+(defn use-kb [] -> [State] i64
+  (do
+    (comptime (set-kb [7 8 9]))
+    (println (get-kb))
+    42))
+
+;; 5. 卫生展开验证：调用方 x=100 不受宏内 let x 影响（x_g1 隔离）
+(defn hygiene-test [] -> i64
+  (let [x 100]
+    (double-x 5)))
+
+;; 6. 入口
+(defn main [] -> i64
+  (do
+    (println (add1 10))
+    (println (compiled-in))
+    (use-kb)
+    (println (hygiene-test))))

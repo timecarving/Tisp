@@ -1,0 +1,14 @@
+;; ch01-functions.tisp — 函数与局部绑定
+;; ✅ 可运行  $ tisp --run tutorial/examples/ch01-functions.tisp
+;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch01-functions.tisp
+(defn factorial [n]
+  (if (<= n 1)
+    1
+    (* n (factorial (- n 1)))))
+
+(defn main []
+  (let [x 5
+        y 10]
+    (println (factorial x))
+    (println (+ x y))
+    (println ((fn [a b] (- a b)) 100 7))))

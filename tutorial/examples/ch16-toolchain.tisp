@@ -1,0 +1,13 @@
+;; ch16-toolchain.tisp — comptime + 编译期 KB
+;; ✅ 可运行  $ tisp --run tutorial/examples/ch16-toolchain.tisp
+;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch16-toolchain.tisp
+
+(defn main [] -> [[State], rho1, @omega, in, det] Unit
+  ;; comptime 常量折叠
+  (println (comptime (+ 1 2)))
+  ;; comptime KB 写入（编译期执行一次）
+  (comptime (set-kb [1 2]))
+  ;; 运行时 KB（编译期分离）
+  (println (get-kb))
+  ;; 基本 eval
+  (println (+ 40 2)))

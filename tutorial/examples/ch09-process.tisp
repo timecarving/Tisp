@@ -1,0 +1,62 @@
+;; ch09-process.tisp — 进程演算:π/Async π/applied π/spi/SKI/ambient/ρ/ς-calculus
+;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch09-process.tisp
+;; ✅ 可运行      $ tisp --run tutorial/examples/ch09-process.tisp
+;; ⚠️  pi-to-ski / async-to-pi / applied-to-pi / rho-to-pi / ambient-to-channel 运行时可用但无类型签名(仅 typecheck 推导);trace-equivalence 仅运行时;κ-calculus(bind/unbind/react)无表面语法(仅 CoreExprNode)
+
+;; §27.2 π-calculus:chan(0 参)/send(2 参)/recv(1 参)—FIFO 阻塞通道
+(defn demo-pi [] Unit
+  (let [c (chan)]
+    (send c 42)
+    (println (recv c))))                   ;; → 42
+
+;; §27.1 SKI 组合子(内置 S/K/I + ski-app/ski-reduce)
+(defn demo-ski [] Unit
+  (println (ski-app (ski-app (ski-app S K) K) 5))   ;; S K K 5 = K 5 K 5 = 5
+  (println (ski-app (ski-app K 40) 2))               ;; K 40 2 = 40
+  (println (ski-app I 7)))                           ;; I 7 = 7
+
+;; §27.4 applied π-calculus:encrypt/decrypt/sign/verify!/hash(需 secret! 注册密钥)
+(defn demo-crypto [] Unit
+  (secret! "k1")                                   ;; 注册密钥(基于 XOR 占位)
+  (let [enc (encrypt "hello" "k1")]
+    (println (decrypt enc "k1")))                  ;; → "hello"
+  (println (verify! (sign "msg" "k1") "k1"))       ;; → true
+  (println (hash "hello")))                        ;; → (CryptoValue … hash)
+
+;; §27.5 spi-calculus:secret!/commit!/check!
+(defn demo-spi [] Unit
+  (secret! "k2")
+  (let [c (commit! "secret-message" "k2")]
+    (println (check! c "secret-message"))))         ;; → true
+
+;; §27.6 Safe Ambients:ambient-new/enter/exit/open
+(defn demo-ambient [] Unit
+  (println (ambient-new room))                      ;; → ambient-room
+  (println (enter "room" 42))                       ;; → false(未注册)
+  (println (exit "room" 99)))                       ;; → 99(总是求值 body)
+
+;; §27.7 ρ-calculus(反射):rho-quote 包装/rho-drop 解包/rho-lift 求值
+(defn demo-rho [] Unit
+  (println (rho-drop (rho-quote 42)))               ;; → 42
+  (println (rho-lift (rho-quote 1) (+ 2 3))))       ;; → 5
+
+;; §27.9 ς-calculus:invoke(方法调用)/update!(方法更新)—对象自分发
+(defn demo-sigma [] Unit
+  (let [obj (update! 0 (fn [self] (+ 1 1)))]
+    (println (invoke obj "_update"))))              ;; → 2
+
+;; §27.2 并发:spawn(启动新线程)/join(等待结果)—需 Spawn 效应
+(defn demo-spawn [] Unit
+  (let [h (spawn (+ 40 2))]
+    (println (join h))))                            ;; → 42
+
+;; 主入口:依次演示各演算
+(defn main [] Unit
+  (demo-pi)
+  (demo-ski)
+  (demo-crypto)
+  (demo-spi)
+  (demo-ambient)
+  (demo-rho)
+  (demo-sigma)
+  (demo-spawn))

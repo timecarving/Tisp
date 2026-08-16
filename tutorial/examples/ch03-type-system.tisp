@@ -1,0 +1,24 @@
+;; ch03-type-system.tisp — QTT 等级 / 区域 / 反射
+;; ✅ 可运行  $ tisp --run tutorial/examples/ch03-type-system.tisp
+;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch03-type-system.tisp
+
+;; QTT 等级：使用最多 3 次
+(defn use3 [{3 x : i64}] -> i64
+  (do x x x))
+
+;; 分支上界 2 ≤ 等级 3
+(defn branch [(3 x : i64)] -> i64
+  (if true (do x x) x))
+
+;; 六维注解（effects, region, grade, mode, determinism）
+(defn annotated [x : i64] -> [IO, rho1, @1, out, det] i64 x)
+
+;; 反射：类型 / 等级
+(defn f [x : i64] -> i64 x)
+
+(defn main []
+  (println (use3 7))
+  (println (branch 1))
+  (println (annotated 42))
+  (println (reflect-type f))
+  (println (grade-of "use3")))

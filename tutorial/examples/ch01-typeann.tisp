@@ -1,0 +1,12 @@
+;; ch01-typeann.tisp — 类型标注
+;; ✅ 可运行  $ tisp --run tutorial/examples/ch01-typeann.tisp
+;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch01-typeann.tisp
+(defn add [x : i64, y : i64] -> i64 (+ x y))
+(defn id [x] x)
+(defn compose [f g]
+  (fn [x] (f (g x))))
+
+(defn main []
+  (println (add 40 2))
+  (println (id 42))
+  (println ((compose (fn [x] (+ x 1)) (fn [x] (* x 2))) 3)))

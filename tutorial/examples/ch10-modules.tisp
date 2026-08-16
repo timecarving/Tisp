@@ -1,0 +1,27 @@
+;; ch10-modules.tisp — 模块系统:ns 声明 + :require/:refer/:as 导入导出
+;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch10-modules.tisp
+;; ✅ 可运行      $ tisp --run tutorial/examples/ch10-modules.tisp
+;; ⚠️  多文件 ns 依赖 base_dir:本文件所在目录自动解析 {mod}.tisp
+
+;; §25.1 ns 声明:命名空间 my-app.core
+;; §25.2 :require [ch10-lib :as lib] → lib/square 等别名限定引用
+;;         :refer [square double safe-div] → 同时以原名导入
+(ns my-app.core
+  (:require [ch10-lib :as lib])
+  (:refer [square double safe-div]))
+
+;; §6.5 defn- 私有定义(仅本文件可见)
+(defn- helper [x] (+ x 1))
+
+(defn main [] Unit
+  (do
+    ;; :as 别名限定调用
+    (println (lib/square 7))               ;; → 49
+    (println (lib/double 21))              ;; → 42
+    ;; :refer 直接导入的符号(原名无前缀)
+    (println (square 6))                   ;; → 36
+    (match (safe-div 10 2)
+      (Nothing) (println "error")
+      (Just v) (println (str-concat "ok: " (str v))))
+    ;; 私有定义仅本文件使用
+    (println (helper 10))))                ;; → 11

@@ -1,0 +1,22 @@
+;; ch10-lib.tisp — 模块示例:库文件
+;; 由 ch10-modules.tisp 通过 ns (:require …)(:refer …)导入
+;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch10-lib.tisp
+;; ✅ 可运行      $ tisp --run tutorial/examples/ch10-lib.tisp
+
+;; 公开定义(可被外部导入)
+(defn square [x] (* x x))
+(defn double [x] (* x 2))
+
+(defdata (Maybe a)
+  (Nothing)
+  (Just a))
+
+;; 安全除法:除零返回 Nothing
+(defn safe-div [a b]
+  (if (= b 0) (Nothing) (Just (/ a b))))
+
+;; 私有定义(外模块不可见,即使 :refer 也无法访问)
+(defn- internal-helper [x] (+ x 100))
+
+;; 未列入 :refer 的公开定义:导入时被过滤
+(defn extra [x] (- x 10))

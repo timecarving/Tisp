@@ -1,0 +1,28 @@
+;; ch15-hott-derived.tisp — HoTT 原语 + deriving + 代数验证
+;; ✅ 可运行  $ tisp --run tutorial/examples/ch15-hott-derived.tisp
+;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch15-hott-derived.tisp
+
+;; deriving
+(defdata Color :deriving (Eq Ord Show)
+  (Red)
+  (RGB i64 i64 i64))
+
+;; 代数性质验证
+(defn id [x] x)
+(defn not-id [x] (+ x 1))
+(defn plus [a b] (+ a b))
+
+(defn main []
+  ;; HoTT 原语
+  (println (transp (fn [i] 9) true))
+  (println (shape (fn [i] 42)))
+  (println (interval-and true false))
+  ;; 函数点态等价
+  (println (fun-ext id id (range 1 4)))
+  (println (fun-ext id not-id (range 1 4)))
+  ;; 幺半群
+  (println (monoid-check plus 0 (range 1 4)))
+  ;; deriving
+  (println (ord-Color (RGB 1 2 3) (RGB 1 2 4)))
+  ;; 时钟
+  (println (clock "c" 5)))

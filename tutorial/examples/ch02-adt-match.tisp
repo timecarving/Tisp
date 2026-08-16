@@ -1,0 +1,51 @@
+;; ch02-adt-match.tisp — ADT + GADT + 模式匹配
+;; ✅ 可运行  $ tisp --run tutorial/examples/ch02-adt-match.tisp
+;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch02-adt-match.tisp
+
+;; 多态 Maybe
+(defdata (Maybe a)
+  (Nothing)
+  (Just a))
+
+;; GADT 表达式
+(defdata (Expr a)
+  (IntLit i64 -> (Expr i64))
+  (BoolLit bool -> (Expr bool))
+  (Add (Expr i64) (Expr i64) -> (Expr i64))
+  (If (Expr bool) (Expr a) (Expr a) -> (Expr a)))
+
+;; 求值器
+(defn eval-expr [e]
+  (match e
+    (IntLit n) n
+    (BoolLit b) b
+    (Add x y) (+ (eval-expr x) (eval-expr y))
+    (If c t f) (if (eval-expr c) (eval-expr t) (eval-expr f))))
+
+(defn safe-div [n d]
+  (if (= d 0) (Nothing) (Just (/ n d))))
+
+(defn describe-graded [score]
+   (cond (>= score 90) "A"
+         (>= score 80) "B"
+         (>= score 70) "C"
+         "F"))
+
+(defdata Color (Red) (Green) (Blue))
+
+(defn guess-color [c]
+  (match c
+    (or Red Green Blue) "known"
+    _ "unknown"))
+
+(defn main []
+  ;; GADT 求值
+  (println (eval-expr (Add (IntLit 40) (IntLit 2))))
+  ;; Maybe 模式匹配
+  (println (match (safe-div 10 2)
+             (Nothing) "error"
+             (Just v) (str-concat "ok: " (str v))))
+  ;; cond 成绩
+  (println (describe-graded 85))
+  ;; or-pattern
+  (println (guess-color Green)))

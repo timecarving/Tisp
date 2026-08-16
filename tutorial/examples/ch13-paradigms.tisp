@@ -1,0 +1,22 @@
+;; ch13-paradigms.tisp — 8 类编程范式完整示例
+;; ✅ 可运行  $ tisp --run tutorial/examples/ch13-paradigms.tisp
+;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch13-paradigms.tisp
+(defn main [] -> [[State Signal], rho1, @omega, in, det] Unit
+  ;; 数组
+  (println (array-sum-axis0 (array [2 2] [1 2 3 4])))
+  ;; 栈
+  (println (stack-peek (stack-push (stack-new) 7)))
+  ;; 连接式
+  (println (point-apply
+             (concatenate (fn [x] (+ x 1)) (fn [x] (* x 2)))
+             3))
+  ;; 符号
+  (println (sym-eval (sym-add (sym-num 1) (sym-num 2))))
+  ;; DFA
+  (println (dfa-accept 0 [0] [0 97 1 1 97 0] "aa"))
+  ;; 状态机
+  (println (sm-drive 0 1 [0 1 1]))
+  ;; 数据驱动
+  (println (table-dispatch (table-new [1] [(fn [x] (+ x 1))]) 1 41))
+  ;; 基于流
+  (println (stream-sink (stream 1) 5)))

@@ -1,0 +1,34 @@
+;; ch08-frp.tisp — 并发与 FRP / 时序类型
+;; ✅ 可运行  $ tisp --run tutorial/examples/ch08-frp.tisp
+;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch08-frp.tisp
+
+;; §18.2 时序流类型:Stream a ≅ a × ⃝(Stream a)(纯函数式,惰性尾)
+(defdata (Stream a)
+  (::: [a, (⃝ (Stream a))]))
+
+;; 纯函数式常量流:每步都是同一个值
+(defn const-stream [a : Type, x : a] -> (Stream a)
+  (::: x (delay (const-stream x))))
+
+;; 纯函数式滚动求和:advance 解开 ⃝ 进入下一时刻
+(defn running-sum [s : (Stream Int)] -> (Stream Int)
+  (let [go (fn [acc : Int, s : (Stream Int)] -> (Stream Int)
+             (match s
+               (::: x tail)
+               (let [new-acc (+ acc x)]
+                 (::: new-acc (delay (go new-acc (advance tail)))))))]
+    (go 0 s)))
+
+;; 入口:Signal 效应门控(使用内置 signal/stream 须声明)
+(defn main [] -> [[Signal], rho1, @omega, in, det] Unit
+  ;; 内置 (stream n):惰性整数流,stream-take 取前 5 个
+  (println (stream-take (stream 0) 5))
+  ;; stream-sink 汇聚流到向量
+  (println (stream-sink (stream 5) 3))
+  ;; Signal 节点:值管道 — 即时求值,非响应式订阅
+  (let [s (signal 10)]
+    (println (signal-fold + 0 s))                   ;; 折叠初始值 → 10
+    (println (signal-map (fn [x] (* x 2)) s))       ;; 映射 → (Signal …)
+    (println (signal-filter (fn [x] (> x 5)) s)))   ;; 过滤谓词 → true
+  ;; 定时序模态:delay/advance 类型为 a→⃝a / ⃝a→a
+  (println (advance (stream 42))))                  ;; 推进内置流 → (Stream 43 …)

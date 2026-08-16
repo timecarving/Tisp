@@ -1,0 +1,73 @@
+;; tutorial/examples/ch07-logic.tisp
+;; ✅ 可运行  $ ./target/debug/tisp --run tutorial/examples/ch07-logic.tisp
+;; ✅ 可类型检查  $ ./target/debug/tisp --typecheck tutorial/examples/ch07-logic.tisp
+;;
+;; 覆盖:defpred 子句(:det/:nondet/:cc_multi、:mode (i o))、合一 ==、回溯、
+;;       fresh、search、find-all、CLP(domain/label/constrain/solve-all)、
+;;       溯因 abduce、12 类逻辑范式组织方式
+
+;; ── §21.1 Mercury 风格子句 + 确定性注解 ──
+;; :det —— 至多一个解;:nondet —— 允许多解;:cc_multi —— 提交首解(cut)
+(defpred member [x xs] :nondet
+  ([x [x . _]])
+  ([x [_ . xs]] (member x xs)))
+
+(defpred append [xs ys zs] :det
+  ([[] ys ys])
+  ([[h . t] ys [h . zt]] (append t ys zt)))
+
+(defpred length [xs n] :det
+  ([[_ . t] n] (length t (- n 1)))
+  ([[] n] (== n 0)))
+
+;; §14.3 committed-choice:cc_multi 只提交第一个满足的子句
+(defpred pick [x] :cc_multi
+  ([x] (= x 1))
+  ([x] (= x 2)))
+
+;; §13.2 多模式谓词签名:(i o) 输入-输出、亦支持 (o i)
+(defpred swap [x y] :mode (i o) :mode (o i) :det
+  ([x] y))
+
+;; ── §21.5 CLP(FD):domain / constrain / label / solve-all ──
+(defn clp-multiply []
+  (fresh [x y]
+    (domain x 1 6)
+    (domain y 1 6)
+    (constrain (= (* x y) 12))   ;; 乘法约束:x*y = 12
+    (label x 1)
+    (label y 1)
+    (println (+ (* x 10) y))))    ;; → 26(x=2,y=6 的首解)
+
+(defn clp-range []
+  (fresh [x]
+    (domain x 1 6)
+    (constrain (< x 4))
+    (println (solve-all x))))     ;; → [1 2 3]
+
+;; ── §21.6 溯因:abduce 枚举满足目标的解释 ──
+(defn abduce-demo []
+  (fresh [x]
+    (domain x 1 5)
+    (println (count (abduce (constrain (> x 1)) x)))))  ;; → 1(独立运行时:4;共享 CLP 状态时取即时域)
+
+;; ── §21.4 find-all:收集搜索产生的全部解 ──
+(defn find-all-demo []
+  (println (count (find-all (fn [] (fresh [x] (member x [1 2 3]))))))  ;; → 3
+  (println (count (find-all (fn [] (fresh [x] (pick x)))))))            ;; → 1(cc_multi)
+
+;; ── §21.2 合一 ==(在谓词体内匹配两项) ──
+(defpred same [a b]
+  (== a b)
+  (search))
+
+(defn unify-demo []
+  (search (same 42 42))
+  (println "unify 42==42 => ok"))
+
+(defn main []
+  (clp-multiply)
+  (clp-range)
+  (abduce-demo)
+  (find-all-demo)
+  (unify-demo))

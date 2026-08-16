@@ -1,0 +1,60 @@
+;; tutorial/examples/ch06-oop.tisp
+;; ✅ 可运行  $ ./target/debug/tisp --run tutorial/examples/ch06-oop.tisp
+;; ✅ 可类型检查  $ ./target/debug/tisp --typecheck tutorial/examples/ch06-oop.tisp
+;;
+;; 覆盖:defgeneric / defmethod / 方法组合(:around :before :after :primary)
+;;       call-next-method / 编译期特化(构造子类型匹配)
+;;       defclass / definstance 类型类 + :fun-deps
+
+;; ── §22.1/22.2 defgeneric + defmethod ──
+;; 方法模式 (c Circle) 按构造子类型匹配:绑定整值 c,随后 match 解构字段。
+;; (§22.4 编译期特化:literal 与构造子类型匹配的调用会被直接特化)
+(defdata Shape (Circle radius) (Square side))
+
+(defgeneric area [s])
+
+(defmethod area [(c Circle)]
+  (match c
+    (Circle r) (* r r 3)))
+
+(defmethod area [(c Square)]
+  (match c
+    (Square n) (* n n)))
+
+;; ── §22.3 方法组合:around 包裹 primary,call-next-method 进入内层 ──
+(defgeneric price [p])
+
+(defmethod price :around [p] (* 2 (call-next-method)))
+(defmethod price :primary [p] 50)
+
+;; ── before / after:副作用在 primary 之前/之后执行,结果被丢弃 ──
+(defgeneric audit [a])
+
+(defmethod audit :before [a] (println "before: entering"))
+(defmethod audit :primary [a] 42)
+(defmethod audit :after [a] (println "after: leaving"))
+
+;; ── §23.1/23.2 typeclass 声明与实例(方法分发尚在运行时注册路径) ──
+(defclass Coll [c e] :fun-deps [(c -> e)]
+  (elem [c] -> e))
+
+(definstance (Coll i64 i64)
+  (elem [x] x))
+
+;; ── 构造子类型匹配 ──
+(defgeneric describe [d])
+
+(defmethod describe [(c Circle)] "a circle")
+(defmethod describe [(c Square)] "a square")
+
+(defn main []
+  ;; defmethod 构造子分派
+  (println (area (Circle 2)))    ;; → 12  (π≈3)
+  (println (area (Square 3)))    ;; → 9
+  ;; around 包裹 primary  → 100
+  (println (price 5))            ;; → 100
+  ;; before → primary → after
+  (println (audit 0))            ;; → 42(两侧打印 before/after)
+  ;; 泛型类型标签
+  (println (describe (Circle 1)))  ;; → "a circle"
+  (println (describe (Square 1))))  ;; → "a square"

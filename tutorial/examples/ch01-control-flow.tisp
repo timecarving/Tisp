@@ -1,0 +1,14 @@
+;; ch01-control-flow.tisp — if/cond 控制流
+;; ✅ 可运行  $ tisp --run tutorial/examples/ch01-control-flow.tisp
+;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch01-control-flow.tisp
+(defn grade [score]
+  (cond (>= score 90) "A"
+        (>= score 80) "B"
+        (>= score 70) "C"
+        (>= score 60) "D"
+        "F"))
+
+(defn main []
+  (println (grade 95))
+  (println (grade 82))
+  (println (grade 55)))

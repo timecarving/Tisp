@@ -1,0 +1,14 @@
+;; ch12-verification.tisp — 模型检查属性
+;; ✅ 可验证  $ tisp --verify tutorial/examples/ch12-verification.tisp
+;; ✅ 可类型检查  $ tisp --typecheck tutorial/examples/ch12-verification.tisp
+(defprop reachable-5
+  (model-check 0
+    (fn [n] (= n 5))
+    (fn [n] [(+ n 1) (+ n 2)])
+    20))
+
+(defprop unreachable-100
+  (model-check 0
+    (fn [n] (> n 100))
+    (fn [n] [(+ n 1)])
+    10))

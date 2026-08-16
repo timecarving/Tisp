@@ -19,6 +19,7 @@
 - HoTT `Squash::elim` 显式错误、`Equiv::new` 见证校验(去 panic);演算互编码(pi-to-ski/async-to-pi/applied-to-pi/rho-to-pi/ambient-to-channel/trace-equivalence)源码可调用
 - 12 逻辑范式/8 编程范式非法输入显式报错(概率越界、DFA 未知符号、模糊真值越界等)
 - `examples/oop-around.tisp`、`examples/paradigm-matrix.tisp`、`scripts/check-paradigm-matrix.sh` 验收矩阵
+- 新增 `tutorial/` 完整中文教程:16 章 + 4 附录覆盖全部语言特性,含 20 个经 `--typecheck`/`--run` 验证的示例与学习路线导航
 
 ### 变更
 - `ns (:require [lib :as alias])` 别名限定引用生效;私有定义跨空间引用显式报错
